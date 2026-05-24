@@ -1,6 +1,6 @@
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
     tags-ignore: ["v*"]
@@ -48,9 +48,6 @@ jobs:
           - name: ubuntu-24.04
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - name: linux-musl
-            os: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
           - name: macos-14
             os: macos-14
             target: aarch64-apple-darwin
@@ -72,10 +69,6 @@ jobs:
         if: matrix.name == 'windows-msvc'
         uses: ilammy/setup-nasm@v1
 
-      - name: Install musl tools (linux-musl)
-        if: matrix.name == 'linux-musl'
-        run: sudo apt-get install -y musl-tools
-
       - uses: actions/cache@v4
         with:
           path: |
@@ -94,7 +87,6 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (contains(matrix.target, 'windows') && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (contains(matrix.target, 'windows') && '.exe' || '') }}
 
       - name: Run tests
-        if: matrix.name != 'linux-musl'
         run: cargo test --release
 
       - name: Upload binary
@@ -137,9 +129,38 @@ jobs:
         if: always()
         run: docker rm -f phr-test-ssh 2>/dev/null || true
 
+  cross-linux:
+    name: Cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+          if-no-files-found: warn
+
   docker:
     name: Docker multi-arch build & push (main)
-    needs: unit-tests
+    needs: [unit-tests, cross-linux]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -159,17 +180,28 @@ jobs:
           mkdir -p bin/amd64
           cp target/x86_64-unknown-linux-musl/release/${{ env.BINARY_NAME }} bin/amd64/${{ env.BINARY_NAME }}
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Download aarch64-gnu artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-aarch64-unknown-linux-gnu
+          path: artifacts-gnu
 
-      - name: Build aarch64 musl binary
-        run: |
-          CARGO_TARGET_DIR=/tmp/cross-target-aarch64 cross build --release --target aarch64-unknown-linux-musl
+      - name: Download aarch64-musl artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-aarch64-unknown-linux-musl
+          path: artifacts-musl
 
-      - name: Stage aarch64 binary
+      - name: Stage aarch64 binary (prefer musl)
         run: |
           mkdir -p bin/arm64
-          cp /tmp/cross-target-aarch64/aarch64-unknown-linux-musl/release/${{ env.BINARY_NAME }} bin/arm64/${{ env.BINARY_NAME }}
+          if [ -f artifacts-musl/${{ env.BINARY_NAME }} ]; then
+            cp artifacts-musl/${{ env.BINARY_NAME }} bin/arm64/${{ env.BINARY_NAME }}
+          else
+            cp artifacts-gnu/${{ env.BINARY_NAME }} bin/arm64/${{ env.BINARY_NAME }}
+          fi
+          chmod +x bin/arm64/${{ env.BINARY_NAME }}
+          ls -la bin/amd64/ bin/arm64/
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
