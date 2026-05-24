@@ -54,7 +54,6 @@ jobs:
           - name: windows-msvc
             os: windows-2022
             target: x86_64-pc-windows-msvc
-            cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +61,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install NASM (windows-msvc)
+        if: matrix.name == 'windows-msvc'
+        uses: ilammy/setup-nasm@v1
 
       - uses: actions/cache@v4
         with:
@@ -71,7 +74,6 @@ jobs:
             target
           key: ${{ matrix.name }}-cargo-${{ hashFiles('Cargo.lock') }}
 
-
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -79,7 +81,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/release 2>/dev/null || true
-          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }}
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (contains(matrix.target, 'windows') && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (contains(matrix.target, 'windows') && '.exe' || '') }}
 
       - name: Run tests
         run: cargo test --release
@@ -88,7 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }}
+          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (contains(matrix.target, 'windows') && '.exe' || '') }}
           if-no-files-found: warn
 
   integration-tests:
@@ -108,10 +110,8 @@ jobs:
             target
           key: integration-cargo-${{ hashFiles('Cargo.lock') }}
 
-
       - name: Build release
         run: cargo build --release
-
 
       - name: Build & start Docker SSH container
         run: |
@@ -127,12 +127,38 @@ jobs:
         run: docker rm -f phr-test-ssh 2>/dev/null || true
 
   docker:
-    name: Docker build & push (main)
+    name: Docker multi-arch build & push (main)
     needs: unit-tests
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get install -y musl-tools
+
+      - name: Build x86_64 musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Stage x86_64 binary
+        run: |
+          mkdir -p bin/amd64
+          cp target/x86_64-unknown-linux-musl/release/${{ env.BINARY_NAME }} bin/amd64/${{ env.BINARY_NAME }}
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build aarch64 musl binary
+        run: |
+          CARGO_TARGET_DIR=/tmp/cross-target-aarch64 cross build --release --target aarch64-unknown-linux-musl
+
+      - name: Stage aarch64 binary
+        run: |
+          mkdir -p bin/arm64
+          cp /tmp/cross-target-aarch64/aarch64-unknown-linux-musl/release/${{ env.BINARY_NAME }} bin/arm64/${{ env.BINARY_NAME }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -148,10 +174,11 @@ jobs:
           tags: |
             type=raw,value=main
 
-
+      - name: Build & load amd64 (for verification)
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.static
           platforms: linux/amd64
           push: false
           load: true
@@ -167,19 +194,33 @@ jobs:
       - name: Verify help output
         run: docker run --rm ${{ steps.meta.outputs.tags }} | head -3
 
+      - name: Build multi-arch (no push, no login)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.static
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false
+
       - name: Log in to Docker Hub
-        if: secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != ''
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-
-      - name: Build & push multi-arch
-        if: secrets.DOCKER_USERNAME != '' && secrets.DOCKER_PASSWORD != ''
+      - name: Push (login required)
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile.static
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
