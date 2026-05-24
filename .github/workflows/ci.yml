@@ -51,7 +51,7 @@ jobs:
           - name: macos-14
             os: macos-14
             target: aarch64-apple-darwin
-          - name: windows-msvc
+          - name: windows-gnu
             os: windows-2022
             target: x86_64-pc-windows-gnu
 
@@ -76,7 +76,7 @@ jobs:
       - name: Copy binary for tests
         run: |
           mkdir -p target/release
-          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }}
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-gnu' && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-gnu' && '.exe' || '') }}
 
       - name: Run tests
         run: cargo test --release
@@ -85,7 +85,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }}
+          path: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-gnu' && '.exe' || '') }}
           if-no-files-found: warn
 
   integration-tests:
