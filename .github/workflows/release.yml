@@ -42,7 +42,7 @@ jobs:
             cross: false
           # Windows
           - os: windows-2022
-            target: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-gnu
             cross: false
 
     steps:
@@ -51,10 +51,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install NASM (windows-msvc)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        uses: ilammy/setup-nasm@v1
 
       - name: Install cross
         if: matrix.cross
