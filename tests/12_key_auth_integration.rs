@@ -1,4 +1,4 @@
-#![allow(clippy::zombie_processes)]
+#![allow(clippy::zombie_processes, clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
 /// -i 私钥认证 + --identity-passphrase 集成测试
 ///
 /// 在 Docker SSH 容器中创建密钥对，测试私钥登录和加密私钥登录。
@@ -23,7 +23,7 @@ fn setup_keypair(passphrase: Option<&str>) -> (String, String) {
     let pub_path = format!("{}.pub", key_path);
 
     // Remove old keys
-    let _ = std::fs::remove_file(&key_path);
+    let _ = std::fs::remove_file(key_path);
     let _ = std::fs::remove_file(&pub_path);
 
     // Generate key
