@@ -93,17 +93,9 @@ jobs:
           if-no-files-found: warn
 
   integration-tests:
-    name: Integration tests (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    name: Integration tests
+    runs-on: ubuntu-24.04
     needs: unit-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ubuntu-24.04
-            os: ubuntu-24.04
-          - name: macos-14
-            os: macos-14
     steps:
       - uses: actions/checkout@v4
 
