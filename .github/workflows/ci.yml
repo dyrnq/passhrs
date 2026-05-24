@@ -235,7 +235,12 @@ jobs:
           DOCKER_BUILD_RECORD_UPLOAD: false
 
       - name: Verify help output
-        run: docker run --rm ${{ steps.meta.outputs.tags }} | head -3
+        run: |
+          docker run --rm "${{ steps.meta.outputs.tags }}" 2>&1 || {
+            rc=$?
+            echo "=== Container failed (exit $rc) ==="
+            exit $rc
+          }
 
       - name: Build multi-arch (no push, no login)
         uses: docker/build-push-action@v6

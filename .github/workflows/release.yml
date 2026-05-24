@@ -169,7 +169,17 @@ jobs:
           DOCKER_BUILD_RECORD_UPLOAD: false
 
       - name: Verify help output
-        run: docker run --rm ${{ steps.meta.outputs.tags }} | head -3
+        run: |
+          echo "=== Docker image tags ==="
+          echo "${{ steps.meta.outputs.tags }}"
+          echo "=== Running container ==="
+          docker run --rm "${{ steps.meta.outputs.tags }}" 2>&1 || {
+            rc=$?
+            echo "=== Container failed (exit $rc) ==="
+            # Try to inspect the image
+            docker image inspect "${{ steps.meta.outputs.tags }}" 2>/dev/null | python3 -c "import sys,json; i=json.load(sys.stdin); [print(f'  CMD: {c["Cmd"]}') for c in i[0]['Config'].get('Entrypoint','') and print(f'  ENTRYPOINT: {c}') for c in i['ContainerConfig']['Cmd']]"
+            exit $rc
+          }
 
       - name: Build multi-arch (no push, no login)
         uses: docker/build-push-action@v6
