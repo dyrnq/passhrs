@@ -1,4 +1,8 @@
-#![allow(clippy::zombie_processes, clippy::needless_borrow, clippy::needless_borrows_for_generic_args)]
+#![allow(
+    clippy::zombie_processes,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args
+)]
 /// -i 私钥认证 + --identity-passphrase 集成测试
 ///
 /// 在 Docker SSH 容器中创建密钥对，测试私钥登录和加密私钥登录。
