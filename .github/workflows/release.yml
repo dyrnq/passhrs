@@ -129,19 +129,27 @@ jobs:
         run: |
           set -e
           mkdir -p bin/amd64 bin/arm64
-          find artifacts -type f -name '${{ env.BINARY_NAME }}-*' | while read f; do
-            case "$f" in
-              *x86_64*) cp "$f" bin/amd64/${{ env.BINARY_NAME }} ; echo "amd64: $f" ;;
-              *aarch64*) cp "$f" bin/arm64/${{ env.BINARY_NAME }} ; echo "arm64: $f" ;;
-            esac
-          done
-          if [ ! -f bin/amd64/${{ env.BINARY_NAME }} ]; then
-            echo "ERROR: amd64 binary not found!"; exit 1
+          echo "=== artifacts content ==="
+          find artifacts -type f -ls
+          echo "=== copying ==="
+          # Find musl binary for amd64
+          AMD64_FILE=$(find artifacts -type f -name '${{ env.BINARY_NAME }}-*x86_64*' | head -1)
+          if [ -z "$AMD64_FILE" ]; then
+            echo "ERROR: amd64 binary not found in artifacts!"
+            exit 1
           fi
-          if [ ! -f bin/arm64/${{ env.BINARY_NAME }} ]; then
-            echo "ERROR: arm64 binary not found!"; exit 1
+          cp "$AMD64_FILE" bin/amd64/${{ env.BINARY_NAME }}
+          echo "amd64: $AMD64_FILE"
+          # Find musl binary for arm64
+          ARM64_FILE=$(find artifacts -type f -name '${{ env.BINARY_NAME }}-*aarch64*' | head -1)
+          if [ -z "$ARM64_FILE" ]; then
+            echo "ERROR: arm64 binary not found in artifacts!"
+            exit 1
           fi
+          cp "$ARM64_FILE" bin/arm64/${{ env.BINARY_NAME }}
+          echo "arm64: $ARM64_FILE"
           chmod +x bin/amd64/${{ env.BINARY_NAME }} bin/arm64/${{ env.BINARY_NAME }}
+          echo "=== staged files ==="
           ls -la bin/amd64/ bin/arm64/
 
       - name: Extract metadata
