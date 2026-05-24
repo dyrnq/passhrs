@@ -159,6 +159,7 @@ jobs:
           images: ${{ secrets.DOCKER_USERNAME }}/${{ env.BINARY_NAME }}
           tags: |
             type=ref,event=tag
+            type=raw,value=latest
 
       - name: Build multi-arch (no push, no login)
         uses: docker/build-push-action@v6
