@@ -1,0 +1,6 @@
+target/
+.git/
+.dev/
+*.bak*
+*.md
+tests/

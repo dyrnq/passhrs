@@ -1,0 +1,23 @@
+# Dockerfile.static — copy pre-built binary from CI release artifacts
+#
+# Usage in CI release workflow:
+#   1. Download build artifacts
+#   2. Organize binaries:
+#      mkdir -p bin/amd64 bin/arm64
+#      cp ... bin/amd64/passhrs
+#      cp ... bin/arm64/passhrs
+#   3. docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.static .
+
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata openssh-client
+
+ARG TARGETPLATFORM
+
+COPY bin/ /tmp/bin/
+RUN cp /tmp/bin/${TARGETPLATFORM#linux/}/passhrs /usr/local/bin/passhrs && \
+    chmod 755 /usr/local/bin/passhrs && \
+    rm -rf /tmp/bin
+
+ENTRYPOINT ["/usr/local/bin/passhrs"]
+CMD ["--help"]
