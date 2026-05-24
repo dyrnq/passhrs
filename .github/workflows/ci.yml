@@ -74,7 +74,7 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
 
       - name: Build
-run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Copy binary for tests
         run: |
