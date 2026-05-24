@@ -1077,7 +1077,12 @@ async fn main() -> Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .creation_flags(0x08000000)
+            .creation_flags({
+                #[cfg(target_os = "windows")]
+                { 0x08000000 }
+                #[cfg(not(target_os = "windows"))]
+                { 0 }
+            })
             .spawn()?;
         info!("Forked to background (pid: {})", child.id());
         std::process::exit(0);
