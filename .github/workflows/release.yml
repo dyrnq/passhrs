@@ -31,6 +31,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
             cross: true
           - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - os: ubuntu-24.04
             target: armv7-unknown-linux-musleabihf
             cross: true
           # macOS
@@ -118,7 +121,7 @@ jobs:
       - name: Download arm64 musl artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.BINARY_NAME }}-aarch64-unknown-linux-gnu
+          name: ${{ env.BINARY_NAME }}-aarch64-unknown-linux-musl
           path: artifacts
 
       - name: Organize binaries for multi-arch build
@@ -292,6 +295,7 @@ jobs:
             | Linux x86_64 (gnu) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-gnu` |
             | Linux x86_64 (static) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-unknown-linux-musl` |
             | Linux aarch64 (gnu) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-unknown-linux-gnu` |
+            | Linux aarch64 (musl) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-unknown-linux-musl` |
             | Linux armv7 (static) | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-armv7-unknown-linux-musleabihf` |
             | macOS x86_64 | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-x86_64-apple-darwin` |
             | macOS aarch64 | `${{ env.BINARY_NAME }}-${{ github.ref_name }}-aarch64-apple-darwin` |
