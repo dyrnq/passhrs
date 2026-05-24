@@ -5,7 +5,7 @@
 ## Features
 
 ### SSH Standard Compatible Options
-`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-H`
+`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S`
 
 | Option    | Description                        |
 |:----------|:-----------------------------------|
@@ -158,7 +158,7 @@ ssh:   passhrs:   description
  -D    ✅  -D       SOCKS5 dynamic forwarding
  -E    ✅  -E       Log to file
  -f    ✅  -f       Fork to background
- -H    ✅  -H       HTTP CONNECT proxy (Note: OpenSSH uses -H for X11)
+ -H    ⭐  —        HTTP CONNECT proxy (passhrs unique, OpenSSH has no -H)
  -i    ✅  -i       Identity file (supports passphrase)
  -J    ✅  -J       ProxyJump
  -L    ✅  -L       Local port forwarding
