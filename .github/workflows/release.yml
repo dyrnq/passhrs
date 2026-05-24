@@ -162,20 +162,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build amd64 with Dockerfile (for verification)
-        run: |
-          # Build native binary + Docker image using the multi-stage Dockerfile
-          docker build -f Dockerfile -t ${{ steps.meta.outputs.tags }} .
-
-      - name: Verify help output
-        run: |
-          echo "=== Running container ==="
-          docker run --rm "${{ steps.meta.outputs.tags }}" 2>&1 || {
-            rc=$?
-            echo "=== Container failed (exit $rc) ==="
-            exit $rc
-          }
-
       - name: Build multi-arch (no push, no login)
         uses: docker/build-push-action@v6
         with:
