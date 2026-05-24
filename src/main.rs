@@ -20,10 +20,10 @@ use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 // ======================================================================
 // CLI
 // ======================================================================
@@ -1081,9 +1081,13 @@ async fn main() -> Result<()> {
             .stderr(std::process::Stdio::null())
             .creation_flags({
                 #[cfg(target_os = "windows")]
-                { 0x08000000 }
+                {
+                    0x08000000
+                }
                 #[cfg(not(target_os = "windows"))]
-                { 0 }
+                {
+                    0
+                }
             })
             .spawn()?;
         info!("Forked to background (pid: {})", child.id());
