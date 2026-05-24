@@ -73,8 +73,13 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Copy binary for tests
+        run: |
+          mkdir -p target/release
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '') }}
+
       - name: Run tests
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --release
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
