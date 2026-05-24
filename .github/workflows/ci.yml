@@ -65,10 +65,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install NASM (windows only)
-        if: matrix.name == 'windows-msvc'
-        uses: ilammy/setup-nasm@v1
-
       - uses: actions/cache@v4
         with:
           path: |
