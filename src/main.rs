@@ -1,11 +1,3 @@
-#![allow(
-    clippy::for_kv_map,
-    clippy::unnecessary_lazy_evaluations,
-    clippy::map_clone,
-    unused_variables,
-    unused_mut,
-    dead_code
-)]
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -610,7 +602,6 @@ async fn handle_socks_connection(handle: &Handle<SshHandler>, stream: TcpStream)
             stx.write_all(&resp).await?;
             let (mut crx, ctx) = channel.split();
             let c2s = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
                 loop {
                     match crx.wait().await {
                         Some(ChannelMsg::Data { ref data }) => {
@@ -1079,16 +1070,7 @@ async fn main() -> Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .creation_flags({
-                #[cfg(target_os = "windows")]
-                {
-                    0x08000000
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    0
-                }
-            })
+            .creation_flags(0x08000000)
             .spawn()?;
         info!("Forked to background (pid: {})", child.id());
         std::process::exit(0);
@@ -1361,9 +1343,13 @@ async fn main() -> Result<()> {
                     let cfg = Arc::new(client::Config::default());
                     let h =
                         SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
-                    let mut c = client::connect(cfg, (fwd_host.as_str(), fwd_port), h)
-                        .await
-                        .expect("HTTP CONNECT connect");
+                    let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("HTTP CONNECT connect failed: {}", e);
+                            continue;
+                        }
+                    };
                     authenticate_fwd(
                         &mut c,
                         &fwd_user,
@@ -1394,9 +1380,13 @@ async fn main() -> Result<()> {
                     let cfg = Arc::new(client::Config::default());
                     let h =
                         SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
-                    let mut c = client::connect(cfg, (fwd_host.as_str(), fwd_port), h)
-                        .await
-                        .expect("SOCKS connect");
+                    let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("SOCKS connect failed: {}", e);
+                            continue;
+                        }
+                    };
                     authenticate_fwd(
                         &mut c,
                         &fwd_user,
@@ -1445,15 +1435,15 @@ async fn main() -> Result<()> {
             tokio::spawn(async move {
                 for spec in fw {
                     let cfg = Arc::new(client::Config::default());
-                    let h = SshHandler::new(
-                        strict_check,
-                        host.clone(),
-                        port,
-                        (*user_known_hosts).clone(),
-                    );
-                    let mut c = client::connect(cfg, (fwd_host.as_str(), fwd_port), h)
-                        .await
-                        .expect("Local forward connect");
+                    let h =
+                        SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
+                    let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Local forward connect failed: {}", e);
+                            continue;
+                        }
+                    };
                     authenticate_fwd(
                         &mut c,
                         &fwd_user,
