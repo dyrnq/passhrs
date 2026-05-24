@@ -77,8 +77,9 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Copy binary for tests
+        shell: bash
         run: |
-          mkdir -p target/release
+          mkdir -p target/release 2>/dev/null || true
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-gnu' && '.exe' || '') }} target/release/${{ env.BINARY_NAME }}${{ (matrix.target == 'x86_64-pc-windows-gnu' && '.exe' || '') }}
 
       - name: Run tests
