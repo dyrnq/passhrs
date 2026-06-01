@@ -35,8 +35,8 @@
 
 | Option                          | Description                                    |
 |:--------------------------------|:-----------------------------------------------|
-| `--password <pw>`               | Direct SSH password                            |
-| `--identity-passphrase <pw>`    | Identity file passphrase                       |
+| `--password <pw>`               | Direct SSH password (or `@file`)               |
+| `--identity-passphrase <pw>`    | Identity file passphrase (or `@file`)          |
 | `--exec-env <VAR=val>`          | Inject env vars before command (multi)         |
 | `--connect-timeout <s>`         | TCP connection timeout                         |
 | `--timeout <s>`                 | Inactivity timeout                             |
@@ -113,6 +113,10 @@ passhrs --password mypass user@host "ls -la"
 
 # Key + passphrase
 passhrs -i ~/.ssh/id_ed25519 --identity-passphrase myphrase user@host
+
+# Password/passphrase from file
+passhrs --password @/path/to/password.txt user@host
+passhrs --identity-passphrase <(echo -n myphrase) -i ~/.ssh/id_ed25519 user@host
 
 # Port forwarding (background)
 passhrs -N -f -L 8118:localhost:8118 user@host
