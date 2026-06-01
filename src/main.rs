@@ -287,7 +287,25 @@ pub fn parse_destination(dest: &str) -> Result<(String, Option<String>, u16)> {
     } else {
         (None, dest)
     };
-    let (host, port) = if let Some(colon_idx) = rest.rfind(':') {
+    // Handle IPv6: [host]:port or [host]
+    let (host, port) = if let Some(rest_stripped) = rest.strip_prefix('[') {
+        if let Some(bracket_end) = rest_stripped.find(']') {
+            let h = rest_stripped[..bracket_end].to_string();
+            let remaining = rest_stripped[bracket_end + 1..].trim_start_matches(':');
+            let p = if remaining.is_empty() {
+                None
+            } else {
+                Some(
+                    remaining
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid port in destination: {}", dest))?,
+                )
+            };
+            (h, p)
+        } else {
+            bail!("unclosed bracket in destination: {}", dest)
+        }
+    } else if let Some(colon_idx) = rest.rfind(':') {
         let p: u16 = rest[colon_idx + 1..]
             .parse()
             .with_context(|| format!("invalid port in destination: {}", dest))?;
@@ -496,6 +514,26 @@ fn expand_path(path: &str) -> String {
     path.to_string()
 }
 
+fn read_value_from_file(s: &str) -> Result<String> {
+    // @file 显式指定
+    if let Some(path) = s.strip_prefix('@') {
+        let val = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read value from file: {}", path))?;
+        return Ok(val.trim_end().to_string());
+    }
+    // 进程替换 /dev/fd/* (如 <(cmd)) 或直接文件路径
+    if !s.is_empty() && s.len() < 256 && s != "-" {
+        if let Ok(meta) = std::fs::metadata(s) {
+            if meta.is_file() {
+                let val = std::fs::read_to_string(s)
+                    .with_context(|| format!("failed to read value from file: {}", s))?;
+                return Ok(val.trim_end().to_string());
+            }
+        }
+    }
+    Ok(s.to_string())
+}
+
 pub fn parse_file_spec(spec: &str) -> Result<(String, String)> {
     if let Some(colon_idx) = spec.find(':') {
         Ok((
@@ -511,12 +549,47 @@ pub fn parse_file_spec(spec: &str) -> Result<(String, String)> {
 // ======================================================================
 
 pub fn socks5_response(bind_addr: &str, bind_port: u16, status: u8) -> Vec<u8> {
-    let mut resp = vec![5, status, 0, 1];
-    for octet in bind_addr.split('.') {
-        resp.push(octet.parse::<u8>().unwrap_or(0));
+    // Try IPv4 dotted notation first
+    if let Some(octets) = try_parse_ipv4(bind_addr) {
+        let mut resp = vec![5, status, 0, 1];
+        resp.extend_from_slice(&octets);
+        resp.extend_from_slice(&bind_port.to_be_bytes());
+        return resp;
     }
+    // Fall back to IPv6
+    if let Some(octets) = try_parse_ipv6(bind_addr) {
+        let mut resp = vec![5, status, 0, 4];
+        resp.extend_from_slice(&octets);
+        resp.extend_from_slice(&bind_port.to_be_bytes());
+        return resp;
+    }
+    // Domain name fallback (unlikely for bind address)
+    let mut resp = vec![5, status, 0, 3];
+    let bytes = bind_addr.as_bytes();
+    resp.push(bytes.len() as u8);
+    resp.extend_from_slice(bytes);
     resp.extend_from_slice(&bind_port.to_be_bytes());
     resp
+}
+
+fn try_parse_ipv4(addr: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = addr.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        octets[i] = p.parse().ok()?;
+    }
+    Some(octets)
+}
+
+fn try_parse_ipv6(addr: &str) -> Option<[u8; 16]> {
+    let addr = addr.trim_start_matches('[').trim_end_matches(']');
+    match addr.parse::<std::net::Ipv6Addr>() {
+        Ok(v6) => Some(v6.octets()),
+        Err(_) => None,
+    }
 }
 
 async fn socks5_handshake(
@@ -554,6 +627,14 @@ async fn socks5_handshake(
                 String::from_utf8_lossy(&domain).to_string(),
                 u16::from_be_bytes(p),
             ))
+        }
+        4 => {
+            let mut ip = [0u8; 16];
+            srx.read_exact(&mut ip).await?;
+            let mut p = [0u8; 2];
+            srx.read_exact(&mut p).await?;
+            let v6 = std::net::Ipv6Addr::from(ip);
+            Ok((v6.to_string(), u16::from_be_bytes(p)))
         }
         _ => bail!("unsupported SOCKS5 address type: {}", buf[3]),
     }
@@ -672,18 +753,18 @@ async fn http_connect_forward(
         let (stream, peer) = listener.accept().await?;
         info!("HTTP CONNECT connection from {}", peer);
         // Use borrowed handle - http_connect_handle_one doesn't own the handle
-        http_connect_handle_one(&handle, stream).await;
+        let _ = http_connect_handle_one(&handle, stream).await;
     }
 }
 
-async fn http_connect_handle_one(handle: &Handle<SshHandler>, mut stream: TcpStream) {
+async fn http_connect_handle_one(handle: &Handle<SshHandler>, mut stream: TcpStream) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 4096];
     let n = match stream.read(&mut buf).await {
         Ok(n) if n > 0 => n,
         _ => {
             let _ = stream.shutdown().await;
-            return;
+            return Ok(());
         }
     };
     let request = String::from_utf8_lossy(&buf[..n]);
@@ -700,7 +781,7 @@ async fn http_connect_handle_one(handle: &Handle<SshHandler>, mut stream: TcpStr
 ",
             )
             .await;
-        return;
+        return Ok(());
     }
     let host_port = parts[1];
     let hp: Vec<&str> = host_port.rsplitn(2, ':').collect();
@@ -713,7 +794,7 @@ async fn http_connect_handle_one(handle: &Handle<SshHandler>, mut stream: TcpStr
 ",
             )
             .await;
-        return;
+        return Ok(());
     }
     let host = hp[1];
     let port: u16 = match hp[0].parse() {
@@ -726,7 +807,7 @@ async fn http_connect_handle_one(handle: &Handle<SshHandler>, mut stream: TcpStr
 ",
                 )
                 .await;
-            return;
+            return Ok(());
         }
     };
     match handle
@@ -788,6 +869,7 @@ async fn http_connect_handle_one(handle: &Handle<SshHandler>, mut stream: TcpStr
                 .await;
         }
     }
+    Ok(())
 }
 
 // =====================================================
@@ -1032,6 +1114,29 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if cli.fork {
+        let args: Vec<String> = std::env::args()
+            .filter(|a| a != "-f" && a != "--fork")
+            .collect();
+        let exe = std::env::current_exe()?;
+        #[cfg(unix)]
+        std::process::Command::new(&exe)
+            .args(&args[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        #[cfg(windows)]
+        std::process::Command::new(&exe)
+            .args(&args[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x08000000)
+            .spawn()?;
+        std::process::exit(0);
+    }
+
     let log_level = if cli.quiet {
         "error"
     } else {
@@ -1051,30 +1156,6 @@ async fn main() -> Result<()> {
         }
     }
     builder.init();
-
-    if cli.fork {
-        let args: Vec<String> = std::env::args()
-            .filter(|a| a != "-f" && a != "--fork")
-            .collect();
-        let exe = std::env::current_exe()?;
-        #[cfg(unix)]
-        let child = std::process::Command::new(&exe)
-            .args(&args[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        #[cfg(windows)]
-        let child = std::process::Command::new(&exe)
-            .args(&args[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(0x08000000)
-            .spawn()?;
-        info!("Forked to background (pid: {})", child.id());
-        std::process::exit(0);
-    }
 
     let opts = parse_ssh_options(&cli.ssh_option);
     let dest_str = cli.destination.as_deref().unwrap_or("");
@@ -1105,8 +1186,16 @@ async fn main() -> Result<()> {
         .get("port")
         .and_then(|v| v.parse().ok())
         .unwrap_or(port);
-    let password = cli.password.as_deref().map(|s| s.to_string());
-    let passphrase = cli.passphrase.as_deref().map(|s| s.to_string());
+    let password = cli
+        .password
+        .as_deref()
+        .map(read_value_from_file)
+        .transpose()?;
+    let passphrase = cli
+        .passphrase
+        .as_deref()
+        .map(read_value_from_file)
+        .transpose()?;
 
     let local_forwards: Vec<ForwardSpec> = cli
         .local_forward
@@ -1644,15 +1733,20 @@ async fn authenticate(
     let u = user.to_string();
     if let Some(ref k) = cli.identity_file {
         info!("Loading key: {:?}", k);
-        if let Ok(pk) = load_secret_key(k, passphrase) {
-            let key = PrivateKeyWithHashAlg::new(Arc::new(pk), None);
-            if handle
-                .authenticate_publickey(u.clone(), key)
-                .await?
-                .success()
-            {
-                info!("Public key auth succeeded");
-                return Ok(());
+        match load_secret_key(k, passphrase) {
+            Ok(pk) => {
+                let key = PrivateKeyWithHashAlg::new(Arc::new(pk), None);
+                if handle
+                    .authenticate_publickey(u.clone(), key)
+                    .await?
+                    .success()
+                {
+                    info!("Public key auth succeeded");
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                warn!("Failed to load key {:?}: {}", k, e);
             }
         }
     }
@@ -1764,8 +1858,8 @@ fn print_help() {
     println!("  -V/--version     Version");
     println!("  --connect-timeout <s>");
     println!("  --exec-env <VAR=val>  Set env on remote");
-    println!("  --identity-passphrase  Key passphrase");
-    println!("  --password <pw>  SSH password");
+    println!("  --identity-passphrase  Key passphrase (or @file)");
+    println!("  --password <pw>  SSH password (or @file)");
     println!("  --timeout <s>    Inactivity timeout");
     println!("  --push <l>:<r>   Upload file/dir");
     println!("  --pull <r>:<l>   Download file/dir");
