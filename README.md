@@ -36,7 +36,9 @@
 | Option                          | Description                                    |
 |:--------------------------------|:-----------------------------------------------|
 | `--password <pw>`               | Direct SSH password (or `@file`)               |
+| `--password-file <path>`        | Read SSH password from file                    |
 | `--identity-passphrase <pw>`    | Identity file passphrase (or `@file`)          |
+| `--identity-passphrase-file <path>` | Read identity passphrase from file         |
 | `--exec-env <VAR=val>`          | Inject env vars before command (multi)         |
 | `--connect-timeout <s>`         | TCP connection timeout                         |
 | `--timeout <s>`                 | Inactivity timeout                             |

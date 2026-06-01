@@ -123,3 +123,44 @@ fn test_password_special_chars_no_file() {
     let (_, _, stderr) = run_phr(&["--password", "!@#$%", "user@localhost", "id"]);
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
+
+#[test]
+fn test_password_file_flag() {
+    let (path, _f) = create_temp_file("pw_from_file_flag", "pwflag");
+    let (_, _, stderr) = run_phr(&[
+        "--password-file",
+        &path.display().to_string(),
+        "user@localhost",
+        "id",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_passphrase_file_flag() {
+    let (path, _f) = create_temp_file("pp_from_file_flag", "ppflag");
+    let (_, _, stderr) = run_phr(&[
+        "--identity-passphrase-file",
+        &path.display().to_string(),
+        "user@localhost",
+        "id",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_password_file_flag_not_found() {
+    let (_, _, stderr) = run_phr(&[
+        "--password-file",
+        "/nonexistent/pw.txt",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(
+        stderr.contains("failed to read"),
+        "should error: {}",
+        stderr
+    );
+}

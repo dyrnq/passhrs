@@ -68,8 +68,12 @@ struct Cli {
     remote_forward: Vec<String>,
     #[arg(long = "identity-passphrase")]
     passphrase: Option<String>,
+    #[arg(long = "identity-passphrase-file")]
+    passphrase_file: Option<String>,
     #[arg(long = "password")]
     password: Option<String>,
+    #[arg(long = "password-file")]
+    password_file: Option<String>,
     #[arg(short = 'S', long = "control-path")]
     control_path: Option<String>,
     #[arg(long = "connect-timeout", default_value_t = 0)]
@@ -1186,16 +1190,26 @@ async fn main() -> Result<()> {
         .get("port")
         .and_then(|v| v.parse().ok())
         .unwrap_or(port);
-    let password = cli
-        .password
-        .as_deref()
-        .map(read_value_from_file)
-        .transpose()?;
-    let passphrase = cli
-        .passphrase
-        .as_deref()
-        .map(read_value_from_file)
-        .transpose()?;
+    let password = if let Some(ref f) = cli.password_file {
+        let val = std::fs::read_to_string(f)
+            .with_context(|| format!("failed to read --password-file: {}", f))?;
+        Some(val.trim_end().to_string())
+    } else {
+        cli.password
+            .as_deref()
+            .map(read_value_from_file)
+            .transpose()?
+    };
+    let passphrase = if let Some(ref f) = cli.passphrase_file {
+        let val = std::fs::read_to_string(f)
+            .with_context(|| format!("failed to read --identity-passphrase-file: {}", f))?;
+        Some(val.trim_end().to_string())
+    } else {
+        cli.passphrase
+            .as_deref()
+            .map(read_value_from_file)
+            .transpose()?
+    };
 
     let local_forwards: Vec<ForwardSpec> = cli
         .local_forward
@@ -1858,8 +1872,10 @@ fn print_help() {
     println!("  -V/--version     Version");
     println!("  --connect-timeout <s>");
     println!("  --exec-env <VAR=val>  Set env on remote");
-    println!("  --identity-passphrase  Key passphrase (or @file)");
+    println!("  --identity-passphrase   Key passphrase (or @file)");
+    println!("  --identity-passphrase-file  Read passphrase from file");
     println!("  --password <pw>  SSH password (or @file)");
+    println!("  --password-file   Read password from file");
     println!("  --timeout <s>    Inactivity timeout");
     println!("  --push <l>:<r>   Upload file/dir");
     println!("  --pull <r>:<l>   Download file/dir");
