@@ -5,7 +5,9 @@
     dead_code
 )]
 /// 一站式 Docker SSH 集成测试
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
@@ -449,4 +451,543 @@ fn test_connect_timeout_integration() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "should have failed");
     assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
+}
+
+// ======================================================================
+// 基本命令测试
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_exit_code_zero() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "true",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "true should exit 0: {}", stderr);
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_multiple_args() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "echo",
+        "hello",
+        "world",
+        "from",
+        "passhrs",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "echo multi args failed: {}", stderr);
+    assert_eq!(
+        stdout.trim(),
+        "hello world from passhrs",
+        "stdout: {}",
+        stdout
+    );
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_uname() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "uname",
+        "-a",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "uname failed: {}", stderr);
+    assert!(
+        stdout.to_lowercase().contains("linux"),
+        "should be Linux: {}",
+        stdout
+    );
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_which() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "which",
+        "sh",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "which sh failed: {}", stderr);
+    assert!(stdout.contains("/sh"), "sh should be found: {}", stdout);
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_yes_head() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "yes",
+        "test_line",
+        "|",
+        "head",
+        "-3",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "yes|head failed: {}", stderr);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "should output 3 lines: {}", stdout);
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_compress_flag() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-C",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "echo",
+        "compress_works",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "compress flag test failed: {}", stderr);
+    assert_eq!(stdout.trim(), "compress_works", "stdout: {}", stdout);
+}
+
+// ======================================================================
+// PTY / 输出格式测试
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_with_pty() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "ps",
+        "aux",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "ps aux failed: {}", stderr);
+    assert!(stdout.contains("USER"), "missing USER column");
+    assert!(stdout.contains("PID"), "missing PID column");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines.len() > 3, "too few lines: {}", lines.len());
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_ps_with_pipe() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "ps",
+        "aux",
+        "|",
+        "wc",
+        "-l",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "ps aux | wc -l failed: {}", stderr);
+    let count = stdout.trim().parse::<u32>().unwrap_or(0);
+    assert!(count > 2, "too few processes: {}", count);
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_force_tty_flag() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-t",
+        &d,
+        "tty",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "-t failed: {}", stderr);
+    assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
+    assert!(stdout.contains("/"), "should show tty device: {}", stdout);
+}
+
+// ======================================================================
+// IPv6 测试
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_command_with_dest_ipv6() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = format!("{}@[::1]", USER);
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "echo",
+        "ipv6_dest_ok",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "IPv6 destination failed: {}", stderr);
+    assert_eq!(stdout.trim(), "ipv6_dest_ok", "stdout: {}", stdout);
+}
+
+// ======================================================================
+// 代理转发测试
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_local_forward_spawn() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let local_port = "22300";
+    let mut child = Command::new(BIN)
+        .args([
+            "-p",
+            PORT,
+            "--password",
+            PASS,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-L",
+            &format!("{}:localhost:{}", local_port, PORT),
+            "-N",
+            &format!("{}@{}", USER, HOST),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn -L");
+    thread::sleep(Duration::from_secs(2));
+    let _ = child.kill();
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_socks5_proxy_spawn() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let socks_port = "21080";
+    let mut child = Command::new(BIN)
+        .args([
+            "-p",
+            PORT,
+            "--password",
+            PASS,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-D",
+            socks_port,
+            "-N",
+            &format!("{}@{}", USER, HOST),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn -D");
+    thread::sleep(Duration::from_secs(2));
+    let _ = child.kill();
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_http_connect_proxy_spawn() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let http_port = "21081";
+    let mut child = Command::new(BIN)
+        .args([
+            "-p",
+            PORT,
+            "--password",
+            PASS,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-H",
+            http_port,
+            "-N",
+            &format!("{}@{}", USER, HOST),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn -H");
+    thread::sleep(Duration::from_secs(2));
+    let _ = child.kill();
+}
+
+// ======================================================================
+// -f fork 测试
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_fork_background() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = format!("{}@{}", USER, HOST);
+    let out = Command::new(BIN)
+        .args([
+            "-p",
+            PORT,
+            "--password",
+            PASS,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-f",
+            &d,
+            "sleep",
+            "2",
+        ])
+        .output()
+        .expect("fork test");
+    assert!(out.status.success(), "fork exit non-zero");
+}
+
+// ======================================================================
+// 选项测试
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_multiple_ssh_options() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "TCPKeepAlive=yes",
+        "-o",
+        "ServerAliveInterval=10",
+        &d,
+        "echo",
+        "multi_opts_ok",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(ok, "multi opts failed: {}", stderr);
+    assert_eq!(stdout.trim(), "multi_opts_ok", "stdout: {}", stdout);
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_verbose_quiet_flags() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    // -vv with echo
+    let a_vv = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-vv",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "echo",
+        "verbose_test",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a_vv);
+    assert!(ok, "verbose test failed: {}", stderr);
+    assert_eq!(stdout.trim(), "verbose_test", "stdout: {}", stdout);
+    assert!(!stderr.is_empty(), "verbose should produce stderr output");
+
+    // -q with echo
+    let a_q = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-q",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "echo",
+        "quiet_test",
+    ];
+    let (ok2, stdout2, stderr2) = run_phr(&a_q);
+    assert!(ok2, "quiet test failed: {}", stderr2);
+    assert_eq!(stdout2.trim(), "quiet_test", "stdout: {}", stdout2);
+}
+
+// ======================================================================
+// ProxyJump 测试
+// ======================================================================
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_proxy_jump_self() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = format!("{}@{}", USER, HOST);
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-J",
+        &format!("{}:{}", HOST, PORT),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "echo",
+        "jump_ok",
+    ];
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
+    if ok {
+        assert_eq!(stdout.trim(), "jump_ok", "stdout: {}", stdout);
+    }
 }
