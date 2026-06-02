@@ -165,26 +165,59 @@ pub(crate) fn parse_proxy_jump(spec: &str) -> Result<ProxyJumpSpec> {
 }
 
 pub(crate) fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    if parts.len() == 3 {
-        Ok(ForwardSpec {
-            bind_addr: "127.0.0.1".into(),
-            bind_port: parts[0].parse().context("invalid bind port")?,
-            target_host: parts[1].into(),
-            target_port: parts[2].parse().context("invalid target port")?,
-        })
-    } else if parts.len() == 4 {
-        Ok(ForwardSpec {
-            bind_addr: parts[0].into(),
-            bind_port: parts[1].parse().context("invalid bind port")?,
-            target_host: parts[2].into(),
-            target_port: parts[3].parse().context("invalid target port")?,
-        })
+    let spec = spec.trim();
+    // Extract optional [bind_addr]
+    let (bind_addr, rest) = if let Some(s) = spec.strip_prefix('[') {
+        if let Some(bracket_end) = s.find(']') {
+            (
+                s[..bracket_end].to_string(),
+                s[bracket_end + 1..].trim_start_matches(':').to_string(),
+            )
+        } else {
+            bail!("unclosed bracket in forward spec: {}", spec)
+        }
     } else {
+        ("127.0.0.1".to_string(), spec.to_string())
+    };
+
+    // From the right: last segment is target_port, second-to-last is target_host
+    // (which may be IPv6 like [::1])
+    // rsplitn is safe for IPv6 because we split from the right
+    let mut parts: Vec<&str> = rest.rsplitn(2, ':').collect();
+    parts.reverse();
+    if parts.len() != 2 {
         bail!(
             "invalid forward spec: {}. Use port:host:port or bind:port:host:port",
             spec
-        )
+        );
+    }
+    let target_host = parts[0].to_string();
+    let target_port: u16 = parts[1].parse().context("invalid target port")?;
+
+    if bind_addr != "127.0.0.1" {
+        Ok(ForwardSpec {
+            bind_addr,
+            bind_port: 0,
+            target_host,
+            target_port,
+        })
+    } else {
+        // bind_addr is default, so rest is "port:host:port" or just "port:host"
+        // Parse bind_port from the leftmost segment
+        let left_parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if left_parts.len() < 2 {
+            bail!(
+                "invalid forward spec: {}. Use port:host:port or bind:port:host:port",
+                spec
+            );
+        }
+        let bind_port: u16 = left_parts[0].parse().context("invalid bind port")?;
+        Ok(ForwardSpec {
+            bind_addr,
+            bind_port,
+            target_host,
+            target_port,
+        })
     }
 }
 

@@ -483,7 +483,7 @@ async fn main() -> Result<()> {
                 || !http_connects.is_empty());
         if !pure_fwd {
             let channel = handle.channel_open_session().await?;
-            let want_pty = cli.force_tty || (cli.command.is_empty() && !cli.no_command);
+            let want_pty = cli.force_tty || !cli.no_command;
             if want_pty {
                 let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
                 channel
