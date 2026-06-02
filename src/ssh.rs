@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -271,7 +272,7 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
     use tokio::sync::oneshot;
 
     // Put local terminal in raw mode when running an interactive shell
-    let _raw = if !redirect_stdin && atty::is(atty::Stream::Stdin) {
+    let _raw = if !redirect_stdin && std::io::stdin().is_terminal() {
         RawModeGuard::new()
     } else {
         None
