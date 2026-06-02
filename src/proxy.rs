@@ -224,7 +224,10 @@ fn parse_connect_request(buf: &[u8]) -> Result<(String, u16)> {
     let request = String::from_utf8_lossy(buf);
     let parts: Vec<&str> = request.splitn(3, ' ').collect();
     if parts.len() < 2 || parts[0].to_uppercase() != "CONNECT" {
-        bail!("invalid HTTP CONNECT request: {}", request.lines().next().unwrap_or("?"));
+        bail!(
+            "invalid HTTP CONNECT request: {}",
+            request.lines().next().unwrap_or("?")
+        );
     }
     let host_port = parts[1];
     let hp: Vec<&str> = host_port.rsplitn(2, ':').collect();

@@ -346,17 +346,33 @@ async fn main() -> Result<()> {
 
         // -H HTTP CONNECT forwarding
         spawn_forward_tasks(
-            &http_connects, "HTTP CONNECT",
-            &host, port, user, &password, &passphrase, &cli.identity_file,
-            &user_known_hosts, strict_check, exit_on_fwd_failure,
+            &http_connects,
+            "HTTP CONNECT",
+            &host,
+            port,
+            user,
+            &password,
+            &passphrase,
+            &cli.identity_file,
+            &user_known_hosts,
+            strict_check,
+            exit_on_fwd_failure,
             |c, s, e| Box::pin(http_connect_forward(c, s, e)),
         );
 
         // -D SOCKS forwarding
         spawn_forward_tasks(
-            &dynamic_forwards, "SOCKS",
-            &host, port, user, &password, &passphrase, &cli.identity_file,
-            &user_known_hosts, strict_check, exit_on_fwd_failure,
+            &dynamic_forwards,
+            "SOCKS",
+            &host,
+            port,
+            user,
+            &password,
+            &passphrase,
+            &cli.identity_file,
+            &user_known_hosts,
+            strict_check,
+            exit_on_fwd_failure,
             |c, s, e| Box::pin(socks_proxy_forward(c, s, e)),
         );
 
@@ -382,9 +398,17 @@ async fn main() -> Result<()> {
 
         // -L local forwarding
         spawn_forward_tasks(
-            &local_forwards, "Local forward",
-            &host, port, user, &password, &passphrase, &cli.identity_file,
-            &user_known_hosts, strict_check, exit_on_fwd_failure,
+            &local_forwards,
+            "Local forward",
+            &host,
+            port,
+            user,
+            &password,
+            &passphrase,
+            &cli.identity_file,
+            &user_known_hosts,
+            strict_check,
+            exit_on_fwd_failure,
             |c, s, e| Box::pin(local_port_forward(c, s, e)),
         );
 
