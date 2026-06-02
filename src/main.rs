@@ -1775,9 +1775,36 @@ async fn authenticate(
 // Session I/O
 // ======================================================================
 
+/// RAII guard that sets stdin to raw mode and restores on drop.
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Option<Self> {
+        use crossterm::tty::IsTty;
+        if !std::io::stdin().is_tty() {
+            return None;
+        }
+        crossterm::terminal::enable_raw_mode().ok()?;
+        Some(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
 async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> Result<i32> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+
+    // Put local terminal in raw mode when running an interactive shell
+    let _raw = if !redirect_stdin && atty::is(atty::Stream::Stdin) {
+        RawModeGuard::new()
+    } else {
+        None
+    };
 
     let (mut rx, tx) = channel.split();
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
