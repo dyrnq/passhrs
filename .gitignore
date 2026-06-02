@@ -24,3 +24,6 @@ codex.sh
 graphify-out
 AGENTS.md
 *.bak.*
+
+# Generated
+TODO.md
