@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use log::*;
 use russh::client::Handle;
-use russh::ChannelMsg;
+use russh::client::Msg;
+use russh::{Channel, ChannelMsg};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::ssh::SshHandler;
@@ -217,11 +219,73 @@ pub(crate) async fn http_connect_forward(
     }
 }
 
+/// Parse an HTTP CONNECT request, returning (host, port).
+fn parse_connect_request(buf: &[u8]) -> Result<(String, u16)> {
+    let request = String::from_utf8_lossy(buf);
+    let parts: Vec<&str> = request.splitn(3, ' ').collect();
+    if parts.len() < 2 || parts[0].to_uppercase() != "CONNECT" {
+        bail!("invalid HTTP CONNECT request: {}", request.lines().next().unwrap_or("?"));
+    }
+    let host_port = parts[1];
+    let hp: Vec<&str> = host_port.rsplitn(2, ':').collect();
+    if hp.len() != 2 {
+        bail!("invalid host:port in CONNECT: {}", host_port);
+    }
+    let port: u16 = hp[0].parse().context("invalid port in CONNECT")?;
+    Ok((hp[1].to_string(), port))
+}
+
+/// Write an HTTP response status line to the stream.
+async fn write_http_response(stream: &mut TcpStream, status: u16, message: &str) {
+    use tokio::io::AsyncWriteExt;
+    let resp = format!("HTTP/1.1 {} {}\r\n\r\n", status, message);
+    let _ = stream.write_all(resp.as_bytes()).await;
+}
+
+/// Bidirectional tunnel: SSH channel <-> TCP stream.
+async fn tunnel_forward(channel: Channel<Msg>, stream: TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut crx, ctx) = channel.split();
+    let (mut srx, mut stx) = tokio::io::split(stream);
+    let c2s = tokio::spawn(async move {
+        loop {
+            match crx.wait().await {
+                Some(ChannelMsg::Data { ref data }) => {
+                    if stx.write_all(data).await.is_err() {
+                        break;
+                    }
+                    let _ = stx.flush().await;
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                _ => {}
+            }
+        }
+    });
+    let s2c = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match srx.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = ctx.eof().await;
+                    break;
+                }
+                Ok(n) => {
+                    if ctx.data(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let _ = tokio::join!(c2s, s2c);
+}
+
 pub(crate) async fn http_connect_handle_one(
     handle: &Handle<SshHandler>,
     mut stream: TcpStream,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; 4096];
     let n = match stream.read(&mut buf).await {
         Ok(n) if n > 0 => n,
@@ -230,106 +294,26 @@ pub(crate) async fn http_connect_handle_one(
             return Ok(());
         }
     };
-    let request = String::from_utf8_lossy(&buf[..n]);
-    let parts: Vec<&str> = request.splitn(3, ' ').collect();
-    if parts.len() < 2 || parts[0].to_uppercase() != "CONNECT" {
-        warn!(
-            "-H invalid HTTP CONNECT request: {}",
-            request.lines().next().unwrap_or("?")
-        );
-        let _ = stream
-            .write_all(
-                b"HTTP/1.1 400 Bad Request
-
-",
-            )
-            .await;
-        return Ok(());
-    }
-    let host_port = parts[1];
-    let hp: Vec<&str> = host_port.rsplitn(2, ':').collect();
-    if hp.len() != 2 {
-        warn!("-H invalid host:port: {}", host_port);
-        let _ = stream
-            .write_all(
-                b"HTTP/1.1 400 Bad Request
-
-",
-            )
-            .await;
-        return Ok(());
-    }
-    let host = hp[1];
-    let port: u16 = match hp[0].parse() {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 400 Bad Request
-
-",
-                )
-                .await;
+    let (host, port) = match parse_connect_request(&buf[..n]) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("-H {}", e);
+            write_http_response(&mut stream, 400, "Bad Request").await;
             return Ok(());
         }
     };
     match handle
-        .channel_open_direct_tcpip(host, port as u32, "127.0.0.1", 0u32)
+        .channel_open_direct_tcpip(&host, port as u32, "127.0.0.1", 0u32)
         .await
     {
         Ok(channel) => {
             info!("-H CONNECT {}:{} via SSH", host, port);
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 200 Connection Established
-
-",
-                )
-                .await;
-            let (mut crx, ctx) = channel.split();
-            let (mut srx, mut stx) = tokio::io::split(stream);
-            let c2s = tokio::spawn(async move {
-                loop {
-                    match crx.wait().await {
-                        Some(ChannelMsg::Data { ref data }) => {
-                            if stx.write_all(data).await.is_err() {
-                                break;
-                            }
-                            let _ = stx.flush().await;
-                        }
-                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                        _ => {}
-                    }
-                }
-            });
-            let s2c = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match srx.read(&mut buf).await {
-                        Ok(0) => {
-                            let _ = ctx.eof().await;
-                            break;
-                        }
-                        Ok(n) => {
-                            if ctx.data(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            let _ = tokio::join!(c2s, s2c);
+            write_http_response(&mut stream, 200, "Connection Established").await;
+            tunnel_forward(channel, stream).await;
         }
         Err(e) => {
             warn!("-H channel_open {}:{} failed: {}", host, port, e);
-            let _ = stream
-                .write_all(
-                    b"HTTP/1.1 502 Bad Gateway
-
-",
-                )
-                .await;
+            write_http_response(&mut stream, 502, "Bad Gateway").await;
         }
     }
     Ok(())
