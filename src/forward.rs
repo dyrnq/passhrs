@@ -81,3 +81,67 @@ pub(crate) async fn local_port_forward(
         }
     }
 }
+
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::Future;
+use russh::client::{self};
+
+use crate::ssh::authenticate_fwd;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_forward_tasks<Spec, Fut>(
+    specs: &[Spec],
+    label: &'static str,
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &Option<String>,
+    passphrase: &Option<String>,
+    identity_file: &Option<std::path::PathBuf>,
+    user_known_hosts: &std::sync::Arc<Option<String>>,
+    strict_check: bool,
+    exit_on_fwd_failure: bool,
+    forward_fn: fn(Handle<SshHandler>, Spec, bool) -> Pin<Box<Fut>>,
+) where
+    Spec: Clone + Send + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    if specs.is_empty() {
+        return;
+    }
+    let fw = specs.to_vec();
+    let fwd_host = host.to_string();
+    let fwd_port = port;
+    let fwd_user = user.to_string();
+    let fwd_pw = password.clone();
+    let fwd_pp = passphrase.clone();
+    let fwd_key = identity_file.clone();
+    let uk = user_known_hosts.clone();
+    tokio::spawn(async move {
+        for spec in fw {
+            let cfg = Arc::new(client::Config::default());
+            let h = SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
+            let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("{} connect failed: {}", label, e);
+                    continue;
+                }
+            };
+            authenticate_fwd(
+                &mut c,
+                &fwd_user,
+                fwd_pw.as_deref(),
+                fwd_pp.as_deref(),
+                fwd_key.as_deref(),
+            )
+            .await
+            .ok();
+            let _ = forward_fn(c, spec, exit_on_fwd_failure).await;
+        }
+        tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+    });
+}

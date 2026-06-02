@@ -19,7 +19,7 @@ use std::os::windows::process::CommandExt;
 use russh_sftp::client::SftpSession;
 
 use crate::cli::*;
-use crate::forward::local_port_forward;
+use crate::forward::{local_port_forward, spawn_forward_tasks};
 use crate::proxy::*;
 use crate::sftp::*;
 use crate::ssh::*;
@@ -344,80 +344,21 @@ async fn main() -> Result<()> {
             }
         }
 
-        // -A agent forwarding (placeholder)
         // -H HTTP CONNECT forwarding
-        if !http_connects.is_empty() {
-            let fw = http_connects.clone();
-            let fwd_host = host.to_string();
-            let fwd_port = port;
-            let fwd_user = user.to_string();
-            let fwd_pw = password.clone();
-            let fwd_pp = passphrase.clone();
-            let fwd_key = cli.identity_file.clone();
-            let uk = user_known_hosts.clone();
-            tokio::spawn(async move {
-                for spec in fw {
-                    let cfg = Arc::new(client::Config::default());
-                    let h =
-                        SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
-                    let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("HTTP CONNECT connect failed: {}", e);
-                            continue;
-                        }
-                    };
-                    authenticate_fwd(
-                        &mut c,
-                        &fwd_user,
-                        fwd_pw.as_deref(),
-                        fwd_pp.as_deref(),
-                        fwd_key.as_deref(),
-                    )
-                    .await
-                    .ok();
-                    let _ = http_connect_forward(c, spec, exit_on_fwd_failure).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
-            });
-        }
+        spawn_forward_tasks(
+            &http_connects, "HTTP CONNECT",
+            &host, port, user, &password, &passphrase, &cli.identity_file,
+            &user_known_hosts, strict_check, exit_on_fwd_failure,
+            |c, s, e| Box::pin(http_connect_forward(c, s, e)),
+        );
 
-        // -D SOCKS forwarding (separate connections)
-        if !dynamic_forwards.is_empty() {
-            let fw = dynamic_forwards.clone();
-            let fwd_host = host.to_string();
-            let fwd_port = port;
-            let fwd_user = user.to_string();
-            let fwd_pw = password.clone();
-            let fwd_pp = passphrase.clone();
-            let fwd_key = cli.identity_file.clone();
-            let uk = user_known_hosts.clone();
-            tokio::spawn(async move {
-                for spec in fw {
-                    let cfg = Arc::new(client::Config::default());
-                    let h =
-                        SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
-                    let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("SOCKS connect failed: {}", e);
-                            continue;
-                        }
-                    };
-                    authenticate_fwd(
-                        &mut c,
-                        &fwd_user,
-                        fwd_pw.as_deref(),
-                        fwd_pp.as_deref(),
-                        fwd_key.as_deref(),
-                    )
-                    .await
-                    .ok();
-                    let _ = socks_proxy_forward(c, spec, exit_on_fwd_failure).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
-            });
-        }
+        // -D SOCKS forwarding
+        spawn_forward_tasks(
+            &dynamic_forwards, "SOCKS",
+            &host, port, user, &password, &passphrase, &cli.identity_file,
+            &user_known_hosts, strict_check, exit_on_fwd_failure,
+            |c, s, e| Box::pin(socks_proxy_forward(c, s, e)),
+        );
 
         // -R remote forwarding
         for fw in &remote_forwards {
@@ -439,42 +380,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        // -L local forwarding (separate connections)
-        if !local_forwards.is_empty() {
-            let fw = local_forwards.clone();
-            let fwd_host = host.to_string();
-            let fwd_port = port;
-            let fwd_user = user.to_string();
-            let fwd_pw = password.clone();
-            let fwd_pp = passphrase.clone();
-            let fwd_key = cli.identity_file.clone();
-            let uk = user_known_hosts.clone();
-            tokio::spawn(async move {
-                for spec in fw {
-                    let cfg = Arc::new(client::Config::default());
-                    let h =
-                        SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
-                    let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            warn!("Local forward connect failed: {}", e);
-                            continue;
-                        }
-                    };
-                    authenticate_fwd(
-                        &mut c,
-                        &fwd_user,
-                        fwd_pw.as_deref(),
-                        fwd_pp.as_deref(),
-                        fwd_key.as_deref(),
-                    )
-                    .await
-                    .ok();
-                    let _ = local_port_forward(c, spec, exit_on_fwd_failure).await;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
-            });
-        }
+        // -L local forwarding
+        spawn_forward_tasks(
+            &local_forwards, "Local forward",
+            &host, port, user, &password, &passphrase, &cli.identity_file,
+            &user_known_hosts, strict_check, exit_on_fwd_failure,
+            |c, s, e| Box::pin(local_port_forward(c, s, e)),
+        );
 
         // Session channel for shell/command
         let pure_fwd = cli.no_command
