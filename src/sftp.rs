@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use copia::{Sync, SyncBuilder};
+use copia::{DeltaOp, Sync, SyncBuilder};
 use log::*;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
@@ -225,8 +225,8 @@ pub(crate) async fn rsync_upload(
                     .ops
                     .iter()
                     .map(|op| match op {
-                        copia::DeltaOp::Literal(data) => data.len() as u64,
-                        copia::DeltaOp::Copy { .. } => 13,
+                        DeltaOp::Literal(data) => data.len() as u64,
+                        DeltaOp::Copy { .. } => 13,
                     })
                     .sum::<u64>();
                 if delta_size < local_data.len() as u64 {
@@ -286,7 +286,26 @@ pub(crate) async fn rsync_download(
     sftp: &SftpSession,
     remote_root: &str,
     local_root: &str,
+    opts: &[String],
 ) -> Result<()> {
+    let mut delete_extra = false;
+    let mut dry_run = false;
+    let mut use_checksum = false;
+    let mut excludes: Vec<String> = Vec::new();
+    for opt in opts {
+        if opt == "delete" {
+            delete_extra = true;
+        } else if opt == "dry-run" || opt == "dry_run" {
+            dry_run = true;
+        } else if opt == "checksum" {
+            use_checksum = true;
+        } else if let Some(pat) = opt.strip_prefix("exclude=") {
+            excludes.push(pat.to_string());
+        } else {
+            warn!("unknown --rsync-opt: {}", opt);
+        }
+    }
+
     let local_files = list_local_files(local_root).await?;
     let remote_files = list_remote_files(sftp, remote_root).await?;
     let local_prefix = local_root.trim_end_matches('/');
@@ -297,23 +316,60 @@ pub(crate) async fn rsync_download(
             .strip_prefix(remote_prefix)
             .unwrap_or(remote_path);
         let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
+        // --rsync-opt exclude
+        if excludes.iter().any(|pat| {
+            rel_path.contains(pat) || rel_path.ends_with(pat) || remote_path.contains(pat)
+        }) {
+            info!("rsync skip (excluded): {}", rel_path);
+            continue;
+        }
         let local_path = format!("{}/{}", local_prefix, rel_path);
 
         match local_files.get(&local_path) {
-            Some(li) if li.size == info.size && li.mtime == info.mtime => {
+            Some(li) if li.size == info.size && (!use_checksum && li.mtime == info.mtime) => {
                 info!("rsync skip (same): {}", rel_path);
                 continue;
             }
             Some(li) if li.size == info.size => {
-                info!("rsync delta check: {}", rel_path);
+                info!("rsync delta check: {} (size={})", rel_path, info.size);
                 let local_data = tokio::fs::read(&local_path).await?;
                 let remote_data = sftp.read(remote_path).await?;
                 if local_data == remote_data {
-                    info!("rsync: content identical");
+                    info!("rsync: content identical, skipping");
+                    continue;
+                }
+                let sync = SyncBuilder::new().block_size(4096).build();
+                let sig = sync.signature(std::io::Cursor::new(&local_data))?;
+                let delta = sync.delta(std::io::Cursor::new(&remote_data), &sig)?;
+                let delta_size = delta
+                    .ops
+                    .iter()
+                    .map(|op| match op {
+                        DeltaOp::Literal(data) => data.len() as u64,
+                        DeltaOp::Copy { .. } => 13,
+                    })
+                    .sum::<u64>();
+                if delta_size < remote_data.len() as u64 {
+                    info!(
+                        "rsync delta: {} -> {} bytes (saved {}%)",
+                        remote_data.len(),
+                        delta_size,
+                        (1.0 - delta_size as f64 / remote_data.len() as f64) * 100.0
+                    );
+                    let mut output = Vec::new();
+                    sync.patch(std::io::Cursor::new(&local_data), &delta, &mut output)?;
+                    tokio::fs::write(&local_path, &output).await?;
                     continue;
                 }
             }
             _ => {}
+        }
+        if dry_run {
+            info!(
+                "rsync dry-run: would download {} -> {}",
+                remote_path, local_path
+            );
+            continue;
         }
         info!("rsync download: {} -> {}", remote_path, local_path);
         let data = sftp.read(remote_path).await?;
@@ -321,6 +377,22 @@ pub(crate) async fn rsync_download(
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&local_path, &data).await?;
+    }
+    // --rsync-opt delete: remove local files not on remote
+    if delete_extra {
+        for local_path in local_files.keys() {
+            let rel_path = local_path.strip_prefix(local_prefix).unwrap_or(local_path);
+            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
+            let remote_path = format!("{}/{}", remote_prefix, rel_path);
+            if !remote_files.contains_key(&remote_path) {
+                if dry_run {
+                    info!("rsync dry-run: would delete {}", local_path);
+                } else {
+                    info!("rsync delete: {}", local_path);
+                    let _ = tokio::fs::remove_file(local_path).await;
+                }
+            }
+        }
     }
     Ok(())
 }
