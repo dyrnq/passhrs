@@ -69,6 +69,10 @@ jobs:
         if: matrix.name == 'windows-msvc'
         uses: ilammy/setup-nasm@v1
 
+      - name: Install NASM (windows gnu)
+        if: matrix.name == 'windows-gnu'
+        uses: ilammy/setup-nasm@v1
+
       - uses: actions/cache@v4
         with:
           path: |
