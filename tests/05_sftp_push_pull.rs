@@ -98,3 +98,132 @@ fn test_push_invalid_spec() {
         stderr
     );
 }
+
+// --rsync 参数解析测试
+
+#[test]
+fn test_rsync_upload_spec() {
+    let (_, _, stderr) = run_phr(&["--rsync", "/local/dir:/remote/dir", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_with_opt_delete() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/dir:/remote/dir",
+        "--rsync-opt",
+        "delete",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_with_opt_dry_run() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/dir:/remote/dir",
+        "--rsync-opt",
+        "dry-run",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_with_opt_checksum() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/dir:/remote/dir",
+        "--rsync-opt",
+        "checksum",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_with_opt_exclude() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/dir:/remote/dir",
+        "--rsync-opt",
+        "exclude=.git",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_multiple_opts() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/dir:/remote/dir",
+        "--rsync-opt",
+        "delete",
+        "--rsync-opt",
+        "exclude=.git",
+        "--rsync-opt",
+        "dry-run",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_relative_path_fails() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "relative/path:/remote/dir",
+        "user@localhost",
+        "id",
+    ]);
+    // Should not panic — error is expected (either path validation or auth failure)
+    assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
+}
+
+#[test]
+fn test_rsync_invalid_spec() {
+    let (_, _, stderr) = run_phr(&["--rsync", "invalid", "user@localhost", "id"]);
+    let combined = stderr.to_lowercase();
+    assert!(
+        !combined.contains("thread") || combined.contains("error"),
+        "should not panic: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_rsync_push_and_pull_combined() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/a:/remote/a",
+        "--push",
+        "/tmp/extra.sh:/tmp/extra.sh",
+        "--pull",
+        "/tmp/result.log:/tmp/result.log",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_rsync_with_unknown_opt() {
+    let (_, _, stderr) = run_phr(&[
+        "--rsync",
+        "/local/dir:/remote/dir",
+        "--rsync-opt",
+        "unknown_option_xyz",
+        "user@localhost",
+        "id",
+    ]);
+    // Should warn about unknown opt but not error
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
