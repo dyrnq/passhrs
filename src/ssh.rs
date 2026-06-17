@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use log::*;
 use russh::client::{Handle, Handler, Msg};
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
+use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg};
 
 use crate::cli::Cli;
@@ -191,13 +191,17 @@ pub(crate) async fn authenticate_fwd(
     let u = user.to_string();
     if let Some(k) = identity_file {
         if let Ok(pk) = load_secret_key(k, passphrase) {
-            let key = PrivateKeyWithHashAlg::new(Arc::new(pk), None);
-            if handle
-                .authenticate_publickey(u.clone(), key)
-                .await?
-                .success()
-            {
-                return Ok(());
+            let algos: &[Option<HashAlg>] = if pk.algorithm().is_rsa() {
+                &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+            } else {
+                &[None]
+            };
+            for &algo in algos {
+                let key = PrivateKeyWithHashAlg::new(Arc::new(pk.clone()), algo);
+                let result = handle.authenticate_publickey(u.clone(), key).await?;
+                if result.success() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -224,13 +228,22 @@ pub(crate) async fn authenticate(
         info!("Loading key: {:?}", k);
         match load_secret_key(k, passphrase) {
             Ok(pk) => {
-                let key = PrivateKeyWithHashAlg::new(Arc::new(pk), None);
-                if handle
-                    .authenticate_publickey(u.clone(), key)
-                    .await?
-                    .success()
-                {
-                    info!("Public key auth succeeded");
+                let algos: &[Option<HashAlg>] = if pk.algorithm().is_rsa() {
+                    &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+                } else {
+                    &[None]
+                };
+                let mut succeeded = false;
+                for &algo in algos {
+                    let key = PrivateKeyWithHashAlg::new(Arc::new(pk.clone()), algo);
+                    let result = handle.authenticate_publickey(u.clone(), key).await?;
+                    if result.success() {
+                        info!("Public key auth succeeded");
+                        succeeded = true;
+                        break;
+                    }
+                }
+                if succeeded {
                     return Ok(());
                 }
             }
