@@ -160,3 +160,68 @@ fn test_key_auth_with_passphrase() {
         stderr
     );
 }
+
+// ======================================================================
+// RSA key auth — verifies SHA-512/SHA-256 fallback for OpenSSH 8.8+
+// (sha-rsa/SHA-1 is disabled by default in modern OpenSSH)
+// See: https://github.com/dyrnq/passhrs/issues/1
+// ======================================================================
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_rsa_key_auth() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+
+    let key_path = "/tmp/phr_test_rsa_id";
+    let pub_path = format!("{}.pub", key_path);
+    let _ = std::fs::remove_file(key_path);
+    let _ = std::fs::remove_file(&pub_path);
+
+    // Generate RSA key (4096-bit)
+    let out = Command::new("ssh-keygen")
+        .args(["-t", "rsa", "-b", "4096", "-f", &key_path, "-N", ""])
+        .output()
+        .expect("ssh-keygen rsa failed");
+    assert!(
+        out.status.success(),
+        "ssh-keygen rsa failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let pub_key = std::fs::read_to_string(&pub_path).expect("read rsa pubkey");
+    add_key_to_container(pub_key.trim());
+    thread::sleep(Duration::from_secs(1));
+
+    let out = Command::new("./target/release/passhrs")
+        .args([
+            "-p",
+            PORT,
+            "-i",
+            &key_path,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            &format!("{}@{}", USER, HOST),
+            "echo",
+            "rsa_sha2_ok",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("passhrs rsa key auth");
+
+    cleanup_key(&key_path);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stdout.contains("rsa_sha2_ok"),
+        "RSA key auth should succeed (SHA-512/SHA-256 fallback)\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+}
