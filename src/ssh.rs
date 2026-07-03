@@ -346,3 +346,51 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
     info!("Session exit code {}", code);
     Ok(code)
 }
+
+/// Decide whether a local environment variable should be forwarded to the
+/// remote session (shell / exec).
+///
+/// Mirrors OpenSSH's default `SendEnv LANG LC_*` behavior: forward `LANG`,
+/// `LANGUAGE` and every `LC_*` locale variable. This lets locale-aware remote
+/// programs (vi/less/nano/…) render UTF-8 correctly and avoids garbled
+/// multibyte (e.g. Chinese) text. Everything else is intentionally not
+/// forwarded, to avoid leaking the local environment or overriding remote
+/// configuration.
+pub(crate) fn should_forward_locale_env(name: &str) -> bool {
+    name == "LANG" || name == "LANGUAGE" || name.starts_with("LC_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_forward_locale_env;
+
+    #[test]
+    fn forwards_lang_and_language() {
+        assert!(should_forward_locale_env("LANG"));
+        assert!(should_forward_locale_env("LANGUAGE"));
+    }
+
+    #[test]
+    fn forwards_all_lc_variants() {
+        assert!(should_forward_locale_env("LC_ALL"));
+        assert!(should_forward_locale_env("LC_CTYPE"));
+        assert!(should_forward_locale_env("LC_MESSAGES"));
+        assert!(should_forward_locale_env("LC_TIME"));
+        // Prefix match covers any future LC_* variable.
+        assert!(should_forward_locale_env("LC_SOMETHING_NEW"));
+    }
+
+    #[test]
+    fn does_not_forward_unrelated_env() {
+        // Avoid leaking local env or overriding remote configuration.
+        assert!(!should_forward_locale_env("PATH"));
+        assert!(!should_forward_locale_env("HOME"));
+        assert!(!should_forward_locale_env("TERM"));
+        assert!(!should_forward_locale_env("SSH_AUTH_SOCK"));
+        // No substring matching: names that merely contain LANG/LC_ but are
+        // not locale variables must not be forwarded.
+        assert!(!should_forward_locale_env("MYLANG"));
+        assert!(!should_forward_locale_env("XLC_FOO"));
+        assert!(!should_forward_locale_env("LANGUAGES"));
+    }
+}
