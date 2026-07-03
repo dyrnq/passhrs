@@ -4,7 +4,18 @@
     clippy::needless_borrows_for_generic_args,
     dead_code
 )]
-/// 一站式 Docker SSH 集成测试
+//! One-stop native-OpenSSH integration tests.
+//!
+//! Replaces the previous Docker-based suite. The platform-specific
+//! setup scripts under `tests/sshd/` start a real `sshd` on
+//! `127.0.0.1:22222` with a known `testuser:testpass` account, and the
+//! tests exercise passhrs end-to-end against it.
+//!
+//! Because sshd is now native, the "remote" filesystem is the same as
+//! the test process's local filesystem — tests can read/clean up
+//! remote artifacts with `std::fs` directly instead of shelling out
+//! to the server.
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -15,33 +26,27 @@ const USER: &str = "testuser";
 const PASS: &str = "testpass";
 const BIN: &str = "./target/release/passhrs";
 
-fn container_ok() -> bool {
-    Command::new("docker")
-        .args([
-            "ps",
-            "--filter",
-            "name=phr-test-ssh",
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .map(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            o.status.success() && s == "phr-test-ssh"
-        })
-        .unwrap_or(false)
+/// Platform-appropriate temp directory for test artifacts. The "remote"
+/// paths used in push/pull/rsync tests are rooted here so they resolve
+/// correctly on Linux, macOS and Windows runners without relying on a
+/// hard-coded `/tmp`.
+fn tmp_root() -> PathBuf {
+    std::env::temp_dir()
 }
 
-fn exec_on_container(cmd: &str) -> (bool, String, String) {
-    let output = Command::new("docker")
-        .args(["exec", "phr-test-ssh", "sh", "-c", cmd])
-        .output()
-        .expect("docker exec failed");
-    (
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+/// Returns true when a real sshd is listening on `127.0.0.1:22222` and
+/// accepts a TCP connection within a short timeout. Used as the
+/// `#[ignore]` gate so tests skip cleanly when setup has not run.
+fn sshd_ok() -> bool {
+    use std::net::ToSocketAddrs;
+    let addr = match format!("{}:{}", HOST, PORT).to_socket_addrs() {
+        Ok(mut it) => match it.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
 fn run_phr(args: &[&str]) -> (bool, String, String) {
@@ -62,9 +67,9 @@ fn dest() -> String {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_basic_command_exec() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -92,9 +97,9 @@ fn test_basic_command_exec() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_push_pull_file() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -122,8 +127,8 @@ fn test_push_pull_file() {
     let (ok, _, stderr) = run_phr(&a);
     assert!(ok, "push failed: {}", stderr);
 
-    let (ok2, out, _) = exec_on_container(&format!("cat {}", remote));
-    assert!(ok2, "remote file not found");
+    let out = std::fs::read_to_string(&remote).unwrap_or_default();
+    assert!(!out.is_empty(), "remote file not found");
     assert!(out.contains("hello sftp push"), "content mismatch");
 
     let spec2 = format!("{}:{}", remote, local2);
@@ -150,13 +155,13 @@ fn test_push_pull_file() {
     );
     let _ = std::fs::remove_file(local);
     let _ = std::fs::remove_file(local2);
-    let _ = exec_on_container(&format!("rm -f {}", remote));
+    let _ = std::fs::remove_file(&remote);
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_push_dir() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -166,7 +171,7 @@ fn test_push_dir() {
     std::fs::write(format!("{}/a.txt", dir), b"file a").unwrap();
     let _ = std::fs::create_dir_all(format!("{}/sub", dir));
     std::fs::write(format!("{}/sub/c.txt", dir), b"file c").unwrap();
-    exec_on_container(&format!("rm -rf {}", remote_dir));
+    let _ = std::fs::remove_dir_all(remote_dir);
 
     let spec = format!("{}/:{}", dir, remote_dir);
     let d = dest();
@@ -186,11 +191,21 @@ fn test_push_dir() {
     ];
     let (ok, _, stderr) = run_phr(&a);
     assert!(ok, "push dir failed: {}", stderr);
-    let (ok2, out, _) = exec_on_container(&format!("ls {}/sub/", remote_dir));
-    assert!(ok2, "remote subdir missing: {}", out);
-    assert!(out.contains("c.txt"), "subdir content: {}", out);
+    let entries: Vec<String> = std::fs::read_dir(format!("{}/sub", remote_dir))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(!entries.is_empty(), "remote subdir missing");
+    assert!(
+        entries.iter().any(|n| n == "c.txt"),
+        "subdir content: {:?}",
+        entries
+    );
     let _ = std::fs::remove_dir_all(dir);
-    let _ = exec_on_container(&format!("rm -rf {}", remote_dir));
+    let _ = std::fs::remove_dir_all(remote_dir);
 }
 
 // ======================================================================
@@ -198,15 +213,16 @@ fn test_push_dir() {
 // ======================================================================
 
 fn setup_rsync_remote(remote_dir: &str) {
-    exec_on_container(&format!("rm -rf {}", remote_dir));
-    exec_on_container(&format!("mkdir -p {}", remote_dir));
-    exec_on_container(&format!("chown testuser:testuser {}", remote_dir));
+    let _ = std::fs::remove_dir_all(remote_dir);
+    std::fs::create_dir_all(remote_dir).expect("create remote rsync dir");
+    // No chown needed: testuser owns its own home and per-user temp dirs
+    // on the native sshd host.
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_rsync_upload_basic() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -236,28 +252,37 @@ fn test_rsync_upload_basic() {
     let (ok, _, stderr) = run_phr(&a);
     assert!(ok, "rsync upload failed: {}", stderr);
     for f in ["f1.txt", "f2.txt"] {
-        let (ok2, _, _) = exec_on_container(&format!("test -f {}/{}", remote_dir, f));
-        assert!(ok2, "remote file {} missing", f);
+        let p = format!("{}/{}", remote_dir, f);
+        assert!(
+            std::path::Path::new(&p).exists(),
+            "remote file {} missing",
+            f
+        );
     }
     let _ = std::fs::remove_dir_all(dir);
-    let _ = exec_on_container(&format!("rm -rf {}", remote_dir));
+    let _ = std::fs::remove_dir_all(remote_dir);
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_rsync_delta() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
     let remote_dir = "/tmp/phr_delta_dst";
     let local_dir = "/tmp/phr_delta_src";
     setup_rsync_remote(remote_dir);
-    // Create remote file as testuser so it's writable by SSH
-    exec_on_container(&format!(
-        "su testuser -c 'echo ORIGINAL_CONTENT > {}/file.txt'",
-        remote_dir
-    ));
+    // Seed the remote file. The native sshd host means we can write
+    // directly and chmod world-writable so testuser can overwrite it
+    // during the rsync delta test.
+    let remote_file = format!("{}/file.txt", remote_dir);
+    std::fs::write(&remote_file, b"ORIGINAL_CONTENT").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&remote_file, std::fs::Permissions::from_mode(0o666));
+    }
     let _ = std::fs::create_dir_all(local_dir);
     std::fs::write(format!("{}/file.txt", local_dir), b"MODIFIED_CONTENT").unwrap();
 
@@ -280,13 +305,13 @@ fn test_rsync_delta() {
     let (ok, _, stderr) = run_phr(&a);
     assert!(ok, "rsync delta failed: {}", stderr);
     let _ = std::fs::remove_dir_all(local_dir);
-    let _ = exec_on_container(&format!("rm -rf {}", remote_dir));
+    let _ = std::fs::remove_dir_all(remote_dir);
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_rsync_with_exclude() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -317,12 +342,15 @@ fn test_rsync_with_exclude() {
     ];
     let (ok, _, stderr) = run_phr(&a);
     assert!(ok, "rsync exclude failed: {}", stderr);
-    let (ok1, _, _) = exec_on_container(&format!("test -f {}/keep.txt", remote_dir));
-    assert!(ok1, "keep.txt missing");
-    let (ok2, _, _) = exec_on_container(&format!("test -f {}/ignore.txt", remote_dir));
-    assert!(!ok2, "ignore.txt should be excluded");
+    let keep = format!("{}/keep.txt", remote_dir);
+    let ignore = format!("{}/ignore.txt", remote_dir);
+    assert!(std::path::Path::new(&keep).exists(), "keep.txt missing");
+    assert!(
+        !std::path::Path::new(&ignore).exists(),
+        "ignore.txt should be excluded"
+    );
     let _ = std::fs::remove_dir_all(dir);
-    let _ = exec_on_container(&format!("rm -rf {}", remote_dir));
+    let _ = std::fs::remove_dir_all(remote_dir);
 }
 
 // ======================================================================
@@ -330,9 +358,9 @@ fn test_rsync_with_exclude() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_exec_env_remote() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -362,9 +390,9 @@ fn test_exec_env_remote() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_password_from_file_integration() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -392,9 +420,9 @@ fn test_password_from_file_integration() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_password_file_flag_integration() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -425,9 +453,9 @@ fn test_password_file_flag_integration() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_connect_timeout_integration() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -458,9 +486,9 @@ fn test_connect_timeout_integration() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_exit_code_zero() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -482,9 +510,9 @@ fn test_command_exit_code_zero() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_multiple_args() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -516,9 +544,9 @@ fn test_command_multiple_args() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_uname() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -546,9 +574,9 @@ fn test_command_uname() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_which() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -572,9 +600,9 @@ fn test_command_which() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_yes_head() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -602,9 +630,9 @@ fn test_command_yes_head() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_compress_flag() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -633,9 +661,9 @@ fn test_command_compress_flag() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_with_pty() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -662,9 +690,9 @@ fn test_command_with_pty() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_ps_with_pipe() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -692,9 +720,9 @@ fn test_ps_with_pipe() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_force_tty_flag() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -723,9 +751,9 @@ fn test_force_tty_flag() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_command_with_dest_ipv6() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -753,9 +781,9 @@ fn test_command_with_dest_ipv6() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_local_forward_spawn() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -784,9 +812,9 @@ fn test_local_forward_spawn() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_socks5_proxy_spawn() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -815,9 +843,9 @@ fn test_socks5_proxy_spawn() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_http_connect_proxy_spawn() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -850,9 +878,9 @@ fn test_http_connect_proxy_spawn() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_fork_background() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -882,9 +910,9 @@ fn test_fork_background() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_multiple_ssh_options() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -912,9 +940,9 @@ fn test_multiple_ssh_options() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_verbose_quiet_flags() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -963,9 +991,9 @@ fn test_verbose_quiet_flags() {
 // ProxyJump 测试
 // ======================================================================
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_proxy_jump_self() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -1016,9 +1044,9 @@ fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, Stri
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_locale_env_forwarded() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }
@@ -1055,9 +1083,9 @@ fn test_locale_env_forwarded() {
 }
 
 #[test]
-#[ignore = "requires docker SSH container running"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with testuser:testpass"]
 fn test_unrelated_env_not_forwarded() {
-    if !container_ok() {
+    if !sshd_ok() {
         eprintln!("SKIP: no container");
         return;
     }

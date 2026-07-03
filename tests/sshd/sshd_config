@@ -1,0 +1,43 @@
+# Shared test sshd config used by Linux / macOS / Windows CI runners.
+# Generated per-platform by tests/sshd/setup-*.sh; the platform-specific
+# setup script is responsible for substituting __SFTP_SERVER_PATH__ and
+# any directives the host platform does not support.
+
+Port 22222
+ListenAddress 127.0.0.1
+AddressFamily any
+
+# Authentication — passhrs e2e tests authenticate with --password testpass.
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+UsePAM yes
+
+# Forwarding — required by -L / -R / -D tests, and by the locale-env
+# forwarding tests that rely on sshd to negotiate env with the client.
+AllowTcpForwarding yes
+AllowAgentForwarding yes
+AllowStreamLocalForwarding yes
+GatewayPorts yes
+
+# AcceptEnv — mirrors OpenSSH default SendEnv LANG LC_*. Without this,
+# sshd silently drops client env requests and the locale_env_forwarded
+# test will see an empty env on the remote side.
+AcceptEnv LANG LC_*
+
+# Speed up connection establishment during the test run.
+LoginGraceTime 30
+MaxAuthTries 10
+MaxSessions 50
+
+# Disable features we do not want in CI: DNS reverse lookups can stall the
+# auth path on shared CI networks and produce flakes.
+UseDNS no
+
+# Quiet logging. Tests observe passhrs behavior, not sshd diagnostics.
+LogLevel ERROR
+
+# Subsystem line is appended by the platform-specific setup script with
+# the correct sftp-server path for that OS.
+# Subsystem sftp __SFTP_SERVER_PATH__

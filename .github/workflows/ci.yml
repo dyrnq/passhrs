@@ -101,9 +101,13 @@ jobs:
           if-no-files-found: warn
 
   integration-tests:
-    name: Integration tests
-    runs-on: ubuntu-24.04
+    name: Integration tests (${{ matrix.os }})
     needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -120,18 +124,21 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Build & start Docker SSH container
-        run: |
-          docker build -t phr-test-ssh-image tests/container/
-          docker run -d --name phr-test-ssh -p 22222:22 phr-test-ssh-image
-          sleep 3
+      - name: Provision native sshd (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo ./tests/sshd/setup-linux.sh
+
+      - name: Provision native sshd (macOS)
+        if: matrix.os == 'macos-14'
+        run: sudo ./tests/sshd/setup-macos.sh
+
+      - name: Provision native sshd (Windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: ./tests/sshd/setup-windows.ps1
 
       - name: Run integration tests
-        run: cargo test --release -- --include-ignored
-
-      - name: Cleanup
-        if: always()
-        run: docker rm -f phr-test-ssh 2>/dev/null || true
+        run: cargo test --release -- --include-ignored -- --test-threads=1
 
   cross-linux:
     name: Cross-compile (${{ matrix.target }})
