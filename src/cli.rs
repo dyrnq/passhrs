@@ -166,59 +166,74 @@ pub(crate) fn parse_proxy_jump(spec: &str) -> Result<ProxyJumpSpec> {
 
 pub(crate) fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
     let spec = spec.trim();
-    // Extract optional [bind_addr]
-    let (bind_addr, rest) = if let Some(s) = spec.strip_prefix('[') {
-        if let Some(bracket_end) = s.find(']') {
-            (
-                s[..bracket_end].to_string(),
-                s[bracket_end + 1..].trim_start_matches(':').to_string(),
-            )
-        } else {
-            bail!("unclosed bracket in forward spec: {}", spec)
-        }
+
+    // Determine the optional bind address and the remaining
+    // "port:host:hostport" core. Supported forms:
+    //   port:host:hostport                 -> bind defaults to 127.0.0.1
+    //   bind_addr:port:host:hostport       -> plain bind address
+    //   [bind_addr]:port:host:hostport     -> bracketed bind (e.g. IPv6)
+    let (bind_addr, core) = if let Some(s) = spec.strip_prefix('[') {
+        // Bracketed bind address, e.g. "[::1]:8080:localhost:80".
+        let end = s
+            .find(']')
+            .with_context(|| format!("unclosed bracket in forward spec: {}", spec))?;
+        (
+            s[..end].to_string(),
+            s[end + 1..].trim_start_matches(':').to_string(),
+        )
     } else {
-        ("127.0.0.1".to_string(), spec.to_string())
+        // Ambiguous between "port:host:hostport" and
+        // "bind_addr:port:host:hostport". Heuristic: if the first field is a
+        // valid port number there is no explicit bind address; otherwise the
+        // first field is a bind address.
+        let first = spec.split(':').next().unwrap_or("");
+        if first.parse::<u16>().is_ok() {
+            ("127.0.0.1".to_string(), spec.to_string())
+        } else {
+            let (b, r) = spec
+                .split_once(':')
+                .with_context(|| format!("invalid forward spec: {}", spec))?;
+            (b.to_string(), r.to_string())
+        }
     };
 
-    // From the right: last segment is target_port, second-to-last is target_host
-    // (which may be IPv6 like [::1])
-    // rsplitn is safe for IPv6 because we split from the right
-    let mut parts: Vec<&str> = rest.rsplitn(2, ':').collect();
-    parts.reverse();
-    if parts.len() != 2 {
-        bail!(
-            "invalid forward spec: {}. Use port:host:port or bind:port:host:port",
+    // core = "port:host:hostport". Peel off bind_port from the left FIRST, so
+    // the bind port is never mistaken for part of the target host.
+    let (bind_port_str, target) = core.split_once(':').with_context(|| {
+        format!(
+            "invalid forward spec: {}. Use port:host:port or [bind:]port:host:port",
             spec
-        );
-    }
-    let target_host = parts[0].to_string();
-    let target_port: u16 = parts[1].parse().context("invalid target port")?;
+        )
+    })?;
+    let bind_port: u16 = bind_port_str
+        .parse()
+        .with_context(|| format!("invalid bind port in forward spec: {}", spec))?;
 
-    if bind_addr != "127.0.0.1" {
-        Ok(ForwardSpec {
-            bind_addr,
-            bind_port: 0,
-            target_host,
-            target_port,
-        })
+    // target = "host:hostport". The host may be a bracketed IPv6 literal.
+    let (target_host, target_port_str) = if let Some(t) = target.strip_prefix('[') {
+        let end = t.find(']').with_context(|| {
+            format!("unclosed bracket for target host in forward spec: {}", spec)
+        })?;
+        (t[..end].to_string(), t[end + 1..].trim_start_matches(':'))
     } else {
-        // bind_addr is default, so rest is "port:host:port" or just "port:host"
-        // Parse bind_port from the leftmost segment
-        let left_parts: Vec<&str> = rest.splitn(2, ':').collect();
-        if left_parts.len() < 2 {
-            bail!(
-                "invalid forward spec: {}. Use port:host:port or bind:port:host:port",
+        let (h, p) = target.rsplit_once(':').with_context(|| {
+            format!(
+                "invalid forward spec: {}. Use port:host:port or [bind:]port:host:port",
                 spec
-            );
-        }
-        let bind_port: u16 = left_parts[0].parse().context("invalid bind port")?;
-        Ok(ForwardSpec {
-            bind_addr,
-            bind_port,
-            target_host,
-            target_port,
-        })
-    }
+            )
+        })?;
+        (h.to_string(), p)
+    };
+    let target_port: u16 = target_port_str
+        .parse()
+        .with_context(|| format!("invalid target port in forward spec: {}", spec))?;
+
+    Ok(ForwardSpec {
+        bind_addr,
+        bind_port,
+        target_host,
+        target_port,
+    })
 }
 
 pub(crate) fn parse_dynamic_spec(spec: &str) -> Result<DynamicForwardSpec> {
@@ -340,4 +355,63 @@ pub(crate) fn print_help() {
         "         {} -N -f -L 8118:localhost:8118 user@host",
         PKG_NAME
     );
+}
+
+#[cfg(test)]
+mod forward_spec_tests {
+    use super::parse_forward_spec;
+
+    #[test]
+    fn plain_port_host_port() {
+        let f = parse_forward_spec("9090:localhost:90").unwrap();
+        assert_eq!(f.bind_addr, "127.0.0.1");
+        assert_eq!(f.bind_port, 9090);
+        assert_eq!(f.target_host, "localhost");
+        assert_eq!(f.target_port, 90);
+    }
+
+    #[test]
+    fn regression_target_host_not_polluted_by_bind_port() {
+        // Previously parsed target_host as "34567:localhost" because the bind
+        // port was not peeled off before extracting the host.
+        let f = parse_forward_spec("34567:localhost:22222").unwrap();
+        assert_eq!(f.bind_port, 34567);
+        assert_eq!(f.target_host, "localhost");
+        assert_eq!(f.target_port, 22222);
+    }
+
+    #[test]
+    fn plain_bind_address() {
+        let f = parse_forward_spec("0.0.0.0:8080:localhost:80").unwrap();
+        assert_eq!(f.bind_addr, "0.0.0.0");
+        assert_eq!(f.bind_port, 8080);
+        assert_eq!(f.target_host, "localhost");
+        assert_eq!(f.target_port, 80);
+    }
+
+    #[test]
+    fn bracketed_ipv6_bind_address() {
+        let f = parse_forward_spec("[::1]:8080:localhost:80").unwrap();
+        assert_eq!(f.bind_addr, "::1");
+        assert_eq!(f.bind_port, 8080);
+        assert_eq!(f.target_host, "localhost");
+        assert_eq!(f.target_port, 80);
+    }
+
+    #[test]
+    fn bracketed_ipv6_target_host() {
+        let f = parse_forward_spec("9090:[::1]:80").unwrap();
+        assert_eq!(f.bind_addr, "127.0.0.1");
+        assert_eq!(f.bind_port, 9090);
+        assert_eq!(f.target_host, "::1");
+        assert_eq!(f.target_port, 80);
+    }
+
+    #[test]
+    fn invalid_specs_error() {
+        // Missing target port.
+        assert!(parse_forward_spec("9090:localhost").is_err());
+        // Non-numeric bind port with no bind address.
+        assert!(parse_forward_spec("9090:localhost:notaport").is_err());
+    }
 }

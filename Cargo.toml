@@ -1,13 +1,13 @@
 [package]
 name = "passhrs"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 repository = "https://github.com/dyrnq/passhrs"
 license = "MIT"
 description = "SSH automation tool (russh-based, ssh-compatible CLI)"
 
 [dependencies]
-russh = { version = "0.61", default-features = false, features = ["rsa", "ring", "flate2"] }
+russh = { version = "0.62", default-features = false, features = ["rsa", "ring", "flate2"] }
 ssh-key = "0.7.0-rc.10"
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
@@ -16,7 +16,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 shell-escape = "0.1"
 term_size = "0.3"
-dirs = "5"
+dirs = "6"
 bytes = "1"
 # futures is needed for channel read polling
 futures = "0.3"
