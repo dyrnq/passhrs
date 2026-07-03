@@ -61,44 +61,56 @@ if (-not (Test-Path $HostKey)) {
     & ssh-keygen -t ed25519 -f $HostKey -N '' -q
 }
 
-# 5b. Lock down the host key's NTFS DACL. ssh-keygen writes explicit
-#     ACEs for BUILTIN\Users and Other; OpenSSH's portable source
-#     treats any such permissive ACE as "too open" and refuses to
-#     load the key ("Permissions ... are too open / no hostkeys
-#     available -- exiting"). icacls /inheritance:r is not enough
-#     because it only strips *inherited* ACEs — explicit ones written
-#     by ssh-keygen survive. Use Set-Acl to assemble a clean DACL
-#     from scratch with only the three SIDs that need read access:
-#       SYSTEM                  — LocalSystem service context reading
-#                                 the key when sshd starts
-#       Administrators          — runner user (members of Administrators
-#                                 group) running `sshd -t -f` for
-#                                 config validation
-#       NT SERVICE\sshd         — explicit service SID
-# 5c. The sshd_config file is not secret, so only add the service SID
-#     without stripping inheritance — preserving the inherited
-#     Administrators ACE the runner user needs to pass `sshd -t`.
+# 5b. Lock down the host key's NTFS DACL. The Windows OpenSSH build
+#     refuses to load a private key whose DACL grants read access to
+#     anyone outside the owner group ("Permissions ... are too open /
+#     no hostkeys available -- exiting"). ssh-keygen leaves explicit
+#     ACEs for BUILTIN\Users and related principals, AND those survive
+#     `icacls /inheritance:r` because /inheritance:r only strips
+#     *inherited* ACEs. We therefore both (a) re-take ownership so the
+#     re-grant below lands cleanly, and (b) drop inheritance and add
+#     only the three SIDs that actually need read access. We then dump
+#     the resulting DACL so the next CI failure has the actual ACL on
+#     stderr rather than relying on icacls prose.
+takeown /F $HostKey /A | Out-Null
+
+# (a) Disable inheritance AND drop inherited ACEs without copying.
+# (b) Snapshot explicit rules into an array so the RemoveAccessRule*
+#     loop does not mutate during enumeration.
 $keyAcl = Get-Acl -Path $HostKey
-# SetAccessRuleProtection(true, false): block inheritance AND drop
-# inherited ACEs without copying them to explicit rules. The explicit
-# rules (including the troublesome BUILTIN\Users) that we just
-# removed from will be re-added below.
 $keyAcl.SetAccessRuleProtection($true, $false)
-# Wipe whatever explicit rules ssh-keygen left behind.
-$keyAcl.Access | ForEach-Object { $keyAcl.RemoveAccessRuleSpecific($_) }
-$systemSid  = New-Object System.Security.Principal.SecurityIdentifier(
-    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
-$adminsSid  = New-Object System.Security.Principal.SecurityIdentifier(
-    [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-$sshdSvcSid = (New-Object System.Security.Principal.NTAccount('NT SERVICE', 'sshd')
-    ).Translate([System.Security.Principal.SecurityIdentifier])
-foreach ($sid in @($systemSid, $adminsSid, $sshdSvcSid)) {
+foreach ($rule in @($keyAcl.Access)) {
+    $keyAcl.RemoveAccessRuleSpecific($rule)
+}
+# (c) Re-grant exactly the three SIDs we want. FullControl (F) on the
+#     private key is the canonical ACL Microsoft's OpenSSH docs
+#     recommend; we follow that instead of Read so the key file is
+#     pristine. SYSTEM covers the LocalSystem service context;
+#     Administrators covers the runner user (Administrator) that runs
+#     the `sshd -t -f` validation step; NT SERVICE\sshd is the explicit
+#     service SID so other service contexts cannot read the key.
+foreach ($sidSpec in @(
+    'SYSTEM',
+    'BUILTIN\Administrators',
+    'NT SERVICE\sshd'
+)) {
+    $nt = New-Object System.Security.Principal.NTAccount($sidSpec)
+    $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier])
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $sid, 'Read', 'Allow')
+        $sid, 'FullControl', 'Allow')
     $keyAcl.AddAccessRule($rule)
 }
 Set-Acl -Path $HostKey -AclObject $keyAcl
 
+# Diagnostic: emit the post-Set-Acl DACL so the next failure has the
+# actual ACL on stderr. icacls /C emits the full SD including deny
+# rules, which is what OpenSSH checks.
+Write-Host "After lockdown, icacls $HostKey:"
+icacls $HostKey | Out-Host
+
+# 5c. The sshd_config file is not secret — only add the service SID
+#     without stripping inheritance (preserves the inherited
+#     Administrators ACE the runner user needs to pass `sshd -t`).
 icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' | Out-Null
 icacls $SshRoot /grant 'NT SERVICE\sshd:(RX)' | Out-Null
 
