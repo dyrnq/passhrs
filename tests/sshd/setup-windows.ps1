@@ -79,24 +79,25 @@ if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
 }
 Add-LocalGroupMember -Group $group -Member $User -ErrorAction SilentlyContinue
 
-# 8. Stop any existing sshd, then start with our config.
-$svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
-if ($null -ne $svc) {
-    Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
-    # Point sshd at our config via the service's command-line override
-    # is not exposed, so we run a foreground sshd bound to the port and
-    # disable the service to free port 22222 for the test process.
-    Set-Service -Name sshd -StartupType Disabled
+# 8. Validate the config syntactically before launching sshd. `sshd -t`
+#    parses the file and exits non-zero on any error, printing the
+#    offending line to stderr.
+& sshd -t -f $SshdCfg
+if ($LASTEXITCODE -ne 0) {
+    throw "sshd config validation failed (exit $LASTEXITCODE)"
 }
 
-# 9. Launch sshd in the background. We use the sshd binary directly so
-#    we can pass -p 22222 and our -f config without touching the service
-#    configuration file the Windows installer expects.
-$sshdExe = (Get-Command sshd.exe -ErrorAction Stop).Source
-$proc = Start-Process -FilePath $sshdExe `
-    -ArgumentList @('-f', $SshdCfg, '-h', $HostKey, '-E', $SshdLog, '-p', $Port, '-D') `
-    -PassThru -WindowStyle Hidden
+# 9. Start sshd via the Windows service that the OpenSSH capability
+#    installs. The service reads $SshdCfg by default (this is where the
+#    installer expects it). Starting via the service avoids the
+#    process-lifecycle quirks of `Start-Process` with -D (the daemon
+#    mode the Windows sshd build does not reliably support).
+$svc = Get-Service -Name sshd -ErrorAction Stop
+Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
+Set-Service -Name sshd -StartupType Manual
+Start-Service -Name sshd
+Start-Sleep -Seconds 1
 
 # 10. Wait for port 22222 to accept connections.
 $ready = $false
@@ -114,9 +115,15 @@ for ($i = 0; $i -lt 50; $i++) {
 }
 
 if (-not $ready) {
-    Write-Error "sshd did not start within 10s. Log:"
+    Write-Error "sshd did not accept connections within 10s."
+    Write-Error "Service status:"
+    Get-Service -Name sshd
+    Write-Error "Recent sshd log entries:"
     if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 }
+    Write-Error "Windows Event Log (sshd):"
+    Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Error $_.Message }
     exit 1
 }
 
-Write-Host "test sshd ready at ${ListenHost}:${Port} (pid=$($proc.Id))"
+Write-Host "test sshd ready at ${ListenHost}:${Port} (service: sshd)"
