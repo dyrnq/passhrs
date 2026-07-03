@@ -61,24 +61,46 @@ if (-not (Test-Path $HostKey)) {
     & ssh-keygen -t ed25519 -f $HostKey -N '' -q
 }
 
-# 5b. Lock down the host key's NTFS ACL. The ssh-keygen default leaves
-#     a BUILTIN\Users read ACE inherited from %ProgramData%, and the
-#     Windows sshd build refuses to load a private key that is readable
-#     by anyone outside the owner group ("Permissions ... are too open"
-#     followed by "no hostkeys available -- exiting"). Strip inheritance
-#     and re-grant read only to the SIDs that actually need it:
-#       SYSTEM                  — LocalSystem context that the service
-#                                 runs under when reading the key
-#       Administrators          — covers the runneradmin user so
-#                                 `sshd -t -f` can validate the config
-#       NT SERVICE\sshd         — the explicit service SID
-# 5c. The sshd_config is NOT secret, so we only add the service SID
-#     without stripping inheritance (preserves the inherited
-#     Administrators ACE the runner user needs for `sshd -t`).
-icacls $HostKey /inheritance:r `
-    /grant 'SYSTEM:(R)' 'Administrators:(R)' 'NT SERVICE\sshd:(R)' | Out-Null
-icacls $SshdCfg  /grant 'NT SERVICE\sshd:(R)' | Out-Null
-icacls $SshRoot  /grant 'NT SERVICE\sshd:(RX)' | Out-Null
+# 5b. Lock down the host key's NTFS DACL. ssh-keygen writes explicit
+#     ACEs for BUILTIN\Users and Other; OpenSSH's portable source
+#     treats any such permissive ACE as "too open" and refuses to
+#     load the key ("Permissions ... are too open / no hostkeys
+#     available -- exiting"). icacls /inheritance:r is not enough
+#     because it only strips *inherited* ACEs — explicit ones written
+#     by ssh-keygen survive. Use Set-Acl to assemble a clean DACL
+#     from scratch with only the three SIDs that need read access:
+#       SYSTEM                  — LocalSystem service context reading
+#                                 the key when sshd starts
+#       Administrators          — runner user (members of Administrators
+#                                 group) running `sshd -t -f` for
+#                                 config validation
+#       NT SERVICE\sshd         — explicit service SID
+# 5c. The sshd_config file is not secret, so only add the service SID
+#     without stripping inheritance — preserving the inherited
+#     Administrators ACE the runner user needs to pass `sshd -t`.
+$keyAcl = Get-Acl -Path $HostKey
+# SetAccessRuleProtection(true, false): block inheritance AND drop
+# inherited ACEs without copying them to explicit rules. The explicit
+# rules (including the troublesome BUILTIN\Users) that we just
+# removed from will be re-added below.
+$keyAcl.SetAccessRuleProtection($true, $false)
+# Wipe whatever explicit rules ssh-keygen left behind.
+$keyAcl.Access | ForEach-Object { $keyAcl.RemoveAccessRuleSpecific($_) }
+$systemSid  = New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+$adminsSid  = New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+$sshdSvcSid = (New-Object System.Security.Principal.NTAccount('NT SERVICE', 'sshd')
+    ).Translate([System.Security.Principal.SecurityIdentifier])
+foreach ($sid in @($systemSid, $adminsSid, $sshdSvcSid)) {
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sid, 'Read', 'Allow')
+    $keyAcl.AddAccessRule($rule)
+}
+Set-Acl -Path $HostKey -AclObject $keyAcl
+
+icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' | Out-Null
+icacls $SshRoot /grant 'NT SERVICE\sshd:(RX)' | Out-Null
 
 # 6. Create testuser with a known password. The default $Pass value
 #    ('PassTest1234#') already satisfies Windows password complexity
