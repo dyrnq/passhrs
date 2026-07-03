@@ -7,7 +7,10 @@
 set -euo pipefail
 
 USER="testuser"
-PASS="testpass"
+# PassTest1234# meets Windows password complexity (upper + lower + digit
+# + special, 13 chars). Same value used by every platform setup script
+# and the e2e tests so the test sshd authenticates passhrs consistently.
+PASS="PassTest1234#"
 PORT="22222"
 HOST="127.0.0.1"
 SSHD_BIN="/usr/sbin/sshd"

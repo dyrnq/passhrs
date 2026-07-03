@@ -11,7 +11,7 @@ use std::time::Duration;
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
 const USER: &str = "testuser";
-const PASS: &str = "testpass";
+const PASS: &str = "PassTest1234#";
 
 fn fport() -> u16 {
     TcpListener::bind("127.0.0.1:0")

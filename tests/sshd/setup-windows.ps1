@@ -4,13 +4,17 @@
 # installed as a Windows capability; we then create a local testuser,
 # write a minimal sshd_config, and start the sshd service.
 #
-# Note: Windows Local Security Policy may reject the test password
-# `testpass` for not meeting complexity. We use secedit to relax
-# `PasswordComplexity` during user creation, then restore it.
+# Note: the default password 'PassTest1234#' already meets Windows
+# password complexity (upper + lower + digit + special, 13 chars),
+# so no Local Security Policy tweak is required.
 [CmdletBinding()]
 param(
     [string]$User = 'testuser',
-    [string]$Pass = 'testpass',
+    # PassTest1234# satisfies Windows password complexity (upper + lower
+    # + digit + special, 13 chars). Same value used by every platform
+    # setup script and the e2e tests so the test sshd authenticates
+    # passhrs consistently across Linux, macOS and Windows runners.
+    [string]$Pass = 'PassTest1234#',
     [int]$Port = 22222,
     [string]$SshdConfigTemplate = "$PSScriptRoot\sshd_config"
 )
@@ -52,54 +56,19 @@ if (-not (Test-Path $HostKey)) {
     & ssh-keygen -t ed25519 -f $HostKey -N '""' -q
 }
 
-# 6. Create testuser with a known password. The Windows password
-#    complexity policy rejects "testpass" by default, so we write a
-#    minimal INF that explicitly disables both complexity and length
-#    requirements, apply it via secedit, then restore the original
-#    policy in the finally block. Using a from-scratch INF (rather
-#    than mutating an exported one) is more robust across different
-#    Windows builds whose exported INF layouts differ.
-$exportDir = Join-Path $env:TEMP 'passhrs-test-sshd'
-New-Item -ItemType Directory -Force -Path $exportDir | Out-Null
-$secDb = Join-Path $exportDir 'secedit.sdb'
-
-# Snapshot the live policy so we can restore it later.
-& secedit /export /db $secDb /cfg (Join-Path $exportDir 'baseline.inf') /quiet | Out-Null
-
-# Minimal relaxed-policy INF. The [Unicode] and [Version] sections
-# are required by secedit; Unicode=yes enables UTF-16 output.
-$relaxInfPath = Join-Path $exportDir 'relax.inf'
-@"
-[Unicode]
-Unicode=yes
-
-[System Access]
-PasswordComplexity = 0
-MinimumPasswordLength = 0
-PasswordHistorySize = 0
-ClearTextPassword = 0
-"@ | Set-Content -Path $relaxInfPath -Encoding Unicode
-
-try {
-    & secedit /configure /db $secDb /cfg $relaxInfPath /quiet | Out-Null
-
-    if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
-        $secure = ConvertTo-SecureString $Pass -AsPlainText -Force
-        New-LocalUser -Name $User -Password $secure `
-            -Description 'Passhrs e2e test user' `
-            -PasswordNeverExpires `
-            -UserMayNotChangePassword | Out-Null
-    }
-    # Always reset the password so re-runs are deterministic.
-    & net user $User $Pass | Out-Null
+# 6. Create testuser with a known password. The default $Pass value
+#    ('PassTest1234#') already satisfies Windows password complexity
+#    (upper + lower + digit + special, 13 chars), so no policy tweak
+#    is required.
+if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
+    $secure = ConvertTo-SecureString $Pass -AsPlainText -Force
+    New-LocalUser -Name $User -Password $secure `
+        -Description 'Passhrs e2e test user' `
+        -PasswordNeverExpires `
+        -UserMayNotChangePassword | Out-Null
 }
-finally {
-    # Restore the original policy.
-    $baselineInf = Join-Path $exportDir 'baseline.inf'
-    if (Test-Path $baselineInf) {
-        & secedit /configure /db $secDb /cfg $baselineInf /quiet | Out-Null
-    }
-}
+# Always reset the password so re-runs are deterministic.
+& net user $User $Pass | Out-Null
 
 # 7. Allow testuser to authenticate via sshd: add to the SSH users group
 #    that Windows OpenSSH honours by default (Administrators + the

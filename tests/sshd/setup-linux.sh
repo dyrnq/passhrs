@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provision a real openssh-server on 127.0.0.1:22222 with a known
-# testuser / testpass, then start sshd in the background. Idempotent:
+# testuser / PassTest1234#, then start sshd in the background. Idempotent:
 # safe to re-run during local iteration.
 #
 # Targets GitHub-hosted ubuntu-24.04 runners; should also work on any
@@ -8,7 +8,11 @@
 set -euo pipefail
 
 USER="testuser"
-PASS="testpass"
+# PassTest1234# meets Windows password complexity (upper + lower + digit
+# + special, 13 chars). The same value is used by every platform setup
+# script and the e2e tests so the test sshd always authenticates the
+# passhrs client with the same credentials.
+PASS="PassTest1234#"
 PORT="22222"
 HOST="127.0.0.1"
 SSHD_CFG_DIR="$(cd "$(dirname "$0")" && pwd)"
