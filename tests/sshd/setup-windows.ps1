@@ -16,7 +16,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$Host       = '127.0.0.1'
+$ListenHost = '127.0.0.1'
 $ProgData   = $env:ProgramData
 $SshRoot    = Join-Path $ProgData 'ssh'
 $SshdCfg    = Join-Path $SshRoot 'sshd_config'
@@ -120,7 +120,7 @@ for ($i = 0; $i -lt 50; $i++) {
     Start-Sleep -Milliseconds 200
     try {
         $client = New-Object System.Net.Sockets.TcpClient
-        $client.Connect($Host, $Port)
+        $client.Connect($ListenHost, $Port)
         $client.Close()
         $ready = $true
         break
@@ -135,4 +135,4 @@ if (-not $ready) {
     exit 1
 }
 
-Write-Host "test sshd ready at ${Host}:${Port} (pid=$($proc.Id))"
+Write-Host "test sshd ready at ${ListenHost}:${Port} (pid=$($proc.Id))"
