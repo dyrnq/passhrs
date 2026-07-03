@@ -55,9 +55,10 @@ if (-not (Test-Path $SftpServer)) {
     | Set-Content -Path $SshdCfg -Encoding ASCII
 Add-Content -Path $SshdCfg -Value "HostKey $HostKey"
 
-# 5. Generate host key if missing.
+# 5. Generate host key if missing. -N '' passes an empty passphrase;
+#    PowerShell's '""' would be the literal two-character string "".
 if (-not (Test-Path $HostKey)) {
-    & ssh-keygen -t ed25519 -f $HostKey -N '""' -q
+    & ssh-keygen -t ed25519 -f $HostKey -N '' -q
 }
 
 # 6. Create testuser with a known password. The default $Pass value
