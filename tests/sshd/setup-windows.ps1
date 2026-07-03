@@ -52,22 +52,36 @@ if (-not (Test-Path $HostKey)) {
     & ssh-keygen -t ed25519 -f $HostKey -N '""' -q
 }
 
-# 6. Create testuser with a known password. Relax PasswordComplexity via
-#    secedit first because GitHub runners occasionally enforce strong
-#    passwords by default.
+# 6. Create testuser with a known password. The Windows password
+#    complexity policy rejects "testpass" by default, so we write a
+#    minimal INF that explicitly disables both complexity and length
+#    requirements, apply it via secedit, then restore the original
+#    policy in the finally block. Using a from-scratch INF (rather
+#    than mutating an exported one) is more robust across different
+#    Windows builds whose exported INF layouts differ.
 $exportDir = Join-Path $env:TEMP 'passhrs-test-sshd'
 New-Item -ItemType Directory -Force -Path $exportDir | Out-Null
 $secDb = Join-Path $exportDir 'secedit.sdb'
-$secInf = Join-Path $exportDir 'baseline.inf'
-$relaxInf = Join-Path $exportDir 'relax.inf'
+
+# Snapshot the live policy so we can restore it later.
+& secedit /export /db $secDb /cfg (Join-Path $exportDir 'baseline.inf') /quiet | Out-Null
+
+# Minimal relaxed-policy INF. The [Unicode] and [Version] sections
+# are required by secedit; Unicode=yes enables UTF-16 output.
+$relaxInfPath = Join-Path $exportDir 'relax.inf'
+@"
+[Unicode]
+Unicode=yes
+
+[System Access]
+PasswordComplexity = 0
+MinimumPasswordLength = 0
+PasswordHistorySize = 0
+ClearTextPassword = 0
+"@ | Set-Content -Path $relaxInfPath -Encoding Unicode
 
 try {
-    # Snapshot current policy, then write a relaxed template.
-    & secedit /export /db $secDb /cfg $secInf /quiet | Out-Null
-    (Get-Content $secInf -Raw) `
-        -replace '(?m)^\s*PasswordComplexity\s*=\s*1', 'PasswordComplexity = 0' `
-        | Set-Content -Path $relaxInf -Encoding ASCII
-    & secedit /configure /db $secDb /cfg $relaxInf /quiet | Out-Null
+    & secedit /configure /db $secDb /cfg $relaxInfPath /quiet | Out-Null
 
     if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
         $secure = ConvertTo-SecureString $Pass -AsPlainText -Force
@@ -81,8 +95,9 @@ try {
 }
 finally {
     # Restore the original policy.
-    if (Test-Path $secInf) {
-        & secedit /configure /db $secDb /cfg $secInf /quiet | Out-Null
+    $baselineInf = Join-Path $exportDir 'baseline.inf'
+    if (Test-Path $baselineInf) {
+        & secedit /configure /db $secDb /cfg $baselineInf /quiet | Out-Null
     }
 }
 
