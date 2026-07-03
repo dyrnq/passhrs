@@ -991,3 +991,96 @@ fn test_proxy_jump_self() {
         assert_eq!(stdout.trim(), "jump_ok", "stdout: {}", stdout);
     }
 }
+
+// ======================================================================
+// Locale env forwarding (fixes garbled multibyte/CJK text in remote
+// locale-aware programs). passhrs must forward LANG/LC_* like OpenSSH's
+// default `SendEnv LANG LC_*`; the test container enables `AcceptEnv
+// LANG LC_*` so the remote session actually receives them.
+// ======================================================================
+
+/// Run passhrs with an explicit environment overlaid on the current process
+/// env, so we can assert that locale variables are forwarded to the remote.
+fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, String) {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("run passhrs");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_locale_env_forwarded() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    // -t forces a PTY, matching a real interactive login where locale matters.
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-t",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "env",
+    ];
+    let (ok, stdout, stderr) =
+        run_phr_with_env(&a, &[("LANG", "en_US.UTF-8"), ("LC_ALL", "en_US.UTF-8")]);
+    assert!(ok, "session failed: {}", stderr);
+    // The remote `env` output must contain the forwarded locale variables,
+    // proving channel.set_env reached the remote (AcceptEnv accepted them).
+    assert!(
+        stdout.contains("LANG=en_US.UTF-8"),
+        "LANG not forwarded to remote; env output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("LC_ALL=en_US.UTF-8"),
+        "LC_ALL not forwarded to remote; env output: {}",
+        stdout
+    );
+}
+
+#[test]
+#[ignore = "requires docker SSH container running"]
+fn test_unrelated_env_not_forwarded() {
+    if !container_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    // A non-locale variable must NOT be forwarded (only LANG/LC_* are).
+    let a = [
+        "-p",
+        PORT,
+        "--password",
+        PASS,
+        "-t",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        &d,
+        "env",
+    ];
+    let (ok, stdout, stderr) = run_phr_with_env(&a, &[("PHR_SHOULD_NOT_LEAK", "leaked_value")]);
+    assert!(ok, "session failed: {}", stderr);
+    assert!(
+        !stdout.contains("PHR_SHOULD_NOT_LEAK"),
+        "unrelated env leaked to remote; env output: {}",
+        stdout
+    );
+}

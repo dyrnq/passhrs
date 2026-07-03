@@ -83,12 +83,13 @@ impl Handler for SshHandler {
         connected_port: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
         let port = connected_port as u16;
-        eprintln!(
-            "DEBUG server_channel_open_forwarded_tcpip called: port={}",
-            port
+        debug!(
+            "Remote forward channel open from {}:{} for port {}",
+            originator_address, originator_port, port
         );
         if let Some(spec) = self.remote_forwards.get(&port) {
             info!(
@@ -96,12 +97,16 @@ impl Handler for SshHandler {
                 originator_address, originator_port, spec.target_host, spec.target_port
             );
             let addr = format!("{}:{}", spec.target_host, spec.target_port);
-            eprintln!(
-                "DEBUG -R connecting to target: '{}' (from spec target_host='{}' target_port={})",
+            debug!(
+                "Remote forward: dialing target {} (target_host={}, target_port={})",
                 addr, spec.target_host, spec.target_port
             );
             match tokio::net::TcpStream::connect(&addr).await {
                 Ok(target_stream) => {
+                    // russh 0.62+: the forwarded channel must be explicitly
+                    // accepted; dropping `reply` auto-rejects. Accept only once
+                    // we have a live connection to the forward target.
+                    reply.accept().await;
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let (mut trx, mut ttx) = tokio::io::split(target_stream);
                     let (mut crx, ctx) = channel.split();
@@ -109,30 +114,19 @@ impl Handler for SshHandler {
                         loop {
                             match crx.wait().await {
                                 Some(ChannelMsg::Data { ref data }) => {
-                                    eprintln!(
-                                        "DEBUG c2t forwarding {} bytes to target",
+                                    debug!(
+                                        "Remote forward c2t: forwarding {} bytes to target",
                                         data.len()
                                     );
                                     if ttx.write_all(data).await.is_err() {
-                                        eprintln!("DEBUG c2t write_all error");
+                                        debug!("Remote forward c2t: write error, ending");
                                         break;
                                     }
                                     let _ = ttx.flush().await;
                                 }
-                                Some(ChannelMsg::Eof) => {
-                                    eprintln!("DEBUG c2t EOF");
-                                    break;
-                                }
-                                Some(ChannelMsg::Close) => {
-                                    eprintln!("DEBUG c2t Close");
-                                    break;
-                                }
-                                None => {
-                                    eprintln!("DEBUG c2t None");
-                                    break;
-                                }
+                                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                                 Some(other) => {
-                                    eprintln!("DEBUG c2t other msg: {:?}", other);
+                                    debug!("Remote forward c2t: ignoring {:?}", other);
                                 }
                             }
                         }
@@ -142,19 +136,22 @@ impl Handler for SshHandler {
                         loop {
                             match trx.read(&mut buf).await {
                                 Ok(0) => {
-                                    eprintln!("DEBUG t2c EOF from target");
+                                    debug!("Remote forward t2c: target EOF");
                                     let _ = ctx.eof().await;
                                     break;
                                 }
                                 Ok(n) => {
-                                    eprintln!("DEBUG t2c forwarding {} bytes from target", n);
+                                    debug!(
+                                        "Remote forward t2c: forwarding {} bytes from target",
+                                        n
+                                    );
                                     if ctx.data(&buf[..n]).await.is_err() {
-                                        eprintln!("DEBUG t2c ctx.data error");
+                                        debug!("Remote forward t2c: channel write error");
                                         break;
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("DEBUG t2c read error: {}", e);
+                                    debug!("Remote forward t2c: read error {}", e);
                                     break;
                                 }
                             }
@@ -163,7 +160,6 @@ impl Handler for SshHandler {
                     let _ = tokio::join!(c2t, t2c);
                 }
                 Err(e) => {
-                    eprintln!("DEBUG -R connect FAILED: {} - {}", addr, e);
                     warn!(
                         "Remote forward: failed to connect to target {}: {}",
                         addr, e
@@ -345,4 +341,52 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
     let code = tokio::select! { c = exit_rx => c.unwrap_or(0), _ = reader => 0 };
     info!("Session exit code {}", code);
     Ok(code)
+}
+
+/// Decide whether a local environment variable should be forwarded to the
+/// remote session (shell / exec).
+///
+/// Mirrors OpenSSH's default `SendEnv LANG LC_*` behavior: forward `LANG`,
+/// `LANGUAGE` and every `LC_*` locale variable. This lets locale-aware remote
+/// programs (vi/less/nano/…) render UTF-8 correctly and avoids garbled
+/// multibyte (e.g. Chinese) text. Everything else is intentionally not
+/// forwarded, to avoid leaking the local environment or overriding remote
+/// configuration.
+pub(crate) fn should_forward_locale_env(name: &str) -> bool {
+    name == "LANG" || name == "LANGUAGE" || name.starts_with("LC_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_forward_locale_env;
+
+    #[test]
+    fn forwards_lang_and_language() {
+        assert!(should_forward_locale_env("LANG"));
+        assert!(should_forward_locale_env("LANGUAGE"));
+    }
+
+    #[test]
+    fn forwards_all_lc_variants() {
+        assert!(should_forward_locale_env("LC_ALL"));
+        assert!(should_forward_locale_env("LC_CTYPE"));
+        assert!(should_forward_locale_env("LC_MESSAGES"));
+        assert!(should_forward_locale_env("LC_TIME"));
+        // Prefix match covers any future LC_* variable.
+        assert!(should_forward_locale_env("LC_SOMETHING_NEW"));
+    }
+
+    #[test]
+    fn does_not_forward_unrelated_env() {
+        // Avoid leaking local env or overriding remote configuration.
+        assert!(!should_forward_locale_env("PATH"));
+        assert!(!should_forward_locale_env("HOME"));
+        assert!(!should_forward_locale_env("TERM"));
+        assert!(!should_forward_locale_env("SSH_AUTH_SOCK"));
+        // No substring matching: names that merely contain LANG/LC_ but are
+        // not locale variables must not be forwarded.
+        assert!(!should_forward_locale_env("MYLANG"));
+        assert!(!should_forward_locale_env("XLC_FOO"));
+        assert!(!should_forward_locale_env("LANGUAGES"));
+    }
 }

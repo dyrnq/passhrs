@@ -426,6 +426,16 @@ async fn main() -> Result<()> {
                     .request_pty(true, &term, 80, 24, 640, 480, &[])
                     .await?;
             }
+            // Forward locale environment variables (like OpenSSH's default
+            // `SendEnv LANG LC_*`) so remote locale-aware programs (vi/less/
+            // nano/…) render UTF-8 correctly instead of garbling multibyte
+            // (e.g. Chinese) text. want_reply=false: sshd may not AcceptEnv
+            // these, in which case they are silently ignored (OpenSSH behavior).
+            for (name, value) in std::env::vars() {
+                if should_forward_locale_env(&name) {
+                    let _ = channel.set_env(false, name, value).await;
+                }
+            }
             if !cli.command.is_empty() {
                 let mut parts: Vec<String> = Vec::new();
                 for spec in &cli.exec_env {

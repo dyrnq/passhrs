@@ -10,7 +10,8 @@ RUN sed -i '/^AllowTcpForwarding/d; /^#AllowTcpForwarding/d' /etc/ssh/sshd_confi
     sed -i 's/^#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config && \
-    echo "GatewayPorts yes" >> /etc/ssh/sshd_config
+    echo "GatewayPorts yes" >> /etc/ssh/sshd_config && \
+    echo "AcceptEnv LANG LC_*" >> /etc/ssh/sshd_config
 
 RUN adduser -D testuser && echo "testuser:testpass" | chpasswd
 
