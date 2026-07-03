@@ -45,11 +45,15 @@ if (-not (Test-Path $SftpServer)) {
 }
 
 # 4. Materialise sshd_config from the shared template, substituting the
-#    Windows sftp-server path. Windows OpenSSH ignores UsePAM (unknown
-#    directive); leaving it in is harmless because the server only warns.
+#    Windows sftp-server path. Then drop directives the Windows OpenSSH
+#    build rejects (UsePAM, which Linux/macOS require but Windows has
+#    no concept of) and append HostKey so the service-mode startup can
+#    find the key without a -h CLI flag.
 (Get-Content $SshdConfigTemplate -Raw) `
     -replace '__SFTP_SERVER_PATH__', ($SftpServer -replace '\\', '\\') `
+    -replace '(?m)^\s*UsePAM\s+yes\s*\r?\n', '' `
     | Set-Content -Path $SshdCfg -Encoding ASCII
+Add-Content -Path $SshdCfg -Value "HostKey $HostKey"
 
 # 5. Generate host key if missing.
 if (-not (Test-Path $HostKey)) {
