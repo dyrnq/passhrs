@@ -61,16 +61,24 @@ if (-not (Test-Path $HostKey)) {
     & ssh-keygen -t ed25519 -f $HostKey -N '' -q
 }
 
-# 5b. Grant LocalSystem read access on the host key + config. The
-#     OpenSSH service runs as LocalSystem (the "NT SERVICE\sshd" SID
-#     service template expands to that context) and refuses to start
-#     if it cannot read these files. We /grant WITHOUT /inheritance:r
-#     because stripping inheritance here would remove the inherited
-#     Administrators ACE — leaving the runner user unable to run
-#     `sshd -t -f` for config validation.
-icacls $HostKey /grant 'NT SERVICE\sshd:(R)' | Out-Null
-icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' | Out-Null
-icacls $SshRoot /grant 'NT SERVICE\sshd:(RX)' | Out-Null
+# 5b. Lock down the host key's NTFS ACL. The ssh-keygen default leaves
+#     a BUILTIN\Users read ACE inherited from %ProgramData%, and the
+#     Windows sshd build refuses to load a private key that is readable
+#     by anyone outside the owner group ("Permissions ... are too open"
+#     followed by "no hostkeys available -- exiting"). Strip inheritance
+#     and re-grant read only to the SIDs that actually need it:
+#       SYSTEM                  — LocalSystem context that the service
+#                                 runs under when reading the key
+#       Administrators          — covers the runneradmin user so
+#                                 `sshd -t -f` can validate the config
+#       NT SERVICE\sshd         — the explicit service SID
+# 5c. The sshd_config is NOT secret, so we only add the service SID
+#     without stripping inheritance (preserves the inherited
+#     Administrators ACE the runner user needs for `sshd -t`).
+icacls $HostKey /inheritance:r `
+    /grant 'SYSTEM:(R)' 'Administrators:(R)' 'NT SERVICE\sshd:(R)' | Out-Null
+icacls $SshdCfg  /grant 'NT SERVICE\sshd:(R)' | Out-Null
+icacls $SshRoot  /grant 'NT SERVICE\sshd:(RX)' | Out-Null
 
 # 6. Create testuser with a known password. The default $Pass value
 #    ('PassTest1234#') already satisfies Windows password complexity
