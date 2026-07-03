@@ -62,12 +62,15 @@ if (-not (Test-Path $HostKey)) {
 }
 
 # 5b. Grant LocalSystem read access on the host key + config. The
-#     OpenSSH service runs as LocalSystem and refuses to start if
-#     it cannot read these files. Inheritance from $env:ProgramData
-#     does not always propagate to files created by a different
-#     account during setup.
-icacls $HostKey /grant 'NT SERVICE\sshd:(R)' /inheritance:r | Out-Null
-icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' /inheritance:r | Out-Null
+#     OpenSSH service runs as LocalSystem (the "NT SERVICE\sshd" SID
+#     service template expands to that context) and refuses to start
+#     if it cannot read these files. We /grant WITHOUT /inheritance:r
+#     because stripping inheritance here would remove the inherited
+#     Administrators ACE — leaving the runner user unable to run
+#     `sshd -t -f` for config validation.
+icacls $HostKey /grant 'NT SERVICE\sshd:(R)' | Out-Null
+icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' | Out-Null
+icacls $SshRoot /grant 'NT SERVICE\sshd:(RX)' | Out-Null
 
 # 6. Create testuser with a known password. The default $Pass value
 #    ('PassTest1234#') already satisfies Windows password complexity
