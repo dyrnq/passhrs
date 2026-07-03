@@ -61,6 +61,14 @@ if (-not (Test-Path $HostKey)) {
     & ssh-keygen -t ed25519 -f $HostKey -N '' -q
 }
 
+# 5b. Grant LocalSystem read access on the host key + config. The
+#     OpenSSH service runs as LocalSystem and refuses to start if
+#     it cannot read these files. Inheritance from $env:ProgramData
+#     does not always propagate to files created by a different
+#     account during setup.
+icacls $HostKey /grant 'NT SERVICE\sshd:(R)' /inheritance:r | Out-Null
+icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' /inheritance:r | Out-Null
+
 # 6. Create testuser with a known password. The default $Pass value
 #    ('PassTest1234#') already satisfies Windows password complexity
 #    (upper + lower + digit + special, 13 chars), so no policy tweak
@@ -122,11 +130,15 @@ for ($i = 0; $i -lt 50; $i++) {
 if (-not $ready) {
     Write-Error "sshd did not accept connections within 10s."
     Write-Error "Service status:"
-    Get-Service -Name sshd
+    Get-Service -Name sshd | Format-List | Out-String | Write-Error
     Write-Error "Recent sshd log entries:"
-    if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 }
+    if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Error }
     Write-Error "Windows Event Log (sshd):"
     Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Error $_.Message }
+    Write-Error "Windows Event Log (System, sshd-related):"
+    Get-WinEvent -LogName System -MaxEvents 50 -ErrorAction SilentlyContinue |
+        Where-Object { $_.ProviderName -match 'sshd' -or $_.Message -match 'sshd' } |
         ForEach-Object { Write-Error $_.Message }
     exit 1
 }
