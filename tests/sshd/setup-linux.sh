@@ -61,6 +61,11 @@ if ! id "${USER}" >/dev/null 2>&1; then
 fi
 echo "${USER}:${PASS}" | sudo chpasswd
 
+# 5b. Ubuntu's OpenSSH package does not create the privilege-separation
+#     directory on install; sshd refuses to start without it.
+sudo mkdir -p /run/sshd
+sudo chmod 0755 /run/sshd
+
 # 6. Tear down any previous instance bound to PORT, then start fresh.
 if [ -f "${SSHD_PID_FILE}" ]; then
     OLD_PID="$(cat "${SSHD_PID_FILE}" || true)"
