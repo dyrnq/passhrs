@@ -145,6 +145,44 @@ jobs:
         # reported as "filtered out" (i.e. never executed).
         run: cargo test --release -- --include-ignored --test-threads=1
 
+      - name: Dump sshd log on failure (unix)
+        if: failure() && matrix.os != 'windows-2022'
+        shell: bash
+        run: |
+          # The integration suite can fail because passhrs cannot
+          # authenticate against the test sshd. sshd's reason is in
+          # its log file, not in passhrs's stderr ("Authentication
+          # failed"). Print it so the failure is debuggable from the
+          # GitHub UI without downloading artifacts.
+          set +e
+          for log in \
+              "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log" \
+              "/tmp/passhrs-test-sshd/sshd.log" \
+              "/var/log/auth.log"; do
+              if [ -r "$log" ]; then
+                  echo "=== sshd log: $log ==="
+                  tail -n 100 "$log" || true
+              fi
+          done
+
+      - name: Dump sshd log on failure (Windows)
+        if: failure() && matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          # Mirror of the unix step above. Windows sshd logs under
+          # %ProgramData%\ssh\logs by default (or wherever the
+          # setup-windows.ps1 put it).
+          $logs = @(
+              "$env:ProgramData\ssh\logs\sshd.log",
+              "$env:ProgramData\ssh\sshd.log"
+          )
+          foreach ($log in $logs) {
+              if (Test-Path -LiteralPath $log) {
+                  Write-Host "=== sshd log: $log ==="
+                  Get-Content -LiteralPath $log -Tail 100 -ErrorAction SilentlyContinue
+              }
+          }
+
   cross-linux:
     name: Cross-compile (${{ matrix.target }})
     runs-on: ubuntu-24.04

@@ -36,9 +36,22 @@ fi
 mkdir -p "${RUNTIME_DIR}"
 
 # 1. Materialise the sshd config with the correct sftp-server path.
+#    Override LogLevel to DEBUG3 — macOS auth failures don't print
+#    anything at ERROR, and the smoke-test in the readiness loop below
+#    hangs because macOS ssh has no controlling terminal and won't read
+#    a password from our FIFO. The DEBUG3 output is what we'll read on
+#    the test-side `Dump sshd log on failure` step.
 sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
     "${SSHD_CFG_TEMPLATE}" \
     > "${SSHD_CFG}"
+# macOS-only: bump log level. The shared template's LogLevel ERROR is
+# fine on Linux (test failures there are visible without sshd debug)
+# but on macOS we need the auth-failure reason to be in sshd.log.
+cat >> "${SSHD_CFG}" <<EOF
+
+# --- passhrs CI overrides ---
+LogLevel DEBUG3
+EOF
 
 # 2. Generate a host key on first run; reuse on subsequent runs.
 if [ ! -f "${HOST_KEY}" ]; then
@@ -139,73 +152,8 @@ for i in $(seq 1 50); do
     fi
     if (echo >"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
         echo "test sshd ready at ${HOST}:${PORT} (pid=${SSHD_PID}, detached via setsid)"
-        # Smoke-test the password channel before declaring success. On
-        # macOS, sshd can be listening but still refuse the password
-        # (PAM sandbox / privilege-separation / dscl-cached password
-        # lag). A failing auth here surfaces the sshd.log line that
-        # explains it, instead of a stack of "Authentication failed"
-        # panics two minutes later.
-        #
-        # We use sshpass if available; otherwise fall back to a manual
-        # stdin password pump via `ssh -o NumberOfPasswordPrompts=1`.
-        SMOKE_OK=0
-        if command -v sshpass >/dev/null 2>&1; then
-            if sshpass -p "${PASS}" \
-                ssh -p "${PORT}" \
-                    -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
-                    -o NumberOfPasswordPrompts=1 \
-                    -o ConnectTimeout=5 \
-                    "${USER}@${HOST}" \
-                    "echo passhrs-smoke-ok" \
-                    >"${RUNTIME_DIR}/smoke.out" 2>"${RUNTIME_DIR}/smoke.err"; then
-                if grep -q '^passhrs-smoke-ok$' "${RUNTIME_DIR}/smoke.out" 2>/dev/null; then
-                    SMOKE_OK=1
-                fi
-            fi
-        else
-            # Manual stdin-pump. Use a FIFO so the password line is
-            # delivered exactly once, then closed (ssh reads the line
-            # for PasswordAuthentication and exits).
-            SSH_FIFO="${RUNTIME_DIR}/smoke.fifo"
-            rm -f "${SSH_FIFO}"
-            mkfifo "${SSH_FIFO}"
-            # Hold the FIFO open for writing in the background so ssh
-            # doesn't see EOF before it reads the password line.
-            exec 9>"${SSH_FIFO}"
-            ( sleep 5; exec 9>&- ) &
-            FIFO_KEEPER_PID=$!
-            if printf '%s\n' "${PASS}" | ssh -p "${PORT}" \
-                    -o StrictHostKeyChecking=no \
-                    -o UserKnownHostsFile=/dev/null \
-                    -o NumberOfPasswordPrompts=1 \
-                    -o ConnectTimeout=5 \
-                    -o PreferredAuthentications=password \
-                    -o PubkeyAuthentication=no \
-                    "${USER}@${HOST}" \
-                    "echo passhrs-smoke-ok" \
-                    <"${SSH_FIFO}" \
-                    >"${RUNTIME_DIR}/smoke.out" 2>"${RUNTIME_DIR}/smoke.err"; then
-                if grep -q '^passhrs-smoke-ok$' "${RUNTIME_DIR}/smoke.out" 2>/dev/null; then
-                    SMOKE_OK=1
-                fi
-            fi
-            exec 9>&- 2>/dev/null || true
-            kill "${FIFO_KEEPER_PID}" 2>/dev/null || true
-            rm -f "${SSH_FIFO}"
-        fi
-        if [ "${SMOKE_OK}" = "1" ]; then
-            echo "test sshd auth smoke-test OK (password accepted for ${USER})"
-            exit 0
-        fi
-        echo "FATAL: sshd accepted TCP but rejected ${USER}'s password" >&2
-        echo "--- ssh log (last 50 lines) ---" >&2
-        sudo tail -n 50 "${SSHD_LOG}" >&2 || true
-        echo "--- ssh smoke stderr ---" >&2
-        cat "${RUNTIME_DIR}/smoke.err" >&2 || true
-        echo "--- ssh smoke stdout ---" >&2
-        cat "${RUNTIME_DIR}/smoke.out" >&2 || true
-        exit 1
+        echo "sshd log: ${SSHD_LOG} (LogLevel DEBUG3)"
+        exit 0
     fi
     sleep 0.2
 done
