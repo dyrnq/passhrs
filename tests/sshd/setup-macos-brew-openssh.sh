@@ -187,7 +187,18 @@ if [ ! -f "${HOST_KEY}" ]; then
 fi
 if [ ! -f "${TEST_KEY}" ]; then
     ssh-keygen -t ed25519 -f "${TEST_KEY}" -N "" -q
-    chmod 600 "${TEST_KEY}"
+    # ssh-keygen ran as root (the whole script runs under sudo), so
+    # the key file is root:root mode 600 by default. The integration
+    # test process runs as the unprivileged `runner` user and can't
+    # read it — russh reports "Failed to load key: Permission denied
+    # (os error 13)" and the auth falls through to password (which
+    # sshd rejects with PasswordAuthentication no). chmod 644 so the
+    # test process can load it. The key is ephemeral (deleted on
+    # runner teardown), lives under /tmp, and has no passphrase, so
+    # wider read perms are safe — no other process on the runner has
+    # any reason to look for it.
+    chmod 644 "${TEST_KEY}"
+    chmod 644 "${TEST_KEY_PUB}"
 fi
 
 # ---- 4. create testuser via sysadminctl -addUser --------------------------

@@ -225,6 +225,27 @@ jobs:
           path: integration-test.log
           if-no-files-found: warn
 
+      - name: Upload sshd log (Windows)
+        # Mirror of the unix step. setup-windows.ps1 sets the log
+        # path via `sshd.exe -E ...` — that argument is respected
+        # by OpenSSH 8.1p1 (inbox) and 10.0 (upgraded), and the
+        # destination is %ProgramData%\ssh\logs\sshd.log. We
+        # upload even on green runs so a future flake has a
+        # baseline to diff against (same rationale as the unix
+        # step). `if-no-files-found: warn` because the exact log
+        # path is setup-windows.ps1's choice — if a future
+        # version of that script moves it, this step should warn
+        # rather than fail the job, and the dump-on-failure step
+        # below still tries a list of candidate paths.
+        if: always() && matrix.os == 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-log-${{ matrix.os }}
+          path: |
+            C:\ProgramData\ssh\logs\sshd.log
+            C:\ProgramData\ssh\OpenSSH_ConfigDiag.log
+          if-no-files-found: warn
+
       - name: Upload sshd log (unix)
         # Always (not just on failure): a green run that suddenly goes
         # red next run benefits from a baseline sshd log to diff. Also
