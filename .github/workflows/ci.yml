@@ -154,14 +154,33 @@ jobs:
           # its log file, not in passhrs's stderr ("Authentication
           # failed"). Print it so the failure is debuggable from the
           # GitHub UI without downloading artifacts.
+          #
+          # The setup script runs under sudo, so the log files are
+          # owned by root. Use `sudo -n cat` so the dump works without
+          # an interactive password prompt (sudo on GitHub-hosted
+          # runners is passwordless for the runner user).
           set +e
           for log in \
               "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log" \
               "/tmp/passhrs-test-sshd/sshd.log" \
               "/var/log/auth.log"; do
-              if [ -r "$log" ]; then
+              if [ -e "$log" ]; then
                   echo "=== sshd log: $log ==="
-                  tail -n 100 "$log" || true
+                  sudo -n tail -n 200 "$log" 2>/dev/null \
+                      || tail -n 200 "$log" 2>/dev/null \
+                      || true
+              fi
+          done
+          # Also dump the rendered sshd_config so we can see what
+          # sshd was actually using.
+          for cfg in \
+              "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd_config" \
+              "/tmp/passhrs-test-sshd/sshd_config"; do
+              if [ -e "$cfg" ]; then
+                  echo "=== sshd config: $cfg ==="
+                  sudo -n cat "$cfg" 2>/dev/null \
+                      || cat "$cfg" 2>/dev/null \
+                      || true
               fi
           done
 
@@ -174,12 +193,24 @@ jobs:
           # setup-windows.ps1 put it).
           $logs = @(
               "$env:ProgramData\ssh\logs\sshd.log",
-              "$env:ProgramData\ssh\sshd.log"
+              "$env:ProgramData\ssh\sshd.log",
+              "$env:ProgramData\ssh\logs\sshd",
+              "$env:ProgramData\ssh\OpenSSH_ConfigDiag.log"
           )
           foreach ($log in $logs) {
               if (Test-Path -LiteralPath $log) {
                   Write-Host "=== sshd log: $log ==="
-                  Get-Content -LiteralPath $log -Tail 100 -ErrorAction SilentlyContinue
+                  Get-Content -LiteralPath $log -Tail 200 -ErrorAction SilentlyContinue
+              }
+          }
+          $cfgs = @(
+              "$env:ProgramData\ssh\sshd_config",
+              "C:\ProgramData\ssh\sshd_config"
+          )
+          foreach ($cfg in $cfgs) {
+              if (Test-Path -LiteralPath $cfg) {
+                  Write-Host "=== sshd config: $cfg ==="
+                  Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
               }
           }
 
