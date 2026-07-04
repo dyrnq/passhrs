@@ -102,6 +102,31 @@ fn auth_args() -> Vec<String> {
     }
 }
 
+/// Prepend the test auth context (`-i PHR_TEST_KEY` on macOS when the
+/// provision script wrote one to GITHUB_ENV, otherwise `--password PASS`)
+/// to an arg vector — but only if the caller didn't already supply an
+/// auth flag. Mirrors the smart-inject done inside `run_phr` for
+/// tests that build a `Command` directly instead of going through
+/// `run_phr` (the four spawned-process tests + the connect-timeout
+/// test). Without this, those tests would call passhrs with no
+/// `--password` and no `-i`, so passhrs would try key auth with an
+/// unset key path (which fails silently) and fall back to password —
+/// which macOS's `PasswordAuthentication no` sshd rejects outright.
+/// On Linux/Windows the missing auth args would still work IF
+/// chpasswd happened to succeed, but the path through auth_args()
+/// keeps every test's auth context visible from one place.
+fn prepend_auth_args(args: &mut Vec<String>) {
+    let caller_has_auth = args
+        .iter()
+        .any(|a| a == "--password" || a == "-i" || a == "--password-file");
+    if caller_has_auth {
+        return;
+    }
+    let mut with_auth = auth_args();
+    with_auth.append(args);
+    *args = with_auth;
+}
+
 fn run_phr(args: &[&str]) -> (bool, String, String) {
     // Auth args used to live inline in every test's arg array
     // (`"--password", PASS,`). They moved here so a single env-var
@@ -115,7 +140,7 @@ fn run_phr(args: &[&str]) -> (bool, String, String) {
     // on Linux/Windows (auth_args would otherwise inject a second
     // `--password PassTest1234!` first).
     let caller_has_auth = args.iter().any(|a| *a == "--password" || *a == "-i");
-    let mut full_args = Vec::new();
+    let mut full_args: Vec<String> = Vec::new();
     if !caller_has_auth {
         full_args.extend(auth_args());
     }
@@ -541,18 +566,30 @@ fn test_connect_timeout_integration() {
         return;
     }
     let d = format!("{}@10.255.255.1", USER);
+    // Prepend auth args so passhrs parses the same argv shape it
+    // would see in a real call. The connection to 10.255.255.1 is
+    // intentionally unreachable; we only assert that passhrs times
+    // out cleanly without panicking. Without the auth args,
+    // passhrs would still try to load a key from "" and fall back
+    // to password — on macOS with PasswordAuthentication no that
+    // fallback would also fail (test would still pass because we
+    // only check non-zero exit + no panic), but it would emit a
+    // confusing auth-related warning before the connect timeout
+    // that masks the actual timeout.
+    let mut args: Vec<String> = vec![
+        "--connect-timeout".to_string(),
+        "3".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        d,
+        "echo".to_string(),
+        "should_not_reach".to_string(),
+    ];
+    prepend_auth_args(&mut args);
     let out = Command::new(BIN)
-        .args([
-            "--connect-timeout",
-            "3",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            &d,
-            "echo",
-            "should_not_reach",
-        ])
+        .args(&args)
         .output()
         .expect("timeout test");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -847,19 +884,21 @@ fn test_local_forward_spawn() {
         return;
     }
     let local_port = "22300";
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-L".to_string(),
+        format!("{}:localhost:{}", local_port, PORT),
+        "-N".to_string(),
+        format!("{}@{}", USER, HOST),
+    ];
+    prepend_auth_args(&mut args);
     let mut child = Command::new(BIN)
-        .args([
-            "-p",
-            PORT,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-L",
-            &format!("{}:localhost:{}", local_port, PORT),
-            "-N",
-            &format!("{}@{}", USER, HOST),
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -876,19 +915,21 @@ fn test_socks5_proxy_spawn() {
         return;
     }
     let socks_port = "21080";
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-D".to_string(),
+        socks_port.to_string(),
+        "-N".to_string(),
+        format!("{}@{}", USER, HOST),
+    ];
+    prepend_auth_args(&mut args);
     let mut child = Command::new(BIN)
-        .args([
-            "-p",
-            PORT,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-D",
-            socks_port,
-            "-N",
-            &format!("{}@{}", USER, HOST),
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -905,19 +946,21 @@ fn test_http_connect_proxy_spawn() {
         return;
     }
     let http_port = "21081";
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-H".to_string(),
+        http_port.to_string(),
+        "-N".to_string(),
+        format!("{}@{}", USER, HOST),
+    ];
+    prepend_auth_args(&mut args);
     let mut child = Command::new(BIN)
-        .args([
-            "-p",
-            PORT,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-H",
-            http_port,
-            "-N",
-            &format!("{}@{}", USER, HOST),
-        ])
+        .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -938,21 +981,20 @@ fn test_fork_background() {
         return;
     }
     let d = format!("{}@{}", USER, HOST);
-    let out = Command::new(BIN)
-        .args([
-            "-p",
-            PORT,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-f",
-            &d,
-            "sleep",
-            "2",
-        ])
-        .output()
-        .expect("fork test");
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-f".to_string(),
+        d,
+        "sleep".to_string(),
+        "2".to_string(),
+    ];
+    prepend_auth_args(&mut args);
+    let out = Command::new(BIN).args(&args).output().expect("fork test");
     assert!(out.status.success(), "fork exit non-zero");
 }
 
@@ -1073,8 +1115,19 @@ fn test_proxy_jump_self() {
 /// Run passhrs with an explicit environment overlaid on the current process
 /// env, so we can assert that locale variables are forwarded to the remote.
 fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, String) {
+    // Mirror run_phr's smart-inject for auth args — without this the
+    // two tests that use this helper (test_locale_env_forwarded,
+    // test_unrelated_env_not_forwarded) land at sshd with no auth
+    // method at all and fail with the opaque russh error
+    // "Authentication failed" before any channel-set-env runs.
+    // Delegate to the shared prepend_auth_args helper (defined above
+    // run_phr) so the smart-inject logic — including the
+    // `--password-file` form — lives in exactly one place.
+    let mut full_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    prepend_auth_args(&mut full_args);
+
     let mut cmd = Command::new(BIN);
-    cmd.args(args);
+    cmd.args(&full_args);
     // `Command::env(K, V)` is implemented as `envs(Some((K, V)))`,
     // and `envs` CLEARS the explicit env list on every call. So a
     // loop like
