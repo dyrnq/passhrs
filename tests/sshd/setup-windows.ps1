@@ -28,12 +28,56 @@ $HostKey    = Join-Path $SshRoot 'ssh_host_ed25519_key'
 $SftpServer = Join-Path $env:SystemRoot 'System32\OpenSSH\sftp-server.exe'
 $SshdLog    = Join-Path $SshRoot 'logs\sshd.log'
 
-# 1. Install OpenSSH Server capability if missing.
+# 1. The inbox Windows OpenSSH capability ships OpenSSH 8.1p1 (LibreSSL
+#    3.8.2) on windows-2022 runners and that build has a known
+#    permission-check regression: it prints "Bad permissions. Try
+#    removing permissions for user: <SID>" against host keys whose DACL
+#    has any non-owner ACE, including the canonical
+#        SYSTEM:(F) Administrators:(F)
+#    "two-ACL" pattern recommended by Microsoft's own upgrade guide.
+#    Microsoft's recommended fix is to replace the inbox binaries with
+#    the latest Win32-OpenSSH release. We do that by downloading the
+#    x64 ZIP and overwriting the binaries in
+#    %SystemRoot%\System32\OpenSSH in place.
+$Win32OpenSshUrl = 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64.zip'
+$WorkDir = Join-Path $env:TEMP 'passhrs-win32-openssh'
+$ZipPath = Join-Path $WorkDir 'OpenSSH-Win64.zip'
+$ExtractedDir = Join-Path $WorkDir 'OpenSSH-Win64'
+$SshdBinDir = Join-Path $env:SystemRoot 'System32\OpenSSH'
+
+# Ensure the OpenSSH capability is present (gives us the sshd service
+# registration and the %ProgramData%\ssh layout); the binaries inside
+# will be replaced below.
 $sshdFeature = Get-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction SilentlyContinue
 if ($null -eq $sshdFeature -or $sshdFeature.State -ne 'Installed') {
     Write-Host 'Installing OpenSSH.Server capability...'
     Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
 }
+
+Write-Host "Upgrading OpenSSH binaries to Win32-OpenSSH 10.0.0.0..."
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+Invoke-WebRequest -Uri $Win32OpenSshUrl -OutFile $ZipPath -UseBasicParsing
+if (Test-Path $ExtractedDir) {
+    Remove-Item -Recurse -Force $ExtractedDir
+}
+Expand-Archive -Path $ZipPath -DestinationPath $WorkDir -Force
+
+# Stop the sshd service before swapping binaries; it caches old ones.
+Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+
+# Overwrite the inbox binaries in-place. OpenSSH.exe / sshd.exe /
+# sftp-server.exe / ssh-keygen.exe are the files passhrs actually
+# shells out to. After this, "sshd -V" reports the Win32-OpenSSH
+# version instead of "OpenSSH_for_Windows_8.1p1".
+foreach ($name in @('sshd.exe','ssh.exe','ssh-keygen.exe','sftp-server.exe','scp.exe','sftp.exe')) {
+    $src = Join-Path $ExtractedDir $name
+    $dst = Join-Path $SshdBinDir $name
+    if (Test-Path $src) {
+        Copy-Item -Path $src -Destination $dst -Force
+    }
+}
+$sshdAfterUpgrade = & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | Select-Object -First 1
+Write-Host "sshd -V after upgrade: $sshdAfterUpgrade"
 
 # 2. Ensure sshd directories exist.
 New-Item -ItemType Directory -Force -Path $SshRoot | Out-Null
@@ -97,15 +141,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "ssh-keygen -A failed (exit $LASTEXITCODE)"
 }
 
-# 5c. Re-lock each newly generated host key ACL with the EXACT minimal
-#     shape OpenSSH 8.1p1's permission check accepts: owner + ONE ACE
-#     (FA for the owner). The check prints
-#       "Bad permissions. Try removing permissions for user: <SID>"
-#     for *each* non-owner ACE in the DACL, so adding Administrators
-#     or NT SERVICE\sshd as additional SIDs makes sshd reject the key
-#     even though those SIDs are tightly scoped. The sshd service runs
-#     in the LocalSystem context, which matches the SYSTEM owner here,
-#     so it can read the key without any other ACE.
+# 5c. Re-lock each newly generated host key ACL. With the upgraded
+#     Win32-OpenSSH 10.0 the historical 8.1p1 SD regression is gone,
+#     so we can use the standard two-ACE ACL the Microsoft upgrade
+#     guide recommends: SYSTEM and Administrators, both FullControl.
+#     We do still strip inherited ACEs to make sure nothing loose
+#     leaks in from the parent directory.
 Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*_key' -Force | ForEach-Object {
     $keyFile = $_.FullName
     takeown /F $keyFile /A | Out-Null
@@ -114,49 +155,24 @@ Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*_key' -Force | ForEach-Object {
     foreach ($rule in @($keyAcl.Access)) {
         $keyAcl.RemoveAccessRuleSpecific($rule)
     }
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $systemSid, 'FullControl', 'Allow')
-    $keyAcl.AddAccessRule($rule)
+    foreach ($sid in @($systemSid, $adminsSid)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, 'FullControl', 'Allow')
+        $keyAcl.AddAccessRule($rule)
+    }
     $keyAcl.SetOwner($systemSid)
     Set-Acl -Path $keyFile -AclObject $keyAcl
 }
 
-# Diagnostic dump: ACL + owner + SDDL + sshd binary location + sshd
-# version, all on stdout so the next CI failure has the full context.
-# icacls hides certain SD fields; we include the raw SDDL string from
-# Get-Acl which preserves everything sshd actually inspects.
+# 5d. The sshd_config file is not secret — grant NT SERVICE\sshd read
+#     so the service can parse its config, while preserving the
+#     inherited Administrators ACE that the runner user needs to run
+#     `sshd -t -f` for syntax validation.
+icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' | Out-Null
+
 Write-Host "After lockdown, icacls ${HostKey}:"
 icacls $HostKey | Out-Host
-Write-Host "Owner: $((Get-Acl -Path $HostKey).Owner)"
-Write-Host "SDDL: $((Get-Acl -Path $HostKey).Sddl)"
-Write-Host "AccessRulesProtected: $((Get-Acl -Path $HostKey).AreAccessRulesProtected)"
-Write-Host "sshd binary: $((Get-Command sshd -ErrorAction SilentlyContinue).Source)"
-$sshdVer = & sshd -V 2>&1 | Out-String
-Write-Host "sshd -V: $sshdVer"
-
-# Diagnostic 2: ask ssh-keygen whether it can read the same key. If
-# ssh-keygen ALSO emits "UNPROTECTED PRIVATE KEY FILE" against an SD
-# we just confirmed is {O:SY,D:P,SYSTEM+Administrators+NT SERVICE\sshd
-# all with FA}, then OpenSSH 8.1p1's permission check is rejecting an
-# actually-private key — i.e. it's a bug in the inbox ssh-keygen/sshd
-# permission validator, not a DACL we can fix. If ssh-keygen is happy
-# but sshd still isn't, then sshd has additional logic beyond the
-# generic OpenSSH portable check.
-Write-Host "Probe: ssh-keygen -y -f $HostKey (public key extract)"
-$sshOut = & $SshBin -y -f $HostKey 2>&1 | Out-String
-Write-Host $sshOut
-
-# Diagnostic 3: ask sshd itself why it rejects the key, with debug
-# output and the host key forced via -h. -ddd makes sshd print the
-# specific permission-check failure (or not).
-Write-Host "Probe: sshd -ddd -h $HostKey (debug mode, host key forced)"
-$sshdDebug = & "$env:SystemRoot\System32\OpenSSH\sshd.exe" -ddd -h $HostKey 2>&1 | Out-String
-Write-Host $sshdDebug
-
-# 5d. The sshd_config file is not secret — only add the service SID
-#     without stripping inheritance (preserves the inherited
-#     Administrators ACE the runner user needs to pass `sshd -t`).
-icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)' | Out-Null
+Write-Host "sshd -V: $sshdAfterUpgrade"
 
 # 6. Create testuser with a known password. The default $Pass value
 #    ('PassTest1234#') already satisfies Windows password complexity
@@ -181,21 +197,22 @@ if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
 }
 Add-LocalGroupMember -Group $group -Member $User -ErrorAction SilentlyContinue
 
-# 8. Skip the usual `sshd -t -f $SshdCfg` syntax check. The runner user
-#    (Administrator) cannot read the SYSTEM-owned host key that the
-#    config points to, so sshd -t fails with the same "Bad permissions"
-#    warning even when the key ACL is correct for the SSH service. The
-#    Start-Service + port-readiness wait below serves as the validation:
-#    if sshd could not load the keys (any ACL issue or config parse
-#    error), the service exits and 127.0.0.1:22222 is never bound.
+# 8. Validate the config syntactically before launching sshd. `sshd -t`
+#    parses the file and exits non-zero on any error, printing the
+#    offending line to stderr. This is now safe because the upgraded
+#    Win32-OpenSSH accepts the canonical host-key ACL we generated in
+#    step 5c, so `sshd -t` (running as the runner user) can read the
+#    key file as part of its validation pass.
+& sshd -t -f $SshdCfg
+if ($LASTEXITCODE -ne 0) {
+    throw "sshd config validation failed (exit $LASTEXITCODE)"
+}
 
 # 9. Start sshd via the Windows service that the OpenSSH capability
 #    installs. The service reads $SshdCfg by default (this is where the
 #    installer expects it). Starting via the service avoids the
 #    process-lifecycle quirks of `Start-Process` with -D (the daemon
-#    mode the Windows sshd build does not reliably support). The
-#    service runs as LocalSystem, which is the owner of the host key
-#    file so the OpenSSH permission check now accepts the key.
+#    mode the Windows sshd build does not reliably support).
 $svc = Get-Service -Name sshd -ErrorAction Stop
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
