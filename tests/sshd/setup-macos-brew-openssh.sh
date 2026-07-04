@@ -48,41 +48,14 @@ if [ ! -x "${BREW_BIN}/brew" ]; then
 fi
 export PATH="${BREW_BIN}:${PATH}"
 
-# Homebrew openssh install path. On arm64: /opt/homebrew/opt/openssh/sbin/sshd
-# (with a /opt/homebrew/sbin/sshd symlink). On x86_64: /usr/local/opt/openssh/sbin/sshd.
+# Resolve sshd + sftp-server AFTER `brew install openssh` below.
+# Searching for them here (before install) would always miss — the
+# Homebrew openssh formula installs sshd to
+# /opt/homebrew/Cellar/openssh/<ver>/sbin/sshd with symlinks under
+# /opt/homebrew/opt/openssh/sbin/sshd and /opt/homebrew/sbin/sshd,
+# none of which exist on a fresh runner before install runs.
 SSHD_BIN=""
-for cand in \
-    "/opt/homebrew/opt/openssh/sbin/sshd" \
-    "/opt/homebrew/sbin/sshd" \
-    "/usr/local/opt/openssh/sbin/sshd" \
-    "/usr/local/sbin/sshd"; do
-    if [ -x "${cand}" ]; then
-        SSHD_BIN="${cand}"
-        break
-    fi
-done
-if [ -z "${SSHD_BIN}" ]; then
-    echo "FATAL: Homebrew openssh installed but sshd not found in any known path" >&2
-    exit 1
-fi
-
-# Homebrew openssh's bundled sftp-server. Falls back to the system
-# sftp-server if Homebrew's is missing (sftp-server is a separate
-# subpackage on some Brew formulas).
 SFTP_SERVER=""
-for cand in \
-    "/opt/homebrew/libexec/sftp-server" \
-    "/usr/local/libexec/sftp-server" \
-    "/usr/libexec/sftp-server"; do
-    if [ -x "${cand}" ]; then
-        SFTP_SERVER="${cand}"
-        break
-    fi
-done
-if [ -z "${SFTP_SERVER}" ]; then
-    echo "FATAL: no sftp-server binary found" >&2
-    exit 1
-fi
 
 SSHD_CFG_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSHD_CFG_TEMPLATE="${SSHD_CFG_DIR}/sshd_config"
@@ -113,18 +86,69 @@ sudo -u "${SUDO_USER:-runner}" -H bash -c "
     exit 1
 }
 
-# Re-resolve SSHD_BIN now that openssh is installed.
-for cand in \
-    "/opt/homebrew/opt/openssh/sbin/sshd" \
-    "/opt/homebrew/sbin/sshd" \
-    "/usr/local/opt/openssh/sbin/sshd" \
-    "/usr/local/sbin/sshd"; do
-    if [ -x "${cand}" ]; then
+# ---- 1b. dynamically resolve Homebrew openssh's binary paths ----------
+# Don't hardcode `/opt/homebrew/...` — that's only correct on
+# Apple Silicon. Use `brew --prefix openssh` to ask Homebrew
+# directly where it installed the formula, then fall back to a
+# handful of common paths for edge cases (custom taps, manual
+# install). `command -v sshd` last-catches the rare case where
+# someone already has an sshd on PATH.
+OPENSSH_PREFIX="$(brew --prefix openssh 2>/dev/null || true)"
+BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+echo "    brew --prefix:         ${BREW_PREFIX}"
+echo "    brew --prefix openssh: ${OPENSSH_PREFIX}"
+
+CANDIDATES=(
+    "${OPENSSH_PREFIX}/sbin/sshd"
+    "${BREW_PREFIX}/opt/openssh/sbin/sshd"
+    "/opt/homebrew/opt/openssh/sbin/sshd"
+    "/opt/homebrew/sbin/sshd"
+    "/usr/local/opt/openssh/sbin/sshd"
+    "/usr/local/sbin/sshd"
+    "$(command -v sshd 2>/dev/null || true)"
+)
+for cand in "${CANDIDATES[@]}"; do
+    if [ -n "${cand}" ] && [ -x "${cand}" ]; then
         SSHD_BIN="${cand}"
         break
     fi
 done
+
+if [ -z "${SSHD_BIN}" ]; then
+    echo "FATAL: Homebrew openssh installed but sshd not found" >&2
+    echo "Searched:" >&2
+    for c in "${CANDIDATES[@]}"; do echo "  - ${c}" >&2; done
+    echo "Cellar contents (best-effort):" >&2
+    find "${OPENSSH_PREFIX}" "${BREW_PREFIX}" -name sshd -type f 2>/dev/null \
+        | head -10 >&2 || true
+    exit 1
+fi
 echo "    sshd: ${SSHD_BIN}  ($(${SSHD_BIN} -V 2>&1 || echo unknown))"
+
+# sftp-server is a separate binary that the openssh formula also
+# installs. It can land in <prefix>/libexec/sftp-server (modern
+# Homebrew) or <prefix>/sbin/sftp-server (older), and the system
+# sftp-server at /usr/libexec/sftp-server is a last-resort fallback.
+SFTP_CANDIDATES=(
+    "${OPENSSH_PREFIX}/libexec/sftp-server"
+    "${BREW_PREFIX}/libexec/sftp-server"
+    "/opt/homebrew/libexec/sftp-server"
+    "/usr/local/libexec/sftp-server"
+    "/usr/libexec/sftp-server"
+)
+for cand in "${SFTP_CANDIDATES[@]}"; do
+    if [ -n "${cand}" ] && [ -x "${cand}" ]; then
+        SFTP_SERVER="${cand}"
+        break
+    fi
+done
+if [ -z "${SFTP_SERVER}" ]; then
+    echo "FATAL: sftp-server binary not found" >&2
+    echo "Searched:" >&2
+    for c in "${SFTP_CANDIDATES[@]}"; do echo "  - ${c}" >&2; done
+    exit 1
+fi
+echo "    sftp-server: ${SFTP_SERVER}"
 
 # ---- 2. materialize sshd_config (template + per-run overrides) ------------
 
