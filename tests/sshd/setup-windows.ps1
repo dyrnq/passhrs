@@ -133,6 +133,25 @@ Write-Host "sshd binary: $((Get-Command sshd -ErrorAction SilentlyContinue).Sour
 $sshdVer = & sshd -V 2>&1 | Out-String
 Write-Host "sshd -V: $sshdVer"
 
+# Diagnostic 2: ask ssh-keygen whether it can read the same key. If
+# ssh-keygen ALSO emits "UNPROTECTED PRIVATE KEY FILE" against an SD
+# we just confirmed is {O:SY,D:P,SYSTEM+Administrators+NT SERVICE\sshd
+# all with FA}, then OpenSSH 8.1p1's permission check is rejecting an
+# actually-private key — i.e. it's a bug in the inbox ssh-keygen/sshd
+# permission validator, not a DACL we can fix. If ssh-keygen is happy
+# but sshd still isn't, then sshd has additional logic beyond the
+# generic OpenSSH portable check.
+Write-Host "Probe: ssh-keygen -y -f $HostKey (public key extract)"
+$sshOut = & $SshBin -y -f $HostKey 2>&1 | Out-String
+Write-Host $sshOut
+
+# Diagnostic 3: ask sshd itself why it rejects the key, with debug
+# output and the host key forced via -h. -ddd makes sshd print the
+# specific permission-check failure (or not).
+Write-Host "Probe: sshd -ddd -h $HostKey (debug mode, host key forced)"
+$sshdDebug = & "$env:SystemRoot\System32\OpenSSH\sshd.exe" -ddd -h $HostKey 2>&1 | Out-String
+Write-Host $sshdDebug
+
 # 5d. The sshd_config file is not secret — only add the service SID
 #     without stripping inheritance (preserves the inherited
 #     Administrators ACE the runner user needs to pass `sshd -t`).
