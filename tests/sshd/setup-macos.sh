@@ -154,7 +154,17 @@ if pid == 0:
     # so `ps` doesn't show the password in the visible arg list.
     os.execv("/usr/bin/sudo", ["sudo", "/usr/bin/passwd", user])
 # Parent: drive the prompts.
-def read_until(token, timeout=15.0):
+def read_until(tokens, timeout=15.0):
+    """Read until one of the byte-string tokens appears in the
+    accumulated buffer. tokens is either a single bytes value or
+    a list of them — any one matching is enough to return.
+    The tokenless form (a single newline) is also supported: the
+    function returns as soon as a b'\n' arrives in the buffer.
+    """
+    if isinstance(tokens, (bytes, bytearray)):
+        tokens = [bytes(tokens)]
+    else:
+        tokens = [bytes(t) for t in tokens]
     buf = b""
     end = time.time() + timeout
     while time.time() < end:
@@ -169,55 +179,50 @@ def read_until(token, timeout=15.0):
             if not chunk:
                 break
             buf += chunk
-            if token in buf:
-                return buf, True
+            for t in tokens:
+                if t in buf:
+                    return buf, True
     return buf, False
 
 def send(text):
     os.write(fd, text.encode('utf-8') + b'\n')
 
-# 1. Banner "Changing password for <user>." appears first. Don't
-#    match on it (it contains "assword" as a substring of
-#    "Changing password" — matching would fire before passwd's
-#    actual prompt is on the wire). Wait specifically for one of
-#    the prompt strings the macOS passwd(1) emits in this order:
-#    - "Old password:"        (when running as root, Sonoma)
-#    - "New password:"        (pre-Sonoma, or non-root self-change)
-#    - "New password for <u>:" (Sonoma, non-root self-change)
-#    - "Retype new password:"  (if both new prompts arrive in one read)
-# We do this in three phases, each looking for the right token.
-def wait_prompt(label, candidates, timeout=15.0):
-    buf, ok = read_until(candidates, timeout=timeout)
-    if not ok:
-        sys.stderr.write("FAIL at {}: never saw any of {!r} within {:.0f}s\n".format(
-            label, candidates, timeout))
-        sys.stderr.write("---- passwd transcript so far ----\n")
-        sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
-        sys.stderr.write('---- end transcript ----\n')
-        sys.exit(1)
-    return buf
-
-# 2. First prompt is the OLD password (Sonoma, even for root).
-#    Pre-Sonoma jumps straight to "New password:" — in that case
-#    skip the old-password phase. We do that by reading until
-#    EITHER "Old password:" OR "New password" appears.
-buf, ok = read_until(b"New password", timeout=10.0)
+# 1. Banner "Changing password for <user>." appears first. We
+#    then look for the FIRST actual passwd prompt. On Sonoma+ as
+#    root that's "Old password:"; on pre-Sonoma passwd jumps
+#    straight to "New password:". The previous version of this
+#    script only matched on "New password" and timed out on
+#    Sonoma — wait for EITHER.
+buf, ok = read_until([b"Old password", b"New password"], timeout=15.0)
 if not ok:
-    sys.stderr.write("FAIL: never saw 'Old password' or 'New password' within 10s\n")
+    sys.stderr.write("FAIL: never saw 'Old password' or 'New password' within 15s\n")
     sys.stderr.write("---- passwd transcript so far ----\n")
     sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
     sys.stderr.write('---- end transcript ----\n')
     sys.exit(1)
+# 2. If we matched on "Old password", feed the autologin pw we
+#    decoded from /etc/kcpassword. If we matched on "New password"
+#    (pre-Sonoma or non-root path), skip straight to sending the
+#    new password below — passwd will accept it.
 if b"Old password" in buf:
-    # Pre-Sonoma, sudo passes the admin password as the old pw
-    # automatically; on Sonoma, we need to feed it ourselves.
     send(old_pw)
-    # Now wait for the new-password prompt.
-    buf = wait_prompt("new-password after old",
-                      [b"New password"], timeout=10.0)
+    # Now wait for the new-password prompt before sending the new pw.
+    buf, ok = read_until(b"New password", timeout=15.0)
+    if not ok:
+        sys.stderr.write("FAIL: after old pw, never saw 'New password' within 15s\n")
+        sys.stderr.write("---- passwd transcript so far ----\n")
+        sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
+        sys.stderr.write('---- end transcript ----\n')
+        sys.exit(1)
 # 3. Send the new password and wait for the retype prompt.
 send(new_pw)
-buf = wait_prompt("retype prompt", [b"Retype"], timeout=15.0)
+buf, ok = read_until(b"Retype", timeout=15.0)
+if not ok:
+    sys.stderr.write("FAIL: after new pw, never saw 'Retype' within 15s\n")
+    sys.stderr.write("---- passwd transcript so far ----\n")
+    sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
+    sys.stderr.write('---- end transcript ----\n')
+    sys.exit(1)
 # 4. Send the retype and capture the verdict line.
 send(new_pw)
 _, ok = read_until(b"\n", timeout=10.0)
