@@ -176,6 +176,24 @@ def decode_kcpassword(path):
 
 old_pw = decode_kcpassword('/etc/kcpassword')
 sys.stderr.write("Decoded autologin password from /etc/kcpassword (len={})\n".format(len(old_pw)))
+# Diagnostic: print the raw file size + hex of the encoded bytes
+# AND the hex of the post-XOR buffer so we can see WHY the decoder
+# landed on the length it did. The kcpassword file on GitHub's
+# macos-14 image has been observed with M=32 in the past, which is
+# not a valid output of the bootstrap-provisioner encoder (valid
+# M's are 11, 12, 22, 23, 33, ...). If we see M=32, it means macOS
+# is using a different (or no) padding scheme and the decoder is
+# returning the whole buffer as a fallback.
+with open('/etc/kcpassword', 'rb') as _f:
+    _raw = _f.read()
+sys.stderr.write("kcpassword file size: M={} bytes\n".format(len(_raw)))
+sys.stderr.write("encoded hex: {}\n".format(_raw.hex()))
+_dec = bytearray(len(_raw))
+for _i, _b in enumerate(_raw):
+    _dec[_i] = _b ^ _KC_KEY[_i % len(_KC_KEY)]
+sys.stderr.write("post-XOR hex: {}\n".format(bytes(_dec).hex()))
+sys.stderr.write("post-XOR printable mask: {}\n".format(
+    ''.join('.' if 32 <= _b < 127 else '?' for _b in _dec)))
 
 pid, fd = pty.fork()
 if pid == 0:
