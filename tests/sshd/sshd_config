@@ -49,6 +49,17 @@ UseDNS no
 # Quiet logging. Tests observe passhrs behavior, not sshd diagnostics.
 LogLevel ERROR
 
-# Subsystem line is appended by the platform-specific setup script with
-# the correct sftp-server path for that OS.
-# Subsystem sftp __SFTP_SERVER_PATH__
+# Subsystem line: the platform-specific setup script does `sed
+# s|__SFTP_SERVER_PATH__|/path/to/sftp-server|` to inject the
+# correct binary path for the host OS. The line must NOT be
+# commented out — when it is, sshd silently drops every
+# `subsystem request for sftp` (log line: 'subsystem request
+# for sftp by user <u> failed, subsystem not found') and the
+# SFTP tests hang in SftpSession::new waiting for an INIT
+# packet that will never come. (The commented line in earlier
+# revisions of this file was a documentation placeholder
+# expecting the setup script to append an uncommented line;
+# that approach was replaced by sed-in-place substitution
+# without uncommenting, hence the SFTP subsystem being
+# effectively disabled on every platform.)
+Subsystem sftp __SFTP_SERVER_PATH__
