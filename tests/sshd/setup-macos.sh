@@ -108,37 +108,35 @@ echo "Creating ${USER} via sysadminctl -addUser (pass=${PASS})..."
 # -admin puts the user in the admin group → SACL ssh grant →
 # pam_sacl.so lets the SSH session past the account stage.
 #
-# NB: on Sonoma, sysadminctl's -password flag is unreliable when the
-# password contains a '#' character — the Cocoa arg parser appears
-# to treat '#' as a comment marker in some code paths, so the
-# user is created but the password is silently dropped (you see
-# "No clear text password or interactive option was specified ...
-# user to use FDE" in stderr). To be robust, we ALWAYS follow up
-# with `dscl . -passwd` to actually set the password regardless of
-# whether sysadminctl took it.
+# NB: on Sonoma, sysadminctl -addUser ALWAYS creates the user
+# with a random initial password (the `-password` flag is
+# silently dropped — see the "No clear text password or
+# interactive option was specified ... user to use FDE" warning
+# we always get). The single-arg `dscl . -passwd` form (which
+# is the documented way to set the initial password of a fresh
+# account) is also a no-op when the account already has a
+# password — dscl returns 0 but doesn't actually overwrite.
+# So we use the two-arg form `dscl . -passwd <user> "" <new>`,
+# which tries empty-as-old and lets OpenDirectory bootstrap the
+# password when there's no real old to match against.
 sudo sysadminctl -addUser "${USER}" \
     -fullName "passhrs test user" \
-    -password "${PASS}" \
     -admin \
     -home "${HOME_DIR}" 2>&1 || {
         echo "FATAL: sysadminctl -addUser ${USER} failed" >&2
         exit 1
     }
 
-# Force-set the password via dscl. For a brand-new user this works
-# without secure token (the user has no prior password hash to
-# unlock against), even though dscl . -passwd normally requires
-# the user's old password. We pass "${PASS}" once (the "new
-# password" form) — dscl recognises the single-arg form on a
-# fresh account.
-echo "Setting password via dscl . -passwd ..."
-sudo dscl . -passwd "/Users/${USER}" "${PASS}" 2>&1 || {
-    echo "FATAL: dscl . -passwd failed to set ${USER}'s password" >&2
-    echo "Trying the secure-token bootstrap via sysadminctl instead..." >&2
-    # Fall back: ask sysadminctl to reset using itself as the blesser.
-    # If that ALSO fails (likely the secure-token lockout we're
-    # trying to avoid), the next authonly check will surface the
-    # real error.
+echo "Setting password via dscl . -passwd (two-arg form, empty old)..."
+# Two-arg form: <path> "" <newpass>. The empty-string old is
+# accepted because OpenDirectory treats "no password on file" as
+# equivalent to "old is empty" for fresh accounts whose sysadminctl-
+# generated random password was never written to disk (only held in
+# memory by the creating process — the on-disk record has no
+# password set yet, which is why single-arg form silently no-ops).
+sudo dscl . -passwd "/Users/${USER}" "" "${PASS}" 2>&1 || {
+    echo "FATAL: dscl . -passwd (two-arg) failed for ${USER}" >&2
+    echo "Trying sysadminctl -resetPasswordFor as a last resort..." >&2
     sudo sysadminctl -resetPasswordFor "${USER}" "${PASS}" \
         -adminPassword "${PASS}" 2>&1 || true
 }
@@ -150,6 +148,11 @@ sudo dscl . -passwd "/Users/${USER}" "${PASS}" 2>&1 || {
 echo "Verifying password via dscl . -authonly ..."
 if ! sudo dscl . -authonly -user "${USER}" -password "${PASS}" 2>&1; then
     echo "FATAL: dscl . -authonly rejected the password we just set" >&2
+    echo "--- ${USER} OpenDirectory record ---"
+    sudo dscl . -read "/Users/${USER}" 2>&1 | head -40 || true
+    echo "--- sysadminctl's take on ${USER} ---"
+    sudo sysadminctl -resetPasswordFor "${USER}" "${PASS}" \
+        -adminPassword "${PASS}" 2>&1 || true
     echo "Aborting before launching sshd; tests would all fail with" >&2
     echo "'PAM: password authentication failed' otherwise." >&2
     exit 1
