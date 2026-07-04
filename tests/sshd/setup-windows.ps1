@@ -66,28 +66,49 @@ Expand-Archive -Path $ZipPath -DestinationPath $WorkDir -Force
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
-# The inbox OpenSSH binaries live under %SystemRoot%\System32\OpenSSH
-# and are protected: they default to owner=TrustedInstaller with a
-# restricted DACL, so Administrator cannot overwrite them even when
-# the sshd service is stopped. Re-acquire ownership and grant
-# Administrators FullControl on each target before overwriting, which
-# is sufficient to defeat Windows Resource Protection for files we
-# ourselves will replace.
-$InboxBinaries = @('sshd.exe','ssh.exe','ssh-keygen.exe','sftp-server.exe','scp.exe','sftp.exe')
-foreach ($name in $InboxBinaries) {
-    $dst = Join-Path $SshdBinDir $name
-    if (-not (Test-Path $dst)) {
-        continue
+# Replace every binary the inbox capability installed with the
+# matching one from the Win32-OpenSSH release. Win32-OpenSSH 10.0
+# is what adds sshd-session.exe: sshd.exe became a thin launcher that
+# forks sshd-session.exe for the per-connection session, so leaving
+# the old 8.1p1 sshd-session.exe-or-no-session-binary layout means
+# sshd.exe immediately exits with
+# "c:\windows\system32\openssh/sshd-session.exe does not exist or
+# is not executable". We also pull across the auxiliary binaries
+# (sshd-auth.exe, ssh-agent.exe, ssh-add.exe, ssh-keyscan.exe,
+# ssh-keysign.exe, ssh-proxy.exe, ssh-shellhost.exe) and the
+# LibreSSL runtime DLLs (libcrypto-3-x64.dll, libssl-3-x64.dll,
+# libssp-0.dll, libssh.dll) — sshd.exe dynamically loads all of
+# them, so leaving the inbox 8.1p1 DLLs in place after swapping the
+# EXEs is also broken. Iterating over $ExtractedDir keeps the script
+# future-proof: future Win32-OpenSSH releases that split or rename
+# binaries again will Just Work without editing this list.
+$UpgradeFiles = Get-ChildItem -Path $ExtractedDir -File -Force
+Write-Host "Win32-OpenSSH release contains $($UpgradeFiles.Count) files; copying all of them to $SshdBinDir"
+
+foreach ($file in $UpgradeFiles) {
+    $src = $file.FullName
+    $dst = Join-Path $SshdBinDir $file.Name
+    # The inbox OpenSSH binaries live under %SystemRoot%\System32\OpenSSH
+    # and are protected: they default to owner=TrustedInstaller with a
+    # restricted DACL, so Administrator cannot overwrite them even when
+    # the sshd service is stopped. Re-acquire ownership and grant
+    # Administrators FullControl on each target before overwriting,
+    # which is sufficient to defeat Windows Resource Protection for
+    # files we ourselves will replace.
+    if (Test-Path $dst) {
+        takeown /F $dst /A | Out-Null
+        icacls $dst /grant 'Administrators:(F)' | Out-Null
     }
-    takeown /F $dst /A | Out-Null
-    icacls $dst /grant 'Administrators:(F)' | Out-Null
+    Copy-Item -Path $src -Destination $dst -Force
 }
 
-foreach ($name in $InboxBinaries) {
-    $src = Join-Path $ExtractedDir $name
-    $dst = Join-Path $SshdBinDir $name
-    if (Test-Path $src) {
-        Copy-Item -Path $src -Destination $dst -Force
+# Sanity check that the file sshd.exe strictly depends on is in place.
+# sshd.exe prints a fatal error and exits if this file is missing or
+# not executable, so verify before attempting to start the service.
+foreach ($required in @('sshd.exe','sshd-session.exe')) {
+    $p = Join-Path $SshdBinDir $required
+    if (-not (Test-Path $p)) {
+        throw "FATAL: $p missing after upgrade; the extracted Win32-OpenSSH release does not contain $required"
     }
 }
 
