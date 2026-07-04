@@ -44,9 +44,12 @@ mkdir -p "${RUNTIME_DIR}"
 sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
     "${SSHD_CFG_TEMPLATE}" \
     > "${SSHD_CFG}"
-# macOS-only: bump log level. The shared template's LogLevel ERROR is
-# fine on Linux (test failures there are visible without sshd debug)
-# but on macOS we need the auth-failure reason to be in sshd.log.
+# macOS-only: bump log level. OpenSSH honours the FIRST LogLevel it
+# sees and ignores later ones, so we have to delete the template's
+# `LogLevel ERROR` before appending DEBUG3 — otherwise the auth-failure
+# reason we want to see is silently suppressed by the template's
+# "Quiet logging" default.
+sed -i '' '/^LogLevel /d' "${SSHD_CFG}"
 cat >> "${SSHD_CFG}" <<EOF
 
 # --- passhrs CI overrides ---
