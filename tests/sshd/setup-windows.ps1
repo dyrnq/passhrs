@@ -241,7 +241,10 @@ try {
     Start-Service -Name sshd -ErrorAction Stop
     $sshdStartupOk = $true
 } catch {
-    Write-Error "Start-Service sshd threw: $_"
+    # Use Write-Host (not Write-Error) because $ErrorActionPreference =
+    # 'Stop' elsewhere turns Write-Error into a terminating error,
+    # which would re-exit the script before the diagnostic dump runs.
+    Write-Host "Start-Service sshd threw: $_"
 }
 Start-Sleep -Seconds 1
 
@@ -263,47 +266,47 @@ if ($sshdStartupOk) {
 }
 
 if (-not $sshdStartupOk) {
-    Write-Error "Start-Service sshd failed; emitting diagnostic dump:"
+    Write-Host "Start-Service sshd failed; emitting diagnostic dump:"
 } elseif (-not $ready) {
-    Write-Error "sshd did not accept connections within 10s; emitting diagnostic dump:"
+    Write-Host "sshd did not accept connections within 10s; emitting diagnostic dump:"
 }
 
 if (-not $sshdStartupOk -or -not $ready) {
-    Write-Error "sshd did not accept connections within 10s."
-    Write-Error "Service status:"
-    Get-Service -Name sshd | Format-List | Out-String | Write-Error
+    Write-Host "sshd did not accept connections within 10s."
+    Write-Host "Service status:"
+    Get-Service -Name sshd | Format-List | Out-String | Write-Host
 
     # Confirm the service really points to our upgraded binary. After
     # overwriting inbox binaries in-place the path stays the same, but
     # surface it so we know which sshd.exe was attempted.
     $svcPath = (Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue).PathName
-    Write-Error "Service BinaryPathName: $svcPath"
+    Write-Host "Service BinaryPathName: $svcPath"
 
-    Write-Error "sc.exe qc sshd:"
-    sc.exe qc sshd 2>&1 | ForEach-Object { Write-Error $_ }
+    Write-Host "sc.exe qc sshd:"
+    sc.exe qc sshd 2>&1 | ForEach-Object { Write-Host $_ }
 
-    Write-Error "sshd.exe on disk reports version:"
-    & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | ForEach-Object { Write-Error $_ }
+    Write-Host "sshd.exe on disk reports version:"
+    & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | ForEach-Object { Write-Host $_ }
 
-    Write-Error "sshd -t -f ${SshdCfg}:"
-    & sshd -t -f $SshdCfg 2>&1 | ForEach-Object { Write-Error $_ }
+    Write-Host "sshd -t -f ${SshdCfg}:"
+    & sshd -t -f $SshdCfg 2>&1 | ForEach-Object { Write-Host $_ }
 
-    Write-Error "sshd -ddd (debug):"
-    & sshd -ddd 2>&1 | Out-String | Write-Error
+    Write-Host "sshd -ddd (debug):"
+    & sshd -ddd 2>&1 | Out-String | Write-Host
 
-    Write-Error "Recent sshd log entries:"
-    if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Error }
+    Write-Host "Recent sshd log entries:"
+    if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Host }
 
-    Write-Error "Windows Event Log (sshd):"
+    Write-Host "Windows Event Log (sshd):"
     Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Error $_.Message }
-    Write-Error "Windows Event Log (System, sshd-related):"
+        ForEach-Object { Write-Host $_.Message }
+    Write-Host "Windows Event Log (System, sshd-related):"
     Get-WinEvent -LogName System -MaxEvents 50 -ErrorAction SilentlyContinue |
         Where-Object { $_.ProviderName -match 'sshd' -or $_.Message -match 'sshd' } |
-        ForEach-Object { Write-Error $_.Message }
-    Write-Error "Windows Event Log (Application, last 20):"
+        ForEach-Object { Write-Host $_.Message }
+    Write-Host "Windows Event Log (Application, last 20):"
     Get-WinEvent -LogName Application -MaxEvents 20 -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Error $_.Message }
+        ForEach-Object { Write-Host $_.Message }
     exit 1
 }
 
