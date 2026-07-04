@@ -109,6 +109,29 @@ fn run_phr(args: &[&str]) -> (bool, String, String) {
         full_args.extend(auth_args());
     }
     full_args.extend(args.iter().map(|s| s.to_string()));
+    // DEBUG (caf58d8 follow-up): on macOS the DEBUG3 sshd log
+    // showed the first few passhrs invocations landing
+    // `for user <os-user> method password` at sshd even though
+    // the test passed `testuser@127.0.0.1:22222` in args. That
+    // meant either PHR_TEST_KEY didn't reach this process (so
+    // auth_args() returned the password fallback) or russh is
+    // doing something with $USER that overrides our resolved
+    // user. Print the relevant env + final argv on the first
+    // invocation only — the first run is the only one that
+    // matters for diagnosis and dumping this for every test
+    // would add ~200 lines to the panic output.
+    static DEBUG_ONCE: std::sync::Once = std::sync::Once::new();
+    DEBUG_ONCE.call_once(|| {
+        eprintln!(
+            "[tests/15 debug] PHR_TEST_KEY={:?} USER={:?} auth_args={:?} \
+             caller_has_auth={} full_args={:?}",
+            std::env::var("PHR_TEST_KEY").ok(),
+            std::env::var("USER").ok(),
+            auth_args(),
+            caller_has_auth,
+            full_args,
+        );
+    });
     let output = Command::new(BIN)
         .args(&full_args)
         .output()

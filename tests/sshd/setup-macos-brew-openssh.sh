@@ -304,6 +304,13 @@ os.execv(argv[0], argv)
         -D
 )
 echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
+# sshd created the log file via sudo — root-owned, mode 600. The
+# `Upload sshd log (unix)` step in ci.yml runs as the unprivileged
+# runner user and would hit EACCES trying to read it. chmod 644 so
+# the artifact upload succeeds (the log contains only hostnames,
+# usernames, and the libssh protocol transcript — fine for a
+# throwaway test environment).
+sudo chmod 644 "${SSHD_LOG}" || true
 echo "Launched detached sshd (pid=${SSHD_PID}, ${SSHD_BIN}) via python3 os.setsid"
 
 # ---- 10. wait for sshd to accept connections ----------------------------

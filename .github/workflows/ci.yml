@@ -167,6 +167,18 @@ jobs:
         # gated on `failure()` — so a green run's logs are still
         # available if a flake shows up on a later run).
         #
+        # PHR_TEST_KEY is set by tests/sshd/setup-macos-brew-openssh.sh
+        # on macOS via `echo "PHR_TEST_KEY=…">> "$GITHUB_ENV"`. GitHub
+        # Actions auto-propagates vars appended to $GITHUB_ENV to
+        # subsequent steps' env — but on caf58d8 the DEBUG3 sshd log
+        # showed tests/15 never seeing a non-empty PHR_TEST_KEY
+        # (every test landed at sshd with `method password` instead
+        # of `method publickey`). Forwarding the var explicitly here
+        # is belt-and-braces in case the auto-propagation is being
+        # eaten by something between the provision step and this one
+        # (e.g. the upload-artifact action's Node.js subprocess
+        # inheriting the runner env and clobbering something).
+        #
         # shell: bash — the script below uses `2>&1 | tee`, `${PIPESTATUS[0]}`
         # etc. which are bash-only. Without this override, the windows-2022
         # runner defaults to PowerShell, which doesn't recognise `2>&1`
@@ -176,7 +188,14 @@ jobs:
         shell: bash
         env:
           RUST_LOG: passhrs=debug
+          PHR_TEST_KEY: ${{ env.PHR_TEST_KEY }}
         run: |
+          # Belt-and-braces: dump the effective env so a flake
+          # shows whether PHR_TEST_KEY actually reached the cargo
+          # test process. (If it didn't, the per-test debug print
+          # in tests/15 would show auth_args()=the password
+          # fallback, which is exactly what we saw on caf58d8.)
+          echo "[run-tests] PHR_TEST_KEY=${PHR_TEST_KEY:-<unset>}"
           cargo test --release -- --include-ignored --test-threads=1 \
               2>&1 | tee integration-test.log
           # Keep cargo's exit code so the step still fails when tests
@@ -201,13 +220,24 @@ jobs:
         # surfaces the DEBUG3 lines around pubkey auth attempts that
         # would otherwise only be available via the dump-on-failure
         # step's inline `cat` (which is clipped to the live log view).
+        #
+        # Why only `/tmp/passhrs-test-sshd/sshd.log`: the setup scripts
+        # (setup-linux.sh, setup-macos-brew-openssh.sh) always write
+        # to ${TMPDIR:-/tmp}/passhrs-test-sshd/, and on the
+        # GitHub-hosted Linux and macOS runners TMPDIR is unset
+        # during a CI step (it's only set for the user's shell, not
+        # the action step), so ${TMPDIR:-/tmp} resolves to /tmp.
+        # Including the raw `${TMPDIR:-/tmp}` literal in the path
+        # list (as we did on caf58d8) makes upload-artifact treat it
+        # as a literal path that doesn't exist, and on macOS it also
+        # appears as a second path so the action's "multiple search
+        # paths" calc descends to / and trips an EACCES on the
+        # root-owned sshd.log file.
         if: always() && matrix.os != 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
           name: sshd-log-${{ matrix.os }}
-          path: |
-            ${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log
-            /tmp/passhrs-test-sshd/sshd.log
+          path: /tmp/passhrs-test-sshd/sshd.log
           if-no-files-found: warn
 
       - name: Dump sshd log on failure (unix)
