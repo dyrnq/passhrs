@@ -10,6 +10,12 @@ use std::time::Duration;
 
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
+// Same platform split as tests/15_native_sshd_integration.rs: Linux +
+// macOS runners ship `runner`, windows-2022 (since runner 2.305.0)
+// ships `runneradmin`.
+#[cfg(target_os = "windows")]
+const USER: &str = "runneradmin";
+#[cfg(not(target_os = "windows"))]
 const USER: &str = "runner";
 const PASS: &str = "PassTest1234#";
 

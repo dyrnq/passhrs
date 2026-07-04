@@ -22,6 +22,18 @@ use std::time::Duration;
 
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
+// GitHub-hosted runners all create a per-image service account that
+// has the right SACL/SSH grants baked in, so we authenticate as that
+// account instead of provisioning a fresh user (cross-platform
+// provisioning was the original approach and ran into PAM/SACL issues
+// on macOS + OpenSSH-on-Windows ACL issues on windows-2022). Ubuntu
+// and macOS runners ship a `runner` user; windows-2022 (since runner
+// 2.305.0) ships `runneradmin`. Tests are built natively for the
+// platform they'll run on, so cfg-gating the constant picks up the
+// right value per target.
+#[cfg(target_os = "windows")]
+const USER: &str = "runneradmin";
+#[cfg(not(target_os = "windows"))]
 const USER: &str = "runner";
 const PASS: &str = "PassTest1234#";
 const BIN: &str = "./target/release/passhrs";

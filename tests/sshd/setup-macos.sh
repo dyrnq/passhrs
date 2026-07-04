@@ -87,11 +87,30 @@ USER="runner"
 HOME_DIR="/Users/${USER}"
 
 # Reset runner's password to the test value so re-runs are
-# deterministic. sysadminctl -resetPasswordFor works non-interactively
-# when sudo is passwordless (the default on GitHub runners).
-sudo sysadminctl -resetPasswordFor "${USER}" -newPassword "${PASS}" \
-    >/dev/null 2>&1 \
-    || sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
+# deterministic. sysadminctl -resetPasswordFor has been observed to
+# silently no-op (the macOS authorization layer rejects password
+# resets outside the GUI/System Preferences context). Use
+# `dscl . -passwd` with the `-old ""` reset form instead — when the
+# old password is empty, dscl performs a privileged reset rather than
+# requiring the previous password.
+echo "Setting password for ${USER} via dscl . -passwd ..."
+if ! sudo dscl . -passwd "/Users/${USER}" "" "${PASS}" 2>&1; then
+    # Fall back to sysadminctl if dscl rejects the empty-old reset.
+    sudo sysadminctl -resetPasswordFor "${USER}" -newPassword "${PASS}" \
+        2>&1 || true
+fi
+
+# Verify the password is actually accepted by PAM. We do this with a
+# non-sshd probe — `dscl . -authonly` is the standard OpenDirectory
+# authentication check and doesn't require a real SSH session. If the
+# check fails, the rest of the setup is pointless.
+echo "Verifying password via dscl . -authonly ..."
+if ! sudo dscl . -authonly -user "${USER}" -password "${PASS}" 2>&1; then
+    echo "FATAL: dscl . -authonly rejected the password we just set" >&2
+    echo "Aborting before launching sshd; tests would all fail with" >&2
+    echo "'PAM: password authentication failed' otherwise." >&2
+    exit 1
+fi
 
 # Ensure /Users/runner/.ssh exists with sane perms. The runner
 # user already owns /Users/runner (UID matches), so chown is a no-op.

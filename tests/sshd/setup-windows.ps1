@@ -9,7 +9,14 @@
 # so no Local Security Policy tweak is required.
 [CmdletBinding()]
 param(
-    [string]$User = 'runner',
+    # GitHub-hosted windows-2022 runners (since runner 2.305.0) create a
+    # local account named `runneradmin` — there is NO `runner` user.
+    # Earlier runner images created `runner` and the setup was correct,
+    # but the current image rejects `Get-LocalUser -Name 'runner'` with
+    # a "not present" error. We default to `runneradmin` and accept
+    # either name on the command line so the same script works against
+    # both image variants.
+    [string]$User = 'runneradmin',
     # PassTest1234# satisfies Windows password complexity (upper + lower
     # + digit + special, 13 chars). Same value used by every platform
     # setup script and the e2e tests so the test sshd authenticates
@@ -211,16 +218,23 @@ icacls $HostKey | Out-Host
 Write-Host "sshd -V: $sshdAfterUpgrade"
 
 # 6. Set the runner user's password to the known test value. The
-#    `runner` user is created by the GitHub-hosted Windows image with
-#    admin privileges; we don't New-LocalUser it. Resetting the
-#    password via `net user` is the supported way and survives across
-#    re-runs. The default $Pass value ('PassTest1234#') already
+#    `runneradmin` account is created by the GitHub-hosted Windows
+#    image with admin privileges; we don't New-LocalUser it. Resetting
+#    the password via `net user` is the supported way and survives
+#    across re-runs. The default $Pass value ('PassTest1234#') already
 #    satisfies Windows password complexity (upper + lower + digit +
 #    special, 13 chars), so no policy tweak is required.
+#
+#    `net user` is invoked with `-Pass` quoted as a single token so the
+#    `#` in the password is not interpreted as a PowerShell comment
+#    delimiter on the call site. (`& net user $User $Pass` works when
+#    `$Pass` is already a string variable, but the explicit quoting
+#    documents intent and shields against future callers passing the
+#    password inline.)
 if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
-    throw "FATAL: ${User} user not present (expected on GitHub Windows runner)"
+    throw "FATAL: ${User} user not present (expected on GitHub Windows runner; current image uses 'runneradmin', older images used 'runner')"
 }
-& net user $User $Pass | Out-Null
+& net user $User "$Pass" | Out-Null
 
 # 7. Allow testuser to authenticate via sshd: add to the SSH users group
 #    that Windows OpenSSH honours by default (Administrators + the
