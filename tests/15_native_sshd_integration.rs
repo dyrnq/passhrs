@@ -8,8 +8,10 @@
 //!
 //! Replaces the previous Docker-based suite. The platform-specific
 //! setup scripts under `tests/sshd/` start a real `sshd` on
-//! `127.0.0.1:22222` with a known `testuser:PassTest1234#` account,
-//! and the tests exercise passhrs end-to-end against it.
+//! `127.0.0.1:22222` with a known user account (USER + PASS below
+//! are cfg-gated per platform — Linux=`runner`, macOS=`testuser`,
+//! Windows=`runneradmin`, all with password `PassTest1234#`).
+//! The tests exercise passhrs end-to-end against it.
 //!
 //! Because sshd is now native, the "remote" filesystem is the same as
 //! the test process's local filesystem — tests can read/clean up
@@ -22,18 +24,23 @@ use std::time::Duration;
 
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
-// GitHub-hosted runners all create a per-image service account that
-// has the right SACL/SSH grants baked in, so we authenticate as that
-// account instead of provisioning a fresh user (cross-platform
-// provisioning was the original approach and ran into PAM/SACL issues
-// on macOS + OpenSSH-on-Windows ACL issues on windows-2022). Ubuntu
-// and macOS runners ship a `runner` user; windows-2022 (since runner
-// 2.305.0) ships `runneradmin`. Tests are built natively for the
-// platform they'll run on, so cfg-gating the constant picks up the
-// right value per target.
+// Linux runner image ships a `runner` user whose password we reset
+// to PASS via chpasswd. windows-2022 (since runner 2.305.0) ships
+// `runneradmin`, and we reset its password via Set-LocalUser.
+//
+// macOS is special: the image's `runner` user has a randomly-
+// generated password we can't reset (Sonoma+ secure-token lockout
+// blocks both dscl . -passwd and sysadminctl -resetPasswordFor
+// unless you supply the user's OLD password). Instead of trying
+// to crack /etc/kcpassword and drive passwd via a pty, the macOS
+// setup script creates a fresh `testuser` via sysadminctl -addUser
+// — the official API for bootstrapping a user on Sonoma+ — which
+// handles secure-token init and SACL ssh grants in one step.
 #[cfg(target_os = "windows")]
 const USER: &str = "runneradmin";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+const USER: &str = "testuser";
+#[cfg(target_os = "linux")]
 const USER: &str = "runner";
 const PASS: &str = "PassTest1234#";
 const BIN: &str = "./target/release/passhrs";

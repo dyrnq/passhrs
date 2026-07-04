@@ -6,16 +6,11 @@
 # (the default on GitHub-hosted runners).
 set -euo pipefail
 
-USER="runner"
+USER="testuser"
 # PassTest1234# meets Windows password complexity (upper + lower + digit
 # + special, 13 chars). Same value used by every platform setup script
 # and the e2e tests so the test sshd authenticates passhrs consistently.
 PASS="PassTest1234#"
-# NOTE: USER used to be 'testuser' (a custom dscl user we created).
-# That broke on the runner image because pam_sacl.so + pam_opendirectory
-# require SACL authorizationdb grants we couldn't easily write via the
-# sandboxed setup script. Switched to the runner user that the image
-# ships with — its OpenDirectory record is pre-authorized for SSH.
 PORT="22222"
 HOST="127.0.0.1"
 SSHD_BIN="/usr/sbin/sshd"
@@ -66,254 +61,60 @@ if [ ! -f "${HOST_KEY}" ]; then
     ssh-keygen -t ed25519 -f "${HOST_KEY}" -N "" -q
 fi
 
-# 3. Use the `runner` user that already exists on the GitHub-hosted
-#    macOS image. It has a working home directory, is in the right
-#    groups (staff, admin), has SACL ssh grants by default, and
-#    passes every pam_opendirectory / pam_sacl / pam_nologin check
-#    that a fresh dscl user fails.
+# 3. Create a fresh local user for the test sshd via `sysadminctl
+#    -addUser`. Why this is the right API on macOS Sonoma+:
 #
-#    The earlier dscl-based testuser approach hit a wall: macOS's
-#    `/etc/pam.d/sshd` runs `account required pam_sacl.so
-#    sacl_service=ssh` followed by `account required
-#    pam_opendirectory.so`. pam_sacl denied the dscl user via
-#    `com.apple.access_ssh`, returning PAM_PERM_DENIED before
-#    pam_opendirectory even ran. The runner user already has
-#    authorizationdb grants baked in by the image, so it sidesteps
-#    the SACL problem entirely.
+#    * `dscl . -create` + `dscl . -passwd` (the historical
+#      approach) requires "secure token" authorization to set the
+#      password — even when run as root via sudo. Without a secure
+#      token, dscl silently no-ops the password write and reports
+#      "Operation is not permitted without secure token unlock /
+#      DS Error: -14090 (eDSAuthFailed)". The only way to unlock a
+#      secure token for a brand-new user is to provide the
+#      blesser's old password (which on a CI runner we don't know)
+#      or perform an interactive token-bootstrap the sandboxed
+#      setup script can't drive.
 #
-#    We just set its password to our known test password and
-#    ensure ~/.ssh exists for completeness.
-USER="runner"
+#    * `sysadminctl -resetPasswordFor <user>` has the same
+#      secure-token requirement — it only works on users who
+#      already have one.
+#
+#    * `sysadminctl -addUser` is the supported path for Sonoma+:
+#      it creates the OpenDirectory record, sets the initial
+#      password, assigns secure token via the blesser (the caller
+#      runs as root, so the blesser is implicit), and adds the
+#      user to standard groups — including `admin`, which gives
+#      the user the right `com.apple.access_ssh` SACL grant
+#      that pam_sacl.so requires at the `account` PAM stage.
+#      Everything in one non-interactive command.
+#
+#    We then verify with `dscl . -authonly` — that helper does NOT
+#    require secure token (it just asks OpenDirectory whether the
+#    password hash matches), so it's a cheap independent check that
+#    the password actually took.
+USER="testuser"
 HOME_DIR="/Users/${USER}"
-
-# Reset runner's password to the test value so re-runs are
-# deterministic.
-#
-# Why this is harder than it looks: macOS Sonoma+ requires a
-# "secure token" to reset another user's password via either
-# `dscl . -passwd` or `sysadminctl -resetPasswordFor`, even when
-# the caller is root via sudo. The token unlock requires either
-# the user's old password (which IS the autologin password baked
-# into the image) or an interactive secure-token bootstrap that
-# the sandboxed setup script can't perform. Both APIs report
-#     "Operation is not permitted without secure token unlock"
-#     "DS Error: -14090 (eDSAuthFailed)"
-# and the password write silently no-ops.
-#
-# Fortunately, macOS stores the autologin password in plain
-# (XOR-encoded) form at /etc/kcpassword, and the encoding is
-# documented: the bytes are XORed against a fixed 11-byte key
-# (0x7D 0x89 0x52 0x23 0xD2 0xBC 0xDD 0xEA 0xA3 0xB9 0x1F) and
-# padded out to a multiple of the key length with NULs. We
-# decode that file to recover the runner user's current
-# password, then drive `sudo passwd runner` via a Python pty —
-# passwd on Sonoma prompts for the old password first, then the
-# new password twice. With the old password we have, all three
-# prompts get answered correctly.
-#
-# Verification: after passwd exits, we run `dscl . -authonly`
-# which doesn't need secure token (it just asks OpenDirectory
-# whether the password matches the stored hash). If authonly
-# rejects, the password set didn't take and sshd would just
-# fail every PAM auth at test time — abort before launching sshd.
-echo "Setting password for ${USER} via sudo passwd driven by python3 pty..."
-SUCC="false"
-if python3 - "$USER" "$PASS" <<'PYEOF' 2>&1
-import pty, os, sys, time, select, errno
-
-user, new_pw = sys.argv[1], sys.argv[2]
-
-# Decode /etc/kcpassword to recover the user's current password.
-# /etc/kcpassword is the macOS autologin password store: the
-# bytes are XORed against a fixed 11-byte key and padded out to
-# a multiple of the key length with NULs. The algorithm is
-# symmetric — decoding is the same XOR pass. This is the same
-# algorithm the runner-images repo's bootstrap-provisioner uses
-# to ENCODE the password; we invert it to recover the plaintext
-# at test-setup time.
-_KC_KEY = bytes([0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD,
-                 0xEA, 0xA3, 0xB9, 0x1F])
-def decode_kcpassword(path):
-    """Recover the runner user's autologin password from /etc/kcpassword.
-
-    The encoding (used by GitHub runner-images bootstrap-provisioner)
-    XORs the password bytes against the 11-byte KEY above, then pads
-    out to a multiple of the KEY length with NUL bytes — except for
-    the special case of an 11-char password, which gets exactly one
-    NUL pad (so an 11-char password occupies 12 bytes on disk).
-
-    Decoding is the inverse XOR; the password region becomes the
-    original ASCII, the NUL-pad region becomes a run of 0x00 bytes
-    (0 XOR K XOR K = 0). We pick the SMALLEST candidate P (1..M) such
-    that (a) the trailing bytes [P..M] are all 0x00 AND (b) the
-    leading bytes [0..P] are printable ASCII. The "smallest P" rule
-    breaks the ambiguity at M = 22 (which can be either a 22-char
-    password with no padding, OR a 12-char password with 10 NUL pads)
-    — a 22-char autologin password is implausible, so the smallest
-    printable candidate is the correct one. Without this rule the
-    old decoder returned the entire 22-byte buffer (e.g. 32 chars)
-    and passwd then rejected it, leaving the pty hung forever in
-    the "Old password:" retry loop.
-    """
-    with open(path, 'rb') as f:
-        data = f.read()
-    M = len(data)
-    decoded = bytearray(M)
-    for i, b in enumerate(data):
-        decoded[i] = b ^ _KC_KEY[i % len(_KC_KEY)]
-    candidates = []
-    for P in range(1, M + 1):
-        # Pad region must be all NUL after XOR.
-        if all(b == 0 for b in decoded[P:]):
-            pw = decoded[:P]
-            # Password region must be printable ASCII (32..126).
-            if all(32 <= b < 127 for b in pw):
-                candidates.append(P)
-    if not candidates:
-        # No valid match — best effort, return the whole buffer.
-        return decoded.decode('utf-8', errors='replace')
-    return decoded[:min(candidates)].decode('utf-8')
-
-old_pw = decode_kcpassword('/etc/kcpassword')
-sys.stderr.write("Decoded autologin password from /etc/kcpassword (len={})\n".format(len(old_pw)))
-# Diagnostic: print the raw file size + hex of the encoded bytes
-# AND the hex of the post-XOR buffer so we can see WHY the decoder
-# landed on the length it did. The kcpassword file on GitHub's
-# macos-14 image has been observed with M=32 in the past, which is
-# not a valid output of the bootstrap-provisioner encoder (valid
-# M's are 11, 12, 22, 23, 33, ...). If we see M=32, it means macOS
-# is using a different (or no) padding scheme and the decoder is
-# returning the whole buffer as a fallback.
-with open('/etc/kcpassword', 'rb') as _f:
-    _raw = _f.read()
-sys.stderr.write("kcpassword file size: M={} bytes\n".format(len(_raw)))
-sys.stderr.write("encoded hex: {}\n".format(_raw.hex()))
-_dec = bytearray(len(_raw))
-for _i, _b in enumerate(_raw):
-    _dec[_i] = _b ^ _KC_KEY[_i % len(_KC_KEY)]
-sys.stderr.write("post-XOR hex: {}\n".format(bytes(_dec).hex()))
-sys.stderr.write("post-XOR printable mask: {}\n".format(
-    ''.join('.' if 32 <= _b < 127 else '?' for _b in _dec)))
-
-pid, fd = pty.fork()
-if pid == 0:
-    # Child: exec sudo passwd <user>. The new argv[0] is "passwd"
-    # so `ps` doesn't show the password in the visible arg list.
-    os.execv("/usr/bin/sudo", ["sudo", "/usr/bin/passwd", user])
-# Parent: drive the prompts.
-def read_until(tokens, timeout=15.0):
-    """Read until one of the byte-string tokens appears in the
-    accumulated buffer. tokens is either a single bytes value or
-    a list of them — any one matching is enough to return.
-    The tokenless form (a single newline) is also supported: the
-    function returns as soon as a b'\n' arrives in the buffer.
-    """
-    if isinstance(tokens, (bytes, bytearray)):
-        tokens = [bytes(tokens)]
-    else:
-        tokens = [bytes(t) for t in tokens]
-    buf = b""
-    end = time.time() + timeout
-    while time.time() < end:
-        r, _, _ = select.select([fd], [], [], 0.2)
-        if r:
-            try:
-                chunk = os.read(fd, 4096)
-            except OSError as e:
-                if e.errno == errno.EIO:
-                    break
-                raise
-            if not chunk:
-                break
-            buf += chunk
-            for t in tokens:
-                if t in buf:
-                    return buf, True
-    return buf, False
-
-def send(text):
-    os.write(fd, text.encode('utf-8') + b'\n')
-
-# 1. Banner "Changing password for <user>." appears first. We
-#    then look for the FIRST actual passwd prompt. On Sonoma+ as
-#    root that's "Old password:"; on pre-Sonoma passwd jumps
-#    straight to "New password:". The previous version of this
-#    script only matched on "New password" and timed out on
-#    Sonoma — wait for EITHER.
-buf, ok = read_until([b"Old password", b"New password"], timeout=15.0)
-if not ok:
-    sys.stderr.write("FAIL: never saw 'Old password' or 'New password' within 15s\n")
-    sys.stderr.write("---- passwd transcript so far ----\n")
-    sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
-    sys.stderr.write('---- end transcript ----\n')
-    sys.exit(1)
-# 2. If we matched on "Old password", feed the autologin pw we
-#    decoded from /etc/kcpassword. If we matched on "New password"
-#    (pre-Sonoma or non-root path), skip straight to sending the
-#    new password below — passwd will accept it.
-if b"Old password" in buf:
-    send(old_pw)
-    # Now wait for the new-password prompt before sending the new pw.
-    buf, ok = read_until(b"New password", timeout=15.0)
-    if not ok:
-        sys.stderr.write("FAIL: after old pw, never saw 'New password' within 15s\n")
-        sys.stderr.write("---- passwd transcript so far ----\n")
-        sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
-        sys.stderr.write('---- end transcript ----\n')
-        sys.exit(1)
-# 3. Send the new password and wait for the retype prompt.
-send(new_pw)
-buf, ok = read_until(b"Retype", timeout=15.0)
-if not ok:
-    sys.stderr.write("FAIL: after new pw, never saw 'Retype' within 15s\n")
-    sys.stderr.write("---- passwd transcript so far ----\n")
-    sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
-    sys.stderr.write('---- end transcript ----\n')
-    sys.exit(1)
-# 4. Send the retype and capture the verdict line.
-send(new_pw)
-_, ok = read_until(b"\n", timeout=10.0)
-# Drain anything left after the verdict line.
-try:
-    while True:
-        r, _, _ = select.select([fd], [], [], 0.3)
-        if not r:
-            break
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            break
-except OSError:
-    pass
-# Wait for child to exit and reap it. We poll with WNOHANG and
-# SIGKILL the child if it hangs — without this, a wrong old
-# password (e.g. from a buggy kcpassword decoder) leaves passwd
-# stuck in the "Old password:" retry loop and the setup script
-# hangs forever, eventually timing out the whole CI step.
-deadline = time.time() + 10.0
-while time.time() < deadline:
-    try:
-        wpid, status = os.waitpid(pid, os.WNOHANG)
-    except ChildProcessError:
-        # Already reaped (shouldn't happen, but defensive).
-        sys.exit(0)
-    if wpid == pid:
-        sys.exit(0 if os.waitstatus_to_exitcode(status) == 0 else 1)
-    time.sleep(0.2)
-sys.stderr.write("FAIL: 'sudo passwd' did not exit within 10s — killing it\n")
-try:
-    os.kill(pid, 9)
-except ProcessLookupError:
-    pass
-sys.exit(1)
-PYEOF
-then
-    SUCC="true"
+# Tear down a previous run's leftover testuser so the create is
+# idempotent across re-runs of the same CI job.
+if sudo dscl . -read "/Users/${USER}" >/dev/null 2>&1; then
+    echo "Removing pre-existing ${USER} from a previous run..."
+    sudo sysadminctl -deleteUser "${USER}" 2>&1 || \
+        sudo dscl . -delete "/Users/${USER}" 2>&1 || true
+    # The home dir survives -deleteUser; remove it explicitly so
+    # the next -addUser doesn't inherit stale state.
+    sudo rm -rf "${HOME_DIR}" 2>/dev/null || true
 fi
-if [ "${SUCC}" != "true" ]; then
-    echo "FATAL: python3 pty-driven 'sudo passwd ${USER}' failed" >&2
-    echo "See output above for the interactive transcript." >&2
-    exit 1
-fi
+echo "Creating ${USER} via sysadminctl -addUser (pass=${PASS})..."
+# -admin puts the user in the admin group → SACL ssh grant →
+# pam_sacl.so lets the SSH session past the account stage.
+sudo sysadminctl -addUser "${USER}" \
+    -fullName "passhrs test user" \
+    -password "${PASS}" \
+    -admin \
+    -home "${HOME_DIR}" 2>&1 || {
+        echo "FATAL: sysadminctl -addUser ${USER} failed" >&2
+        exit 1
+    }
 
 # Verify the password is actually accepted by PAM. We do this with a
 # non-sshd probe — `dscl . -authonly` is the standard OpenDirectory
@@ -327,12 +128,11 @@ if ! sudo dscl . -authonly -user "${USER}" -password "${PASS}" 2>&1; then
     exit 1
 fi
 
-# Ensure /Users/runner/.ssh exists with sane perms. The runner
-# user already owns /Users/runner (UID matches), so chown is a no-op.
-if [ ! -d "${HOME_DIR}/.ssh" ]; then
-    sudo mkdir -p "${HOME_DIR}/.ssh"
-    sudo chmod 700 "${HOME_DIR}/.ssh"
-fi
+# Ensure /Users/${USER}/.ssh exists with sane perms. sysadminctl
+# creates the home dir; we just need .ssh.
+sudo mkdir -p "${HOME_DIR}/.ssh"
+sudo chmod 700 "${HOME_DIR}/.ssh"
+sudo chown "${USER}:staff" "${HOME_DIR}/.ssh"
 
 # Strip any forced-expiry / pw-policy that would deny SSH login on
 # the next run. Run after the password reset because pwpolicy -clear
@@ -342,7 +142,7 @@ NOW_EPOCH="$(date +%s)"
 sudo dscl . -create "/Users/${USER}" passwordLastSet "${NOW_EPOCH}" 2>/dev/null || true
 sudo dscl . -delete "/Users/${USER}" accountExpires 2>/dev/null || true
 
-# Diagnostic dump of the runner user's state. The same fields that
+# Diagnostic dump of the test user's state. The same fields that
 # made dscl-created users fail pam_opendirectory are printed so future
 # regressions can be diagnosed from the CI log without a shell.
 echo "--- ${USER} OpenDirectory state ---"
