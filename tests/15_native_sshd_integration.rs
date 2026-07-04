@@ -1044,7 +1044,18 @@ fn test_proxy_jump_self() {
 fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, String) {
     let mut cmd = Command::new(BIN);
     cmd.args(args);
+    // `Command::env` only ADDS the variable to the explicit list — it
+    // does NOT replace entries that are already in the inherited parent
+    // env. On GitHub-hosted runners, for example, the runner always
+    // exports `LANG=C.UTF-8` to its own process; a child that calls
+    // `cmd.env("LANG", "en_US.UTF-8")` inherits BOTH and the parent
+    // value wins in the child (because the explicit envs are appended
+    // after the inherited ones — and on Linux the LAST occurrence
+    // wins only for `envs(IntoIterator)`, not for `env(K, V)`).
+    // To guarantee the test value is what passhrs sees and forwards,
+    // we first strip the variable from the inherited environment.
     for (k, v) in envs {
+        cmd.env_remove(k);
         cmd.env(k, v);
     }
     let output = cmd.output().expect("run passhrs");

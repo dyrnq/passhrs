@@ -56,9 +56,21 @@ if [ -z "${SFTP_SERVER}" ]; then
 fi
 
 # 3. Materialise the sshd config with the correct sftp-server path.
+#    Bump LogLevel to DEBUG3 so SFTP subsystem session attempts show
+#    up in the log on failure (the SFTP init timeout in passhrs takes
+#    ~10s to fire, and without DEBUG3 there's nothing in sshd.log to
+#    explain the timeout). Like macOS, OpenSSH only honours the FIRST
+#    LogLevel in the config file, so we have to strip the template's
+#    `LogLevel ERROR` first.
 sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
     "${SSHD_CFG_TEMPLATE}" \
     > "${SSHD_CFG}"
+sed -i '/^LogLevel /d' "${SSHD_CFG}"
+cat >> "${SSHD_CFG}" <<'EOF'
+
+# --- passhrs CI overrides ---
+LogLevel DEBUG3
+EOF
 
 # 4. Generate a host key on first run; reuse it on subsequent runs so
 #    tests that persist /tmp keep their known_hosts entry stable.

@@ -87,17 +87,98 @@ USER="runner"
 HOME_DIR="/Users/${USER}"
 
 # Reset runner's password to the test value so re-runs are
-# deterministic. sysadminctl -resetPasswordFor has been observed to
-# silently no-op (the macOS authorization layer rejects password
-# resets outside the GUI/System Preferences context). Use
-# `dscl . -passwd` with the `-old ""` reset form instead — when the
-# old password is empty, dscl performs a privileged reset rather than
-# requiring the previous password.
-echo "Setting password for ${USER} via dscl . -passwd ..."
-if ! sudo dscl . -passwd "/Users/${USER}" "" "${PASS}" 2>&1; then
-    # Fall back to sysadminctl if dscl rejects the empty-old reset.
-    sudo sysadminctl -resetPasswordFor "${USER}" -newPassword "${PASS}" \
-        2>&1 || true
+# deterministic.
+#
+# Why this is harder than it looks: macOS Sonoma+ requires a
+# "secure token" to reset another user's password via either
+# `dscl . -passwd` or `sysadminctl -resetPasswordFor`, even when
+# the caller is root via sudo. The token unlock requires either
+# the user's old password (we don't have it — fresh CI runner)
+# or an interactive secure-token bootstrap that the sandboxed
+# setup script can't perform. Both APIs report
+#     "Operation is not permitted without secure token unlock"
+#     "DS Error: -14090 (eDSAuthFailed)"
+# and the password write silently no-ops.
+#
+# The way around it is `passwd(8)`: when invoked by root for a
+# different user, `passwd` does NOT require secure token — it
+# prompts for the new password twice via /dev/tty and updates
+# the local OpenDirectory record directly. We drive that
+# interactive prompt with Python's `pty.fork()` (the only
+# pty-allocation helper on a stock macOS runner — neither
+# setsid(1) nor expect(1) are installed by default).
+#
+# After the write we verify with `dscl . -authonly`, which
+# doesn't need secure token (it just asks OpenDirectory whether
+# the password matches the stored hash). If authonly rejects,
+# the password set didn't take and sshd would just fail every
+# PAM auth at test time — abort before launching sshd.
+echo "Setting password for ${USER} via sudo passwd driven by python3 pty..."
+SUCC="false"
+if python3 - "$USER" "$PASS" <<'PYEOF' 2>&1; then
+import pty, os, sys, time, select, errno
+
+user, pw = sys.argv[1], sys.argv[2]
+pid, fd = pty.fork()
+if pid == 0:
+    # Child: exec sudo passwd <user>. The new argv[0] is "passwd"
+    # so `ps` doesn't show the password in the visible arg list.
+    os.execv("/usr/bin/sudo", ["sudo", "/usr/bin/passwd", user])
+# Parent: drive the prompts.
+def read_until(token, timeout=2.0):
+    buf = b""
+    end = time.time() + timeout
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError as e:
+                if e.errno == errno.EIO:
+                    break
+                raise
+            if not chunk:
+                break
+            buf += chunk
+            if token in buf:
+                return buf, True
+    return buf, False
+
+# "Changing password for <user>.\r\nNew password:" — wait for the
+# first prompt before sending, otherwise passwd may consume the
+# bytes as soon as the fd is writable and miss the question.
+_, ok = read_until(b"New password:", timeout=5.0)
+if not ok:
+    sys.exit("timeout waiting for 'New password:' prompt")
+os.write(fd, pw.encode("utf-8") + b"\n")
+_, ok = read_until(b"Retype new password:", timeout=2.0)
+if not ok:
+    sys.exit("timeout waiting for 'Retype new password:' prompt")
+os.write(fd, pw.encode("utf-8") + b"\n")
+# Capture the final lines (success / failure verdict).
+_, ok = read_until(b"\n", timeout=5.0)
+# Drain anything left after the verdict line.
+try:
+    while True:
+        r, _, _ = select.select([fd], [], [], 0.3)
+        if not r:
+            break
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+except OSError:
+    pass
+# Wait for child to exit and reap it.
+wpid, status = os.waitpid(pid, 0)
+sys.exit(0 if os.waitstatus_to_exitcode(status) == 0 else 1)
+PYEOF
+then
+    SUCC="true"
+fi
+if [ "${SUCC}" != "true" ]; then
+    echo "FATAL: python3 pty-driven 'sudo passwd ${USER}' failed" >&2
+    echo "See output above for the interactive transcript." >&2
+    exit 1
 fi
 
 # Verify the password is actually accepted by PAM. We do this with a
