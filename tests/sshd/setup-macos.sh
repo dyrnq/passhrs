@@ -90,11 +90,60 @@ if ! dscl . -read "/Users/${USER}" UniqueID >/dev/null 2>&1; then
     sudo dscl . -create "/Users/${USER}" NFSHomeDirectory "/Users/${USER}"
     sudo dscl . -create "/Users/${USER}" AuthenticationAuthority ";basic;"
     sudo dscl . -create "/Users/${USER}" Password "${PASS}"
-    sudo createhomedir -u "${USER}" >/dev/null
 fi
 
 # Always reset password to the test value so re-runs are deterministic.
 sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
+
+# Home directory: createhomedir -u is documented but silently no-ops
+# on some runner images (we observed /Users/testuser missing after a
+# successful `createhomedir -u testuser` exit). Create it manually
+# with the canonical 0755 owner=user:group that pam_opendirectory's
+# account check expects.
+HOME_DIR="/Users/${USER}"
+if [ ! -d "${HOME_DIR}" ]; then
+    sudo mkdir -p "${HOME_DIR}"
+    sudo chown "${UNIQUE_ID:-55555}:20" "${HOME_DIR}"
+    sudo chmod 755 "${HOME_DIR}"
+fi
+# Ensure the user's ~/.ssh dir exists for authorized_keys if we ever
+# want to fall back to pubkey auth.
+sudo mkdir -p "${HOME_DIR}/.ssh"
+sudo chown "${UNIQUE_ID:-55555}:20" "${HOME_DIR}/.ssh"
+sudo chmod 700 "${HOME_DIR}/.ssh"
+
+# SACL: macOS /etc/pam.d/sshd has `account required pam_sacl.so
+# sacl_service=ssh`. This module checks macOS's authorizationdb
+# rule for SSH access; the default on a fresh install is "allow
+# group:everyone", but the GitHub-hosted runner image ships with
+# `com.apple.access_ssh` restricted to administrators or specific
+# groups. A dscl-created user is not in those groups and gets
+# PAM_PERM_DENIED from the SACL module before pam_opendirectory
+# even runs.
+#
+# Fix: read the current `com.apple.access_ssh` rule and add the
+# testuser's group (PrimaryGroupID 20 = `staff`) as an allowed
+# member. We rewrite the rule via PlistBuddy so we don't disturb
+# other rule fields.
+SACL_RULE="/System/Library/SystemConfiguration/PMSettings.plist"
+# More robust: authorizationdb rule lives in
+# /etc/security/authorization or in the system keychain; easier path
+# is `security authorizationdb read com.apple.access_ssh`. If the
+# rule restricts to a group the testuser isn't in, append our group.
+SACL_PLIST="$(sudo security authorizationdb read com.apple.access_ssh 2>/dev/null || true)"
+if [ -n "${SACL_PLIST}" ]; then
+    if echo "${SACL_PLIST}" | grep -q "group"; then
+        # Append `group` 20 (staff) to the allowed-groups list if not
+        # already present. The XML plist uses <string>group</string>
+        # <integer>20</integer> pairs.
+        if ! echo "${SACL_PLIST}" | grep -q "<integer>20</integer>"; then
+            NEW_SACL="$(echo "${SACL_PLIST}" \
+                | sed 's|</array>|</array><string>group</string><integer>20</integer>|')"
+            echo "${NEW_SACL}" | sudo security authorizationdb write com.apple.access_ssh \
+                >/dev/null 2>&1 || true
+        fi
+    fi
+fi
 
 # Refresh passwordLastSet so PAM treats the password as freshly set
 # (avoids 'password expired' / 'must change on next login' rejections).
