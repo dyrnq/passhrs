@@ -62,23 +62,8 @@ fi
 # Always reset password to the test value so re-runs are deterministic.
 sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
 
-# 4. Tear down any previous instance. Under launchd we bootout the
-#    plist rather than killing by PID: a stale label might still
-#    own an orphaned sshd whose pidfile was cleared by a previous
-#    failed run, and we'd rather launchctl revoke it cleanly.
-#
-#    The `user/$(id -u)` domain is the correct non-GUI session
-#    domain — `gui/$(id -u)` requires a WindowServer / Aqua session
-#    that the GitHub Actions macOS runner does not have (bootstrap
-#    fails with exit 125 / "Domain does not support specified
-#    action"). `user/<uid>` is the equivalent for headless sessions
-#    and has been the supported path since macOS 10.10.
-PLIST="${HOME}/Library/LaunchAgents/com.passhrs.test-sshd.plist"
-mkdir -p "$(dirname "${PLIST}")"
-LAUNCHD_DOMAIN="user/$(id -u)"
-sudo launchctl bootout "${LAUNCHD_DOMAIN}" "${PLIST}" 2>/dev/null || true
-# Belt-and-suspenders: also kill any orphaned sshd bound to PORT
-# from an even earlier run that pre-dated the launchd path.
+# 4. Tear down any previous instance bound to PORT. We track
+#    sshd by PID across runs.
 if [ -f "${SSHD_PID_FILE}" ]; then
     OLD_PID="$(cat "${SSHD_PID_FILE}" || true)"
     if [ -n "${OLD_PID}" ] && sudo kill -0 "${OLD_PID}" 2>/dev/null; then
@@ -87,8 +72,8 @@ if [ -f "${SSHD_PID_FILE}" ]; then
     fi
     rm -f "${SSHD_PID_FILE}"
 fi
-# Catch any orphan sshd from a previous crashed run that left a
-# listener bound to PORT without a recognised plist owner.
+# Catch any orphan sshd from a previous crashed run that didn't
+# write a pidfile but left a listener bound to PORT.
 ORPHAN_PID=$(sudo lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
 if [ -n "${ORPHAN_PID}" ]; then
     echo "Killing orphan sshd pid=${ORPHAN_PID} from prior run"
@@ -96,79 +81,70 @@ if [ -n "${ORPHAN_PID}" ]; then
     sleep 1
 fi
 
-# 5. Launch sshd under launchd.
+# 5. Launch sshd detached into its own session.
 #
-#    Backgrounding sshd from bash (`sudo sshd ... &` + `nohup` /
-#    `disown -h` / stdio-redirect) is NOT enough on GitHub-hosted
-#    macos-14 runners: the runner's step cleanup kills all processes
-#    in the step's process group, even detached ones, ~100 s after
-#    the script exits — which matches exactly the "test_basic_command_exec
-#    fails with Connection reset by peer ~100 s after readiness"
-#    pattern we observed on 2026-07-04.
+#    The naive `sudo sshd ... &` keeps sshd in this bash script's
+#    process group. When the script exits, the GitHub Actions
+#    runner's step-cleanup delivers SIGKILL to every process in
+#    the step's process group (we observed sshd dying ~100 s
+#    after the readiness probe succeeded, but only after cargo
+#    build + ~50 s of tests had started), so every later SSH
+#    connection gets "Connection reset by peer".
 #
-#    The right macOS primitive is launchd, the system's process
-#    supervisor. A LaunchAgent loaded into the runner user's GUI
-#    domain is owned by launchd, not by the shell that submitted
-#    it; launchd keeps the process alive across shell exits and
-#    only tears it down on explicit `launchctl bootout`. We point
-#    `ProgramArguments` at `sudo /usr/sbin/sshd ... -D` so the
-#    resulting sshd process runs as root (the usual sshd privilege
-#    model) and can read host keys written to ${HOST_KEY}.
+#    macOS does not ship `setsid(1)` so we use Python (which the
+#    runner always has) to do it: a small bootstrap that forks,
+#    then in the child calls `os.setsid()` to create a brand-new
+#    session and process group detached from the runner's step
+#    process group, redirects stdio to /dev/null, and execs the
+#    target. The runner's step-cleanup SIGKILL, which targets the
+#    step's pgid specifically, does not reach processes in a
+#    different pgid.
 #
-#    `-D` keeps sshd in foreground *inside* launchd — launchd is
-#    happy to manage a foreground process; it just considers the
-#    job "running" until sshd exits. We track the launchd job by
-#    label, not by PID, so the teardown in step 4 (next run) is
-#    `launchctl bootout gui/$UID $PLIST` rather than `kill $PID`.
-#    PLIST and GUI_DOMAIN were already declared above in step 4.
-
-# Render the plist. ProgramArguments uses `sudo` to elevate so the
-# resulting sshd runs as root (otherwise sshd inherits the runner
-# uid and refuses to read keys outside that uid).
-cat > "${PLIST}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.passhrs.test-sshd</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/sudo</string>
-        <string>${SSHD_BIN}</string>
-        <string>-f</string><string>${SSHD_CFG}</string>
-        <string>-h</string><string>${HOST_KEY}</string>
-        <string>-E</string><string>${SSHD_LOG}</string>
-        <string>-p</string><string>${PORT}</string>
-        <string>-D</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><false/>
-    <key>StandardOutPath</key><string>${RUNTIME_DIR}/sshd.out.log</string>
-    <key>StandardErrorPath</key><string>${SSHD_LOG}</string>
-</dict>
-</plist>
-EOF
-
-# Submit the new job. launchd will launch sudo -> sshd immediately
-# because RunAtLoad=true.
-sudo launchctl bootstrap "${LAUNCHD_DOMAIN}" "${PLIST}"
+#    We intentionally KEEP `-D` so sshd stays in the foreground
+#    of its new session — that gives us a stable PID ($! in
+#    bash, captured by Python via fork's parent return) that we
+#    can read with `kill -0` and `lsof` for both liveness and
+#    teardown.
+SSHD_PID=$(
+    python3 -c '
+import os, sys
+pid = os.fork()
+if pid > 0:
+    print(pid); sys.exit(0)
+os.setsid()
+null_in = os.open("/dev/null", os.O_RDONLY)
+null_out = os.open("/dev/null", os.O_WRONLY)
+os.dup2(null_in, 0)
+os.dup2(null_out, 1)
+os.dup2(null_out, 2)
+argv = ["/usr/bin/sudo", "--", sys.argv[1]] + sys.argv[2:]
+os.execv(argv[0], argv)
+' \
+        "${SSHD_BIN}" \
+        -f "${SSHD_CFG}" \
+        -h "${HOST_KEY}" \
+        -E "${SSHD_LOG}" \
+        -p "${PORT}" \
+        -D
+)
+echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
+echo "Launched detached sshd (pid=${SSHD_PID}) via python3 os.setsid"
 
 # 6. Wait for the daemon to accept connections (max 10s).
-SSHD_PID=""
 for i in $(seq 1 50); do
+    if ! sudo kill -0 "${SSHD_PID}" 2>/dev/null; then
+        echo "FATAL: detached sshd (pid ${SSHD_PID}) exited before becoming ready" >&2
+        tail -n 50 "${SSHD_LOG}" >&2 || true
+        exit 1
+    fi
     if (echo >"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
-        # Find the actually-listening sshd PID (launchd's child, after
-        # sudo). lsof makes this robust against label-to-pid mapping
-        # changes between launchd versions.
-        SSHD_PID=$(sudo lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1)
-        echo "test sshd ready at ${HOST}:${PORT} (pid=${SSHD_PID}, launchd: com.passhrs.test-sshd)"
-        echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
+        echo "test sshd ready at ${HOST}:${PORT} (pid=${SSHD_PID}, detached via setsid)"
         exit 0
     fi
     sleep 0.2
 done
 
 echo "FATAL: sshd did not start within 10s" >&2
-sudo launchctl bootout "${LAUNCHD_DOMAIN}" "${PLIST}" 2>/dev/null || true
+sudo kill "${SSHD_PID}" 2>/dev/null || true
 tail -n 50 "${SSHD_LOG}" >&2 || true
 exit 1
