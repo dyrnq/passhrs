@@ -112,6 +112,18 @@ sudo pwpolicy -u "${USER}" -clear 2>/dev/null || true
 # timestamp past which the account is locked).
 sudo dscl . -delete "/Users/${USER}" accountExpires 2>/dev/null || true
 
+# Diagnostic dump of the testuser's OpenDirectory state. PAM's
+# account-management step on macOS uses pam_opendirectory.so and can
+# deny a dscl-created account for any of: missing AuthenticationAuthority,
+# non-empty accountPolicyData forcing pw change, passwordLastSet=0
+# (never set), etc. Print the relevant attributes so future failures
+# can be diagnosed from the CI log without an interactive shell.
+echo "--- testuser OpenDirectory state ---"
+sudo dscl . -read "/Users/${USER}" 2>&1 | head -60 || true
+echo "--- pwpolicy ---"
+sudo pwpolicy -u "${USER}" -getpolicy 2>&1 | head -20 || true
+echo "--------------------------------------"
+
 # 4. Tear down any previous instance bound to PORT. We track
 #    sshd by PID across runs.
 if [ -f "${SSHD_PID_FILE}" ]; then
