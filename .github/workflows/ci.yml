@@ -125,9 +125,19 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: sudo ./tests/sshd/setup-linux.sh
 
-      - name: Provision native sshd (macOS)
+      - name: Probe Docker-on-macOS via colima (macOS)
+        # Replaces the previous native-sshd provision on macos-14.
+        # macOS Sonoma+ secure-token lockout makes the native
+        # testuser password path fundamentally unreliable (dscl
+        # . -passwd, sysadminctl -resetPasswordFor, and passwd all
+        # fail unless you supply the user's old password). Instead
+        # of fighting it, this step installs colima + docker CLI
+        # and starts a Lima VM so the next iteration can run a
+        # Linux openssh-server container on 127.0.0.1:22222.
+        # Linux and Windows continue to use their native sshd
+        # provisions — this probe is macOS-only.
         if: matrix.os == 'macos-14'
-        run: sudo ./tests/sshd/setup-macos.sh
+        run: sudo ./tests/sshd/setup-macos-docker.sh
 
       - name: Provision native sshd (Windows)
         if: matrix.os == 'windows-2022'
