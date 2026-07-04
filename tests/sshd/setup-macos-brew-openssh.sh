@@ -59,9 +59,15 @@ SFTP_SERVER=""
 
 SSHD_CFG_DIR="$(cd "$(dirname "$0")" && pwd)"
 SSHD_CFG_TEMPLATE="${SSHD_CFG_DIR}/sshd_config"
-# Distinct runtime dir from setup-macos.sh's so the two can coexist
-# (e.g. when bisecting the macos-14 provision change in CI history).
-RUNTIME_DIR="${TMPDIR:-/tmp}/passhrs-test-sshd-brew"
+# Runtime dir is intentionally the same as setup-macos.sh and
+# setup-linux.sh (passhrs-test-sshd), NOT a -brew-suffixed variant.
+# ci.yml's "Dump sshd log on failure" step hard-codes a list of
+# candidate paths; if we used a -brew suffix here, the dump step
+# would emit nothing and a failed auth handshake would leave us
+# staring at "Authentication failed" in the test log with no
+# sshd-side reason. Keeping the suffix-less path means a single
+# dump step handles all three platforms' failed-state diagnostics.
+RUNTIME_DIR="${TMPDIR:-/tmp}/passhrs-test-sshd"
 SSHD_CFG="${RUNTIME_DIR}/sshd_config"
 HOST_KEY="${RUNTIME_DIR}/ssh_host_ed25519_key"
 SSHD_LOG="${RUNTIME_DIR}/sshd.log"
@@ -359,3 +365,13 @@ fi
 echo "==> Setup SUCCESS: ${USER}@${HOST}:${PORT} accepts ed25519 key auth."
 echo "    sshd log: ${SSHD_LOG} (LogLevel DEBUG3)"
 echo "    test key: ${TEST_KEY}"
+
+# ---- 13. tail the DEBUG3 sshd log to the GitHub log ----------------------
+# The smoke-test probe above proves pubkey auth works from a normal
+# openssh client, but the integration tests use russh. If russh fails
+# to authenticate we want the sshd-side reason visible inline in the
+# provision-step log so we don't have to download the artifact. The
+# full log is also persisted as a build artifact below.
+echo "==> sshd DEBUG3 log so far (full file at ${SSHD_LOG}):"
+sudo cat "${SSHD_LOG}" 2>&1 | tail -n 200 || true
+echo "==> end of DEBUG3 log"

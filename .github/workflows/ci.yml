@@ -195,6 +195,21 @@ jobs:
           path: integration-test.log
           if-no-files-found: warn
 
+      - name: Upload sshd log (unix)
+        # Always (not just on failure): a green run that suddenly goes
+        # red next run benefits from a baseline sshd log to diff. Also
+        # surfaces the DEBUG3 lines around pubkey auth attempts that
+        # would otherwise only be available via the dump-on-failure
+        # step's inline `cat` (which is clipped to the live log view).
+        if: always() && matrix.os != 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-log-${{ matrix.os }}
+          path: |
+            ${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log
+            /tmp/passhrs-test-sshd/sshd.log
+          if-no-files-found: warn
+
       - name: Dump sshd log on failure (unix)
         if: failure() && matrix.os != 'windows-2022'
         shell: bash
