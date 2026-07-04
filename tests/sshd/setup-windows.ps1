@@ -105,7 +105,7 @@ Set-Acl -Path $HostKey -AclObject $keyAcl
 # Diagnostic: emit the post-Set-Acl DACL so the next failure has the
 # actual ACL on stderr. icacls /C emits the full SD including deny
 # rules, which is what OpenSSH checks.
-Write-Host "After lockdown, icacls $HostKey:"
+Write-Host "After lockdown, icacls ${HostKey}:"
 icacls $HostKey | Out-Host
 
 # 5c. The sshd_config file is not secret — only add the service SID
