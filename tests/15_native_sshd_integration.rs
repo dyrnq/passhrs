@@ -84,10 +84,21 @@ fn sshd_ok() -> bool {
 /// so it survives across CI steps). When that's set, we use it;
 /// otherwise we fall back to the password path.
 fn auth_args() -> Vec<String> {
-    if let Ok(key) = std::env::var("PHR_TEST_KEY") {
-        vec!["-i".to_string(), key]
-    } else {
-        vec!["--password".to_string(), PASS.to_string()]
+    // PHR_TEST_KEY may be set-but-empty if the provision step's
+    // `>> $GITHUB_ENV` propagation is broken (e.g. a future
+    // regression where sudo strips GITHUB_ENV). An empty `-i ""` is
+    // rejected by clap with "a value is required for --key
+    // <IDENTITY_FILE>" — which kills every test before it even
+    // opens a TCP connection, hiding the real problem. Only emit
+    // `-i` when we actually have a key path; otherwise fall
+    // through to the password fallback. On macOS with
+    // `PasswordAuthentication no` that fallback still fails — but
+    // it fails with a clear sshd-side "Permission denied
+    // (publickey)" instead of an opaque clap error in the test
+    // binary's stderr.
+    match std::env::var("PHR_TEST_KEY") {
+        Ok(key) if !key.is_empty() => vec!["-i".to_string(), key],
+        _ => vec!["--password".to_string(), PASS.to_string()],
     }
 }
 

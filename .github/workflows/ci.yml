@@ -139,8 +139,19 @@ jobs:
         # fails fast with a clear "Permission denied (publickey)".
         # Linux and Windows continue to use their native sshd
         # provisions — this is macOS-only.
+        #
+        # Sudo on macOS has env_reset enabled by default and
+        # GITHUB_ENV is NOT in the env_keep whitelist, so `sudo
+        # ./script.sh` would strip GITHUB_ENV and the script's
+        # `echo "PHR_TEST_KEY=..." >> "$GITHUB_ENV"` would never
+        # run — the integration-tests step would see
+        # ${{ env.PHR_TEST_KEY }} == "" and the test binary would
+        # pass `-i ""` to passhrs, which clap rejects with "a value
+        # is required for --key <IDENTITY_FILE>". Pass GITHUB_ENV
+        # explicitly to sudo: `sudo VAR=value cmd` survives
+        # env_reset regardless of the env_keep list.
         if: matrix.os == 'macos-14'
-        run: sudo ./tests/sshd/setup-macos-brew-openssh.sh
+        run: sudo GITHUB_ENV="${GITHUB_ENV}" ./tests/sshd/setup-macos-brew-openssh.sh
 
       - name: Provision native sshd (Windows)
         if: matrix.os == 'windows-2022'
