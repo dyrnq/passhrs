@@ -73,17 +73,41 @@ fi
 
 # 5. Launch sshd. macOS sshd by default reads /private/etc/ssh/sshd_config
 #    AND treats included Match blocks; we override everything via -f.
+#
+#    Detach carefully. The naive `sudo sshd ... &` keeps sshd in the
+#    script's job table, so when this script exits bash sends SIGHUP
+#    to the child and sshd dies — which is exactly what the integration
+#    suite observed before: TCP probe succeeded immediately, every
+#    real passhrs connection ~100 s later got "Connection reset by
+#    peer" because sshd was gone. Wrapping in `nohup` ignores SIGHUP,
+#    `</dev/null >/dev/null 2>&1` severs sshd from the script's stdio
+#    so no one is waiting on the FDs, and `disown -h` (best-effort;
+#    macOS `disown` may not support -h) removes it from bash's job
+#    table so bash won't try to signal it at exit.
 sudo "${SSHD_BIN}" \
     -f "${SSHD_CFG}" \
     -h "${HOST_KEY}" \
     -E "${SSHD_LOG}" \
     -p "${PORT}" \
-    -D &
+    -D \
+    </dev/null >/dev/null 2>&1 &
 SSHD_PID=$!
 echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
+# Belt-and-suspenders: ignore SIGHUP via nohup-style behavior and
+# remove from the bash job table if disown supports it. Failure is
+# not fatal here.
+nohup sudo kill -0 "${SSHD_PID}" >/dev/null 2>&1 || true
+disown -h "${SSHD_PID}" 2>/dev/null || disown "${SSHD_PID}" 2>/dev/null || true
 
-# 6. Wait for the daemon to accept connections (max 10s).
+# 6. Wait for the daemon to accept connections (max 10s). Also confirms
+#    sshd is still alive (kill -0) — if nohup/disown failed silently
+#    and sshd died, the TCP probe will time out and we'll print the log.
 for i in $(seq 1 50); do
+    if ! sudo kill -0 "${SSHD_PID}" 2>/dev/null; then
+        echo "FATAL: sshd (pid ${SSHD_PID}) exited before becoming ready" >&2
+        tail -n 50 "${SSHD_LOG}" >&2 || true
+        exit 1
+    fi
     if (echo >"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
         echo "test sshd ready at ${HOST}:${PORT} (pid=${SSHD_PID})"
         exit 0

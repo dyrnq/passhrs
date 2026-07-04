@@ -4,7 +4,12 @@
 # any directives the host platform does not support.
 
 Port 22222
-ListenAddress 127.0.0.1
+# ListenAddress unset on purpose: sshd defaults to all loopback addresses
+# (127.0.0.1 and ::1) on whatever ports Port applies. tests/15
+# runs test_command_with_dest_ipv6 against [::1], so we must accept
+# dual-stack loopback. Set AddressFamily any (already below) to also
+# be safe on the Windows runner where sshd treats the v4 default
+# literally.
 AddressFamily any
 
 # Authentication — passhrs e2e tests authenticate with
@@ -27,10 +32,15 @@ GatewayPorts yes
 # test will see an empty env on the remote side.
 AcceptEnv LANG LC_*
 
-# Speed up connection establishment during the test run.
-LoginGraceTime 30
+# Speed up connection establishment during the test run. MaxStartups
+# is generous (default 10:30:100 drops 30% of unauthenticated
+# connections once 10 are queued) because the test suite hammers sshd
+# with rapid back-to-back sessions; without headroom we see
+# "Connection reset by peer" mid-handshake on a busy moment.
+LoginGraceTime 60
 MaxAuthTries 10
-MaxSessions 50
+MaxStartups 50:100:200
+MaxSessions 100
 
 # Disable features we do not want in CI: DNS reverse lookups can stall the
 # auth path on shared CI networks and produce flakes.
