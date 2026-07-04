@@ -159,8 +159,12 @@ jobs:
           cargo test --release -- --include-ignored --test-threads=1 \
               2>&1 | tee integration-test.log
           # Keep cargo's exit code so the step still fails when tests
-          # do; `tee` doesn't propagate it.
-          ${PIPESTATUS[0]}
+          # do; `tee` doesn't propagate it. `exit ${PIPESTATUS[0]}` is
+          # the canonical idiom — using just `${PIPESTATUS[0]}` on its
+          # own line makes bash try to execute the number as a command
+          # when PIPESTATUS[0] is 0, and the step fails with
+          # "0: command not found" even though all tests passed.
+          exit "${PIPESTATUS[0]}"
 
       - name: Upload integration test log
         if: always()
