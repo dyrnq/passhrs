@@ -107,6 +107,15 @@ fi
 echo "Creating ${USER} via sysadminctl -addUser (pass=${PASS})..."
 # -admin puts the user in the admin group → SACL ssh grant →
 # pam_sacl.so lets the SSH session past the account stage.
+#
+# NB: on Sonoma, sysadminctl's -password flag is unreliable when the
+# password contains a '#' character — the Cocoa arg parser appears
+# to treat '#' as a comment marker in some code paths, so the
+# user is created but the password is silently dropped (you see
+# "No clear text password or interactive option was specified ...
+# user to use FDE" in stderr). To be robust, we ALWAYS follow up
+# with `dscl . -passwd` to actually set the password regardless of
+# whether sysadminctl took it.
 sudo sysadminctl -addUser "${USER}" \
     -fullName "passhrs test user" \
     -password "${PASS}" \
@@ -115,6 +124,24 @@ sudo sysadminctl -addUser "${USER}" \
         echo "FATAL: sysadminctl -addUser ${USER} failed" >&2
         exit 1
     }
+
+# Force-set the password via dscl. For a brand-new user this works
+# without secure token (the user has no prior password hash to
+# unlock against), even though dscl . -passwd normally requires
+# the user's old password. We pass "${PASS}" once (the "new
+# password" form) — dscl recognises the single-arg form on a
+# fresh account.
+echo "Setting password via dscl . -passwd ..."
+sudo dscl . -passwd "/Users/${USER}" "${PASS}" 2>&1 || {
+    echo "FATAL: dscl . -passwd failed to set ${USER}'s password" >&2
+    echo "Trying the secure-token bootstrap via sysadminctl instead..." >&2
+    # Fall back: ask sysadminctl to reset using itself as the blesser.
+    # If that ALSO fails (likely the secure-token lockout we're
+    # trying to avoid), the next authonly check will surface the
+    # real error.
+    sudo sysadminctl -resetPasswordFor "${USER}" "${PASS}" \
+        -adminPassword "${PASS}" 2>&1 || true
+}
 
 # Verify the password is actually accepted by PAM. We do this with a
 # non-sshd probe — `dscl . -authonly` is the standard OpenDirectory
