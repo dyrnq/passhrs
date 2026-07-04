@@ -64,18 +64,33 @@ Expand-Archive -Path $ZipPath -DestinationPath $WorkDir -Force
 
 # Stop the sshd service before swapping binaries; it caches old ones.
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 
-# Overwrite the inbox binaries in-place. OpenSSH.exe / sshd.exe /
-# sftp-server.exe / ssh-keygen.exe are the files passhrs actually
-# shells out to. After this, "sshd -V" reports the Win32-OpenSSH
-# version instead of "OpenSSH_for_Windows_8.1p1".
-foreach ($name in @('sshd.exe','ssh.exe','ssh-keygen.exe','sftp-server.exe','scp.exe','sftp.exe')) {
+# The inbox OpenSSH binaries live under %SystemRoot%\System32\OpenSSH
+# and are protected: they default to owner=TrustedInstaller with a
+# restricted DACL, so Administrator cannot overwrite them even when
+# the sshd service is stopped. Re-acquire ownership and grant
+# Administrators FullControl on each target before overwriting, which
+# is sufficient to defeat Windows Resource Protection for files we
+# ourselves will replace.
+$InboxBinaries = @('sshd.exe','ssh.exe','ssh-keygen.exe','sftp-server.exe','scp.exe','sftp.exe')
+foreach ($name in $InboxBinaries) {
+    $dst = Join-Path $SshdBinDir $name
+    if (-not (Test-Path $dst)) {
+        continue
+    }
+    takeown /F $dst /A | Out-Null
+    icacls $dst /grant 'Administrators:(F)' | Out-Null
+}
+
+foreach ($name in $InboxBinaries) {
     $src = Join-Path $ExtractedDir $name
     $dst = Join-Path $SshdBinDir $name
     if (Test-Path $src) {
         Copy-Item -Path $src -Destination $dst -Force
     }
 }
+
 $sshdAfterUpgrade = & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | Select-Object -First 1
 Write-Host "sshd -V after upgrade: $sshdAfterUpgrade"
 
