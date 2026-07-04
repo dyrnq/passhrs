@@ -10,7 +10,7 @@
 //! setup scripts under `tests/sshd/` start a real `sshd` on
 //! `127.0.0.1:22222` with a known user account (USER + PASS below
 //! are cfg-gated per platform — Linux=`runner`, macOS=`testuser`,
-//! Windows=`runneradmin`, all with password `PassTest1234#`).
+//! Windows=`runneradmin`, all with password `PassTest1234!`).
 //! The tests exercise passhrs end-to-end against it.
 //!
 //! Because sshd is now native, the "remote" filesystem is the same as
@@ -42,7 +42,7 @@ const USER: &str = "runneradmin";
 const USER: &str = "testuser";
 #[cfg(target_os = "linux")]
 const USER: &str = "runner";
-const PASS: &str = "PassTest1234#";
+const PASS: &str = "PassTest1234!";
 const BIN: &str = "./target/release/passhrs";
 
 /// Platform-appropriate temp directory for test artifacts. The "remote"
@@ -86,7 +86,7 @@ fn dest() -> String {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_basic_command_exec() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -116,7 +116,7 @@ fn test_basic_command_exec() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_push_pull_file() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -178,7 +178,7 @@ fn test_push_pull_file() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_push_dir() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -239,7 +239,7 @@ fn setup_rsync_remote(remote_dir: &str) {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_rsync_upload_basic() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -283,7 +283,7 @@ fn test_rsync_upload_basic() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_rsync_delta() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -328,7 +328,7 @@ fn test_rsync_delta() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_rsync_with_exclude() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -377,7 +377,7 @@ fn test_rsync_with_exclude() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_exec_env_remote() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -409,7 +409,7 @@ fn test_exec_env_remote() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_password_from_file_integration() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -439,7 +439,7 @@ fn test_password_from_file_integration() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_password_file_flag_integration() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -472,7 +472,7 @@ fn test_password_file_flag_integration() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_connect_timeout_integration() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -505,7 +505,7 @@ fn test_connect_timeout_integration() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_exit_code_zero() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -529,7 +529,7 @@ fn test_command_exit_code_zero() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_multiple_args() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -563,7 +563,7 @@ fn test_command_multiple_args() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_uname() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -593,7 +593,7 @@ fn test_command_uname() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_which() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -619,7 +619,7 @@ fn test_command_which() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_yes_head() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -649,7 +649,7 @@ fn test_command_yes_head() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_compress_flag() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -680,7 +680,7 @@ fn test_command_compress_flag() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_with_pty() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -709,7 +709,7 @@ fn test_command_with_pty() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_ps_with_pipe() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -739,7 +739,7 @@ fn test_ps_with_pipe() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_force_tty_flag() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -770,7 +770,7 @@ fn test_force_tty_flag() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_with_dest_ipv6() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -800,7 +800,7 @@ fn test_command_with_dest_ipv6() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_local_forward_spawn() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -831,7 +831,7 @@ fn test_local_forward_spawn() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_socks5_proxy_spawn() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -862,7 +862,7 @@ fn test_socks5_proxy_spawn() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_http_connect_proxy_spawn() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -897,7 +897,7 @@ fn test_http_connect_proxy_spawn() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_fork_background() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -929,7 +929,7 @@ fn test_fork_background() {
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_multiple_ssh_options() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -959,7 +959,7 @@ fn test_multiple_ssh_options() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_verbose_quiet_flags() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -1010,7 +1010,7 @@ fn test_verbose_quiet_flags() {
 // ProxyJump 测试
 // ======================================================================
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_proxy_jump_self() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -1079,7 +1079,7 @@ fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, Stri
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_locale_env_forwarded() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
@@ -1121,7 +1121,7 @@ fn test_locale_env_forwarded() {
 }
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234#"]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_unrelated_env_not_forwarded() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");

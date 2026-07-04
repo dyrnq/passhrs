@@ -4,7 +4,7 @@
 # installed as a Windows capability; we then create a local testuser,
 # write a minimal sshd_config, and start the sshd service.
 #
-# Note: the default password 'PassTest1234#' already meets Windows
+# Note: the default password 'PassTest1234!' already meets Windows
 # password complexity (upper + lower + digit + special, 13 chars),
 # so no Local Security Policy tweak is required.
 [CmdletBinding()]
@@ -17,11 +17,11 @@ param(
     # either name on the command line so the same script works against
     # both image variants.
     [string]$User = 'runneradmin',
-    # PassTest1234# satisfies Windows password complexity (upper + lower
+    # PassTest1234! satisfies Windows password complexity (upper + lower
     # + digit + special, 13 chars). Same value used by every platform
     # setup script and the e2e tests so the test sshd authenticates
     # passhrs consistently across Linux, macOS and Windows runners.
-    [string]$Pass = 'PassTest1234#',
+    [string]$Pass = 'PassTest1234!',
     [int]$Port = 22222,
     [string]$SshdConfigTemplate = "$PSScriptRoot\sshd_config"
 )
@@ -221,7 +221,7 @@ Write-Host "sshd -V: $sshdAfterUpgrade"
 #    `runneradmin` account is created by the GitHub-hosted Windows
 #    image with admin privileges; we don't New-LocalUser it. Resetting
 #    the password via `net user` is the supported way and survives
-#    across re-runs. The default $Pass value ('PassTest1234#') already
+#    across re-runs. The default $Pass value ('PassTest1234!') already
 #    satisfies Windows password complexity (upper + lower + digit +
 #    special, 13 chars), so no policy tweak is required.
 #

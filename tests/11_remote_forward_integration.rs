@@ -17,7 +17,7 @@ const PORT: &str = "22222";
 const USER: &str = "runneradmin";
 #[cfg(not(target_os = "windows"))]
 const USER: &str = "runner";
-const PASS: &str = "PassTest1234#";
+const PASS: &str = "PassTest1234!";
 
 fn fport() -> u16 {
     TcpListener::bind("127.0.0.1:0")

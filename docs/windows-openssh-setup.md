@@ -16,7 +16,7 @@ matrix entry is chosen via the script's `-NoUpgrade` switch.
 
 Both modes install and start the sshd **service** (not a `Start-Process`
 foreground daemon). Both use the same port (22222), the same
-`testuser:PassTest1234#` account, and the same shared
+`testuser:PassTest1234!` account, and the same shared
 `tests/sshd/sshd_config` template (with Windows-specific directives
 stripped / appended, see below).
 
@@ -72,7 +72,7 @@ script as follows:
 | 5b | 154-178 | Run `ssh-keygen -A` to generate keys | This creates fresh keys with inheritance from the locked parent dir. |
 | 5c | 165-201 | Re-lock each generated key to `SYSTEM:F + Administrators:F`, owner=System | Belt-and-suspenders: explicitly set the canonical two-ACE ACL on each key file. **This is the part that breaks inbox 8.1p1, so we skip it under `-NoUpgrade`.** |
 | 5d | 195-198 | `icacls $SshdCfg /grant 'NT SERVICE\sshd:(R)'` | The sshd service account (LocalSystem / NT SERVICE\sshd) needs read access to parse config. |
-| 6 | 209-225 | Create `testuser` if missing with `PassTest1234#` (already meets Windows password complexity: upper + lower + digit + special, 13 chars) | Deterministic credential across all platforms. |
+| 6 | 209-225 | Create `testuser` if missing with `PassTest1234!` (already meets Windows password complexity: upper + lower + digit + special, 13 chars) | Deterministic credential across all platforms. |
 | 7 | 226-234 | Add `testuser` to local `OpenSSH Users` group (created on demand) | Windows OpenSSH honours this group by default |
 | 8 | 236-245 | `sshd -t -f $SshdCfg` syntax check | Catches bad config before starting the service |
 | 9 | 247-269 | `Stop-Service sshd -Force; Set-Service -StartupType Manual; try { Start-Service sshd -ErrorAction Stop } catch { Write-Host ... }` | Service-mode startup (`Start-Service` is more reliable than `Start-Process sshd -D` on Windows). `try/catch` survives `$ErrorActionPreference = 'Stop'` because we use `Write-Host`, not `Write-Error`. |

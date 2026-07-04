@@ -14,7 +14,7 @@ behaviour interacts badly with bash job control on CI runners.
 |--------|-------|
 | sshd path | `/usr/sbin/sshd` (stock macOS) |
 | sftp-server path | `/usr/libexec/sftp-server` (stock macOS) |
-| Test user | `testuser`, password `PassTest1234#` (created via `dscl`) |
+| Test user | `testuser`, password `PassTest1234!` (created via `dscl`) |
 | Listen | `127.0.0.1:22222` and `[::1]:22222` (dual-stack loopback) |
 | Launch | `sudo /usr/sbin/sshd -D &` wrapped in `nohup`, stdio→`/dev/null`, `disown -h` |
 | Config | `tests/sshd/sshd_config` materialised to `${TMPDIR}/passhrs-test-sshd/sshd_config` |
@@ -87,7 +87,7 @@ File: `tests/sshd/setup-macos.sh`.
 | 1 | 38-41 | `sed`-substitute `__SFTP_SERVER_PATH__` in shared sshd_config template → write to `${SSHD_CFG}` | Shared config is platform-agnostic |
 | 2 | 43-46 | Generate host key on first run (`ssh-keygen -t ed25519`), reuse on subsequent runs | Re-using the host key keeps `~/.ssh/known_hosts` stable across reruns. |
 | 3 | 48-60 | Create `testuser` via `dscl . -create /Users/testuser ...` and `sudo createhomedir -u testuser` | macOS user records live in OpenDirectory, not `/etc/passwd`. The naive Linux `useradd` would silently fail or write to /etc/passwd (which is no longer authoritative on modern macOS). |
-| 3b | 62-63 | `sudo dscl . -passwd /Users/testuser PassTest1234#` | Reset password each run so the credential stays deterministic |
+| 3b | 62-63 | `sudo dscl . -passwd /Users/testuser PassTest1234!` | Reset password each run so the credential stays deterministic |
 | 4 | 65-72 | Tear down any previous sshd bound to 22222 by reading `${SSHD_PID_FILE}` and sending SIGTERM | Idempotent re-runs |
 | 5 | 74-100 | Launch sshd fully detached (see above) | **The critical step — see "Why the detachment trick"** |
 | 6 | 102-116 | Readiness probe: 50 × 200 ms TCP-connect loop with `kill -0` liveness check | Fails fast if sshd died during launch |

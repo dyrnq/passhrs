@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Provision a real openssh-server on 127.0.0.1:22222 with a known
-# testuser / PassTest1234#, then start sshd in the background. Idempotent:
+# testuser / PassTest1234!, then start sshd in the background. Idempotent:
 # safe to re-run during local iteration.
 #
 # Targets GitHub-hosted ubuntu-24.04 runners; should also work on any
@@ -8,11 +8,11 @@
 set -euo pipefail
 
 USER="runner"
-# PassTest1234# meets Windows password complexity (upper + lower + digit
+# PassTest1234! meets Windows password complexity (upper + lower + digit
 # + special, 13 chars). The same value is used by every platform setup
 # script and the e2e tests so the test sshd always authenticates the
 # passhrs client with the same credentials.
-PASS="PassTest1234#"
+PASS="PassTest1234!"
 # NOTE: USER used to be 'testuser' (created via useradd). The macOS
 # setup hit a wall because macOS's pam_sacl.so + pam_opendirectory
 # require SACL authorizationdb grants that we couldn't easily write

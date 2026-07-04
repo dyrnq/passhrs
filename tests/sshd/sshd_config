@@ -13,7 +13,7 @@ Port 22222
 AddressFamily any
 
 # Authentication — passhrs e2e tests authenticate with
-# --password PassTest1234# (meets Windows password complexity too).
+# --password PassTest1234! (meets Windows password complexity too).
 PermitRootLogin yes
 PasswordAuthentication yes
 PubkeyAuthentication yes
