@@ -1096,13 +1096,16 @@ fn test_locale_env_forwarded() {
     let (ok, stdout, stderr) =
         run_phr_with_env(&a, &[("LANG", "en_US.UTF-8"), ("LC_ALL", "en_US.UTF-8")]);
     assert!(ok, "session failed: {}", stderr);
-    // The remote `env` output must contain the forwarded locale variables,
-    // proving channel.set_env reached the remote (AcceptEnv accepted them).
-    assert!(
-        stdout.contains("LANG=en_US.UTF-8"),
-        "LANG not forwarded to remote; env output: {}",
-        stdout
-    );
+    // LC_ALL is the most-overriding locale variable; it is NOT read
+    // from /etc/environment by pam_env on Ubuntu 24.04, so it is the
+    // one the test can reliably assert on. (LANG is read from
+    // /etc/environment — which the runner ships with LANG=C.UTF-8 —
+    // and pam_env applies that AFTER the SSH channel-set-env request,
+    // so LANG reaches the user session as C.UTF-8 even when passhrs
+    // correctly forwards en_US.UTF-8. The protocol-level forwarding
+    // itself is verified separately by the LC_ALL assertion below
+    // and by the RUST_LOG=passhrs=debug trace showing passhrs sent
+    // `Setting env 0: LANG=en_US.UTF-8` on the wire.)
     assert!(
         stdout.contains("LC_ALL=en_US.UTF-8"),
         "LC_ALL not forwarded to remote; env output: {}",

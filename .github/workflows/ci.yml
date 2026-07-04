@@ -143,7 +143,32 @@ jobs:
         # `--test-threads=1` as a TEST-NAME FILTER, which matches
         # nothing and silently causes all integration tests to be
         # reported as "filtered out" (i.e. never executed).
-        run: cargo test --release -- --include-ignored --test-threads=1
+        #
+        # RUST_LOG=passhrs=debug forces the env_logger in src/main.rs
+        # to emit DEBUG-level traces (env-var forwarding, SFTP init,
+        # sshd handshake timing, …) to stderr for every passhrs child
+        # process the test harness spawns. We pipe stderr+stdout
+        # through `tee` so the live GitHub log still shows the test
+        # summary AND we get a persisted file for after-the-fact
+        # diagnosis (uploaded as an artifact below, always — not
+        # gated on `failure()` — so a green run's logs are still
+        # available if a flake shows up on a later run).
+        env:
+          RUST_LOG: passhrs=debug
+        run: |
+          cargo test --release -- --include-ignored --test-threads=1 \
+              2>&1 | tee integration-test.log
+          # Keep cargo's exit code so the step still fails when tests
+          # do; `tee` doesn't propagate it.
+          ${PIPESTATUS[0]}
+
+      - name: Upload integration test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-log-${{ matrix.os }}
+          path: integration-test.log
+          if-no-files-found: warn
 
       - name: Dump sshd log on failure (unix)
         if: failure() && matrix.os != 'windows-2022'
