@@ -134,16 +134,45 @@ user, new_pw = sys.argv[1], sys.argv[2]
 _KC_KEY = bytes([0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD,
                  0xEA, 0xA3, 0xB9, 0x1F])
 def decode_kcpassword(path):
+    """Recover the runner user's autologin password from /etc/kcpassword.
+
+    The encoding (used by GitHub runner-images bootstrap-provisioner)
+    XORs the password bytes against the 11-byte KEY above, then pads
+    out to a multiple of the KEY length with NUL bytes — except for
+    the special case of an 11-char password, which gets exactly one
+    NUL pad (so an 11-char password occupies 12 bytes on disk).
+
+    Decoding is the inverse XOR; the password region becomes the
+    original ASCII, the NUL-pad region becomes a run of 0x00 bytes
+    (0 XOR K XOR K = 0). We pick the SMALLEST candidate P (1..M) such
+    that (a) the trailing bytes [P..M] are all 0x00 AND (b) the
+    leading bytes [0..P] are printable ASCII. The "smallest P" rule
+    breaks the ambiguity at M = 22 (which can be either a 22-char
+    password with no padding, OR a 12-char password with 10 NUL pads)
+    — a 22-char autologin password is implausible, so the smallest
+    printable candidate is the correct one. Without this rule the
+    old decoder returned the entire 22-byte buffer (e.g. 32 chars)
+    and passwd then rejected it, leaving the pty hung forever in
+    the "Old password:" retry loop.
+    """
     with open(path, 'rb') as f:
         data = f.read()
-    out = bytearray(len(data))
+    M = len(data)
+    decoded = bytearray(M)
     for i, b in enumerate(data):
-        out[i] = b ^ _KC_KEY[i % len(_KC_KEY)]
-    # The first NUL is the terminator; trim everything from there.
-    nul = out.find(b'\x00')
-    if nul >= 0:
-        out = out[:nul]
-    return out.decode('utf-8', errors='replace')
+        decoded[i] = b ^ _KC_KEY[i % len(_KC_KEY)]
+    candidates = []
+    for P in range(1, M + 1):
+        # Pad region must be all NUL after XOR.
+        if all(b == 0 for b in decoded[P:]):
+            pw = decoded[:P]
+            # Password region must be printable ASCII (32..126).
+            if all(32 <= b < 127 for b in pw):
+                candidates.append(P)
+    if not candidates:
+        # No valid match — best effort, return the whole buffer.
+        return decoded.decode('utf-8', errors='replace')
+    return decoded[:min(candidates)].decode('utf-8')
 
 old_pw = decode_kcpassword('/etc/kcpassword')
 sys.stderr.write("Decoded autologin password from /etc/kcpassword (len={})\n".format(len(old_pw)))
@@ -237,9 +266,27 @@ try:
             break
 except OSError:
     pass
-# Wait for child to exit and reap it.
-wpid, status = os.waitpid(pid, 0)
-sys.exit(0 if os.waitstatus_to_exitcode(status) == 0 else 1)
+# Wait for child to exit and reap it. We poll with WNOHANG and
+# SIGKILL the child if it hangs — without this, a wrong old
+# password (e.g. from a buggy kcpassword decoder) leaves passwd
+# stuck in the "Old password:" retry loop and the setup script
+# hangs forever, eventually timing out the whole CI step.
+deadline = time.time() + 10.0
+while time.time() < deadline:
+    try:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        # Already reaped (shouldn't happen, but defensive).
+        sys.exit(0)
+    if wpid == pid:
+        sys.exit(0 if os.waitstatus_to_exitcode(status) == 0 else 1)
+    time.sleep(0.2)
+sys.stderr.write("FAIL: 'sudo passwd' did not exit within 10s — killing it\n")
+try:
+    os.kill(pid, 9)
+except ProcessLookupError:
+    pass
+sys.exit(1)
 PYEOF
 then
     SUCC="true"
