@@ -60,6 +60,23 @@ fi
 
 # 3. Create testuser if missing. macOS user records live in OpenDirectory,
 #    not /etc/passwd, so use dscl.
+#
+#    Two macOS-specific quirks make a vanilla dscl user unable to log
+#    in over SSH even with PasswordAuthentication yes + UsePAM yes:
+#
+#    a. AuthenticationAuthority: a dscl-created user has no auth
+#       authority entries, so pam_opendirectory's account check
+#       returns "Access denied for user ... by PAM account
+#       configuration [preauth]". Adding `;basic;` opts the user in
+#       to the basic-password authentication flow that PAM/SSH use.
+#
+#    b. password aging: macOS's pwpolicy gives newly-created users
+#       a password-expiry policy. If the password is "expired" (or
+#       the policy says "must change on next log in"), PAM rejects
+#       the account even when the supplied password matches. We set
+#       `passwordLastSet` to the current time so the password is
+#       fresh from PAM's perspective, and clear any forced-expiry
+#       policy via pwpolicy.
 if ! dscl . -read "/Users/${USER}" UniqueID >/dev/null 2>&1; then
     UNIQUE_ID="55555"
     sudo dscl . -create "/Users/${USER}"
@@ -68,12 +85,29 @@ if ! dscl . -read "/Users/${USER}" UniqueID >/dev/null 2>&1; then
     sudo dscl . -create "/Users/${USER}" UniqueID "${UNIQUE_ID}"
     sudo dscl . -create "/Users/${USER}" PrimaryGroupID 20
     sudo dscl . -create "/Users/${USER}" NFSHomeDirectory "/Users/${USER}"
+    sudo dscl . -create "/Users/${USER}" AuthenticationAuthority ";basic;"
     sudo dscl . -create "/Users/${USER}" Password "${PASS}"
     sudo createhomedir -u "${USER}" >/dev/null
 fi
 
 # Always reset password to the test value so re-runs are deterministic.
 sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
+
+# Refresh passwordLastSet so PAM treats the password as freshly set
+# (avoids 'password expired' / 'must change on next login' rejections).
+# Setting it to 0 also works; we use the current epoch to match what
+# dscl . -passwd would record on a brand-new user.
+NOW_EPOCH="$(date +%s)"
+sudo dscl . -create "/Users/${USER}" passwordLastSet "${NOW_EPOCH}" 2>/dev/null || true
+
+# Strip any forced-expiry / pw-policy that would deny SSH login on
+# the next run. `pwpolicy -u USER -clear` removes all custom policies
+# for the user, falling back to the system default (no expiry for
+# non-admin users).
+sudo pwpolicy -u "${USER}" -clear 2>/dev/null || true
+# Belt-and-suspenders: also clear accountExpires (an absolute
+# timestamp past which the account is locked).
+sudo dscl . -delete "/Users/${USER}" accountExpires 2>/dev/null || true
 
 # 4. Tear down any previous instance bound to PORT. We track
 #    sshd by PID across runs.
