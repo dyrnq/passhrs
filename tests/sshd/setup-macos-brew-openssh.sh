@@ -84,12 +84,39 @@ mkdir -p "${RUNTIME_DIR}"
 
 echo "==> Installing openssh via brew (as ${SUDO_USER:-runner})..."
 # `brew install openssh` is idempotent — returns 0 if already at latest.
+#
+# HOMEBREW_NO_AUTO_UPDATE=1 stops brew from running `brew update` before
+# the install. On a fresh macos-14 runner the brew prefix has never
+# seen an update, so a vanilla `brew install openssh` triggers an
+# implicit `brew update` first; if that update hits a transient
+# GitHub-API or DNS flake (very common on shared CI egress IPs) the
+# whole `brew install` aborts in a few seconds with no useful context
+# — exactly the failure pattern we saw on the last 10+ CI runs. Pin
+# NO_AUTO_UPDATE and let a single explicit retry absorb the flake.
+#
+# HOMEBREW_NO_INSTALL_FROM_API=1 keeps the formula fetch from the
+# local tap repo instead of the new API endpoint, which is more
+# reliable in CI environments that occasionally have restricted
+# egress to *.bintray-style hosts.
 sudo -u "${SUDO_USER:-runner}" -H bash -c "
     export PATH='${BREW_BIN}:\$PATH'
+    export HOMEBREW_NO_AUTO_UPDATE=1
+    export HOMEBREW_NO_INSTALL_FROM_API=1
+    export HOMEBREW_NO_ANALYTICS=1
     brew install openssh
 " || {
-    echo "FATAL: brew install openssh failed" >&2
-    exit 1
+    echo "WARN: brew install openssh failed on first try; retrying once after 5s..." >&2
+    sleep 5
+    sudo -u "${SUDO_USER:-runner}" -H bash -c "
+        export PATH='${BREW_BIN}:\$PATH'
+        export HOMEBREW_NO_AUTO_UPDATE=1
+        export HOMEBREW_NO_INSTALL_FROM_API=1
+        export HOMEBREW_NO_ANALYTICS=1
+        brew install openssh
+    " || {
+        echo "FATAL: brew install openssh failed twice" >&2
+        exit 1
+    }
 }
 
 # ---- 1b. dynamically resolve Homebrew openssh's binary paths ----------
@@ -213,33 +240,52 @@ if [ ! -f "${TEST_KEY}" ]; then
     chmod 644 "${TEST_KEY_PUB}"
 fi
 
-# ---- 4. create testuser via sysadminctl -addUser --------------------------
+# ---- 4. create testuser via dscl (Sonoma+ secure-token-safe path) --------
 
-# Idempotency: if a previous run left a testuser record, delete it
-# first so sysadminctl -addUser doesn't refuse with "user exists".
-# (sysadminctl -deleteUser is the supported path; dscl . -delete
-# is a fallback for the rare case where -deleteUser refuses on a
-# system-protected record.)
+# sysadminctl -addUser was the previous path. It is broken on Sonoma+
+# in non-interactive CI contexts: the tool bootstraps a secure-token
+# for the new account and that requires an interactive auth dialog
+# the runner can't satisfy, so the call fails with the opaque
+# `Could not create account. (-?)`. dscl . -create the same
+# OpenDirectory record by hand; this skips the secure-token bootstrap
+# entirely because pubkey auth doesn't need one (sshd validates the
+# challenge signature against authorized_keys without ever consulting
+# the user's password). Set Password to a literal asterisk to lock
+# the account out of password login — belt-and-braces on top of the
+# `PasswordAuthentication no` we already write into sshd_config.
+
+# Idempotency: clean up any prior record + home dir from a previous run
+# before recreating, otherwise dscl . -create returns "object already
+# exists" errors.
 if sudo dscl . -read "/Users/${USER}" >/dev/null 2>&1; then
     echo "==> Removing pre-existing ${USER} from a previous run..."
     sudo sysadminctl -deleteUser "${USER}" 2>&1 \
         || sudo dscl . -delete "/Users/${USER}" 2>&1 || true
-    # The home dir survives -deleteUser; nuke it so the next -addUser
+    # The home dir survives -deleteUser; nuke it so the next -create
     # doesn't inherit stale state (notably .ssh/authorized_keys).
     sudo rm -rf "${HOME_DIR}" 2>/dev/null || true
 fi
 
-echo "==> Creating ${USER} via sysadminctl -addUser..."
-# -admin puts the user in the admin group → SACL ssh grant →
-# pam_sacl.so lets the SSH session past the account stage even
-# though we never set a password.
-sudo sysadminctl -addUser "${USER}" \
-    -fullName "passhrs test user" \
-    -admin \
-    -home "${HOME_DIR}" 2>&1 || {
-        echo "FATAL: sysadminctl -addUser ${USER} failed" >&2
-        exit 1
-    }
+echo "==> Creating ${USER} via dscl . -create (no sysadminctl, no token bootstrap)..."
+# UniqueID 550 + PrimaryGroupID 20 (staff) match the canonical macOS
+# user template and don't collide with any system account on a fresh
+# runner. RealName and NFSHomeDirectory are needed for pam_opendirectory
+# to resolve the user record at auth time. Password '*' disables
+# password login at the OpenDirectory layer — pubkey-only.
+sudo dscl . -create "/Users/${USER}" UniqueID 550 || {
+    echo "FATAL: dscl UniqueID failed" >&2; exit 1; }
+sudo dscl . -create "/Users/${USER}" PrimaryGroupID 20 || {
+    echo "FATAL: dscl PrimaryGroupID failed" >&2; exit 1; }
+sudo dscl . -create "/Users/${USER}" UserShell /bin/zsh || {
+    echo "FATAL: dscl UserShell failed" >&2; exit 1; }
+sudo dscl . -create "/Users/${USER}" RealName "passhrs test user" || {
+    echo "FATAL: dscl RealName failed" >&2; exit 1; }
+sudo dscl . -create "/Users/${USER}" NFSHomeDirectory "${HOME_DIR}" || {
+    echo "FATAL: dscl NFSHomeDirectory failed" >&2; exit 1; }
+sudo dscl . -create "/Users/${USER}" Password "*" || {
+    echo "FATAL: dscl Password failed" >&2; exit 1; }
+sudo createhomedir -c -u "${USER}" >/dev/null 2>&1 || {
+    echo "FATAL: createhomedir -c -u ${USER} failed" >&2; exit 1; }
 
 # ---- 5. drop public key into authorized_keys ------------------------------
 # This is the bit that bypasses the secure-token wall: sshd reads

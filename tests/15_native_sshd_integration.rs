@@ -174,9 +174,160 @@ fn run_phr(args: &[&str]) -> (bool, String, String) {
         .expect("run passhrs");
     (
         output.status.success(),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
+        strip_ansi(&String::from_utf8_lossy(&output.stdout)),
+        strip_ansi(&String::from_utf8_lossy(&output.stderr)),
     )
+}
+
+/// Strip CSI / OSC / single-character ANSI escape sequences from a
+/// string. Windows' conhost + cmd.exe routinely inject sequences like
+/// `\x1b[2J\x1b[m\x1b[H` (clear screen + reset + cursor home) at
+/// the start of a channel-exec stdout, and `\x1b]0;...\x07\x1b[?25h`
+/// (set window title + show cursor) at the end — captured as part of
+/// the channel data when sshd forwards it to passhrs. Without
+/// stripping, every stdout-asserting test on Windows fails with
+/// the expected text wrapped in escape codes. Linux/macOS sshd
+/// never emits these, so applying the helper unconditionally is a
+/// no-op there. We strip both stdout and stderr so error messages
+/// stay readable on a future regression.
+///
+/// Covers:
+///   - CSI: ESC `[` <params 0x30-0x3f> <intermediate 0x20-0x2f>
+///     <final 0x40-0x7e>   (most cursor/color/erase sequences)
+///   - OSC: ESC `]` ... BEL (`\x07`) or ESC `\` (the canonical
+///     terminator; some terminals also accept ESC `\` aka ST)
+///   - DCS / PM / APC: ESC `P` / `^` / `_` ... ESC `\`
+///   - Single-char escapes: ESC followed by one of `=` `>` `}`
+///     (DECKPAM, DECKPNM, etc. — rare but harmless to strip)
+///   - Lone ESC chars (defensive — some terminals emit them as
+///     cancel sequences)
+fn strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != 0x1b {
+            // Pass through; re-encode as UTF-8 safely via String::push_str
+            // below in the surrogate escape branch.
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // ESC: try to consume a known sequence shape. If we don't
+        // recognise the introducer, drop just the ESC and keep
+        // scanning — better to over-strip than to leave a stray
+        // `\x1b` in the output.
+        if i + 1 >= bytes.len() {
+            break;
+        }
+        let intro = bytes[i + 1];
+        match intro {
+            b'[' => {
+                // CSI: skip until final byte (0x40..=0x7e)
+                let mut j = i + 2;
+                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                    j += 1;
+                }
+                i = if j < bytes.len() { j + 1 } else { j };
+            }
+            b']' | b'P' | b'^' | b'_' => {
+                // OSC / DCS / PM / APC: skip until BEL or ESC \\
+                let mut j = i + 2;
+                while j < bytes.len() {
+                    if bytes[j] == 0x07 {
+                        j += 1;
+                        break;
+                    }
+                    if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                        j += 2;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+            }
+            b'=' | b'>' | b'}' => {
+                i += 2;
+            }
+            _ => {
+                // Unknown — drop just the ESC.
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn passes_through_plain_text() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+        assert_eq!(strip_ansi("hello_phr\n"), "hello_phr\n");
+        assert_eq!(strip_ansi(""), "");
+    }
+
+    #[test]
+    fn strips_csi_sequences() {
+        // clear screen, reset attributes, cursor home — the trio
+        // conhost emits at the start of every cmd.exe exec channel.
+        assert_eq!(
+            strip_ansi("\x1b[2J\x1b[m\x1b[Hhello_phr\r\n"),
+            "hello_phr\r\n"
+        );
+        // show/hide cursor.
+        assert_eq!(strip_ansi("\x1b[?25lsecret\x1b[?25h"), "secret");
+        // SGR colour (no effect on stripping logic).
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        // Cursor position with parameter bytes.
+        assert_eq!(strip_ansi("\x1b[10;20Hrow=10"), "row=10");
+    }
+
+    #[test]
+    fn strips_osc_sequences() {
+        // OSC 0 ; <title> BEL — what conhost emits at the end of a
+        // cmd.exe session to set the window title.
+        assert_eq!(
+            strip_ansi("hello\x1b]0;C:\\Windows\\system32\\conhost.exe\x07end"),
+            "helloend",
+        );
+        // OSC terminated by ST (ESC \) instead of BEL.
+        assert_eq!(strip_ansi("a\x1b]2;title\x1b\\b"), "ab");
+    }
+
+    #[test]
+    fn strips_windows_conhost_payload() {
+        // The exact stdout shape we saw on 28706151879's failing
+        // test_basic_command_exec on Windows:
+        let raw = "\x1b[2J\x1b[m\x1b[Hhello_phr\r\n\x1b]0;C:\\Windows\\system32\\conhost.exe\x07\x1b[?25h";
+        assert_eq!(strip_ansi(raw), "hello_phr\r\n");
+    }
+
+    #[test]
+    fn preserves_non_escape_text() {
+        // Multi-byte UTF-8 must round-trip; strip_ansi only ever
+        // drops bytes starting with 0x1b, never touches the
+        // continuation bytes of a multi-byte char.
+        let s = "中文测试 🎉";
+        assert_eq!(strip_ansi(s), s);
+        // Bytes that happen to be in the CSI introducer range
+        // (0x30..=0x3f) but are NOT preceded by ESC must pass
+        // through. e.g. '?' (0x3f) inside a URL.
+        assert_eq!(strip_ansi("http://x?y=1"), "http://x?y=1");
+    }
+
+    #[test]
+    fn handles_truncated_escape() {
+        // Lone ESC at end of input — must not panic, must drop.
+        assert_eq!(strip_ansi("abc\x1b"), "abc");
+        // ESC + introducer with no body (CSI at EOF).
+        assert_eq!(strip_ansi("abc\x1b["), "abc");
+        // ESC + introducer + garbage (unknown introducer).
+        assert_eq!(strip_ansi("abc\x1bZx"), "abcx");
+    }
 }
 
 fn dest() -> String {

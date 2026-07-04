@@ -37,6 +37,16 @@ if ! command -v sshd >/dev/null 2>&1; then
     sudo apt-get update
     sudo apt-get install -y openssh-server openssh-sftp-server
 fi
+# Install sshpass so the end-of-script smoke probe (step 8a) can drive
+# sshpass -p ${PASS} ssh ... to verify the password actually authenticates
+# before the integration-test step inherits a misconfigured sshd. Without
+# this, a silent chpasswd failure only surfaces as 30 opaque
+# "Authentication failed" messages in the cargo test output, which makes
+# it hard to distinguish from a real bug in passhrs. sshpass is a small
+# no-daemon utility; safe to install alongside openssh-server.
+if ! command -v sshpass >/dev/null 2>&1; then
+    sudo apt-get install -y sshpass
+fi
 
 # 2. Locate sftp-server (path varies across distros).
 SFTP_SERVER=""
@@ -87,6 +97,19 @@ if ! id "${USER}" >/dev/null 2>&1; then
     exit 1
 fi
 echo "${USER}:${PASS}" | sudo chpasswd
+# chpasswd can silently fail if the runner user is locked or has a
+# no-password entry (the runner image occasionally ships one). Verify
+# the password field in /etc/shadow is non-empty and not '*' / '!' /
+# '!!' / '*LK*' (locked-account markers) — otherwise every auth_args()
+# call in the integration tests would fall through to a literal empty
+# password and sshd would reply "Authentication failed" 30 times in a
+# row before any test ever produces a real failure message.
+if ! sudo getent shadow "${USER}" | cut -d: -f2 | grep -qE '^[^!*]'; then
+    echo "FATAL: ${USER}'s /etc/shadow password field is empty/locked after chpasswd" >&2
+    sudo getent shadow "${USER}" >&2 || true
+    exit 1
+fi
+echo "    chpasswd verified: /etc/shadow has non-empty password for ${USER}"
 
 # 5b. Ubuntu's OpenSSH package does not create the privilege-separation
 #     directory on install; sshd refuses to start without it.
@@ -127,11 +150,36 @@ echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
 for i in $(seq 1 50); do
     if (echo >"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
         echo "test sshd ready at ${HOST}:${PORT} (pid=${SSHD_PID})"
-        exit 0
+        break
     fi
     sleep 0.2
 done
 
-echo "FATAL: sshd did not start within 10s" >&2
-tail -n 50 "${SSHD_LOG}" >&2 || true
-exit 1
+if ! (echo >"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
+    echo "FATAL: sshd did not start within 10s" >&2
+    tail -n 50 "${SSHD_LOG}" >&2 || true
+    exit 1
+fi
+
+# 8a. End-to-end smoke probe: drive sshpass -p ${PASS} ssh to log in
+# with the runner user's password and run `echo linux_ssh_ok`. This
+# catches: wrong chpasswd, sshd_config typos (e.g. PasswordAuthentication
+# silently overridden by a Match block), and the rare case where sshd
+# starts but the PAM stack rejects every password. sshpass is
+# installed in step 1 alongside openssh-server.
+echo "==> Smoke-testing ssh password auth..."
+if ! sshpass -p "${PASS}" ssh \
+        -p "${PORT}" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=no \
+        -o ConnectTimeout=5 \
+        -o NumberOfPasswordPrompts=1 \
+        "${USER}@${HOST}" \
+        "echo linux_ssh_ok" 2>&1; then
+    echo "FATAL: ssh password auth probe failed; check sshd log + chpasswd output" >&2
+    tail -n 80 "${SSHD_LOG}" >&2 || true
+    exit 1
+fi
+
+exit 0
