@@ -77,11 +77,6 @@ takeown /F $HostKey /A | Out-Null
 # (a) Disable inheritance AND drop inherited ACEs without copying.
 # (b) Snapshot explicit rules into an array so the RemoveAccessRule*
 #     loop does not mutate during enumeration.
-$keyAcl = Get-Acl -Path $HostKey
-$keyAcl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($keyAcl.Access)) {
-    $keyAcl.RemoveAccessRuleSpecific($rule)
-}
 # (c) Re-grant exactly the three SIDs we want. FullControl (F) on the
 #     private key is the canonical ACL Microsoft's OpenSSH docs
 #     recommend; we follow that instead of Read so the key file is
@@ -89,24 +84,39 @@ foreach ($rule in @($keyAcl.Access)) {
 #     Administrators covers the runner user (Administrator) that runs
 #     the `sshd -t -f` validation step; NT SERVICE\sshd is the explicit
 #     service SID so other service contexts cannot read the key.
-foreach ($sidSpec in @(
-    'SYSTEM',
-    'BUILTIN\Administrators',
-    'NT SERVICE\sshd'
-)) {
-    $nt = New-Object System.Security.Principal.NTAccount($sidSpec)
-    $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier])
+# (d) Set the OWNER to SYSTEM. OpenSSH on Windows also rejects the
+#     key if the owner is a regular user account (e.g. runneradmin);
+#     SYSTEM or Administrators are the only accepted owners. We use
+#     SYSTEM because the sshd service runs in the LocalSystem context.
+$keyAcl = Get-Acl -Path $HostKey
+$keyAcl.SetAccessRuleProtection($true, $false)
+foreach ($rule in @($keyAcl.Access)) {
+    $keyAcl.RemoveAccessRuleSpecific($rule)
+}
+$systemSid  = New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+$adminsSid  = New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+$sshdSvcSid = (New-Object System.Security.Principal.NTAccount('NT SERVICE', 'sshd')
+    ).Translate([System.Security.Principal.SecurityIdentifier])
+foreach ($sid in @($systemSid, $adminsSid, $sshdSvcSid)) {
     $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
         $sid, 'FullControl', 'Allow')
     $keyAcl.AddAccessRule($rule)
 }
+$keyAcl.SetOwner($systemSid)
 Set-Acl -Path $HostKey -AclObject $keyAcl
 
-# Diagnostic: emit the post-Set-Acl DACL so the next failure has the
-# actual ACL on stderr. icacls /C emits the full SD including deny
-# rules, which is what OpenSSH checks.
+# Diagnostic dump: ACL + owner + sshd binary location + sshd version,
+# all on stdout so the next CI failure has the full context. icacls
+# without /C still emits the canonical DACL; we add a separate owner
+# query because icacls /C sometimes collapses it.
 Write-Host "After lockdown, icacls ${HostKey}:"
 icacls $HostKey | Out-Host
+Write-Host "Owner: $((Get-Acl -Path $HostKey).Owner)"
+Write-Host "sshd binary: $((Get-Command sshd -ErrorAction SilentlyContinue).Source)"
+$sshdVer = & sshd -V 2>&1 | Out-String
+Write-Host "sshd -V: $sshdVer"
 
 # 5c. The sshd_config file is not secret — only add the service SID
 #     without stripping inheritance (preserves the inherited
