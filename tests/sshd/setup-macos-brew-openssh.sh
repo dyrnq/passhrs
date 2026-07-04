@@ -188,16 +188,28 @@ fi
 if [ ! -f "${TEST_KEY}" ]; then
     ssh-keygen -t ed25519 -f "${TEST_KEY}" -N "" -q
     # ssh-keygen ran as root (the whole script runs under sudo), so
-    # the key file is root:root mode 600 by default. The integration
-    # test process runs as the unprivileged `runner` user and can't
-    # read it — russh reports "Failed to load key: Permission denied
-    # (os error 13)" and the auth falls through to password (which
-    # sshd rejects with PasswordAuthentication no). chmod 644 so the
-    # test process can load it. The key is ephemeral (deleted on
-    # runner teardown), lives under /tmp, and has no passphrase, so
-    # wider read perms are safe — no other process on the runner has
-    # any reason to look for it.
-    chmod 644 "${TEST_KEY}"
+    # the key file is root:root mode 600 by default. That breaks
+    # BOTH the in-script smoke test (step 11) AND the integration
+    # tests, in different ways:
+    #   - Smoke test: `ssh -i <key>` is launched by this root shell.
+    #     OpenSSH rejects the key regardless of effective UID if the
+    #     mode bits are too open — but it ALSO rejects mode 600 when
+    #     the owner is a different uid (the smoke test is in the
+    #     runner user's name at the protocol level), exiting 255
+    #     with "Permissions 0600 for ... are too open".
+    #   - Integration tests: russh runs as the runner user, which
+    #     can't read root-owned 600 — "Failed to load key: Permission
+    #     denied (os error 13)".
+    # chmod 644 alone (what the previous attempt did) fixes the
+    # russh read but breaks the ssh smoke test the other way.
+    # Right answer: chown to the unprivileged runner user, then
+    # keep mode 600. The runner user owns the file and has the only
+    # read bit set — ssh is happy, russh is happy, and no other
+    # process on the runner has any reason to touch this ephemeral
+    # key under /tmp.
+    KEY_OWNER="${SUDO_USER:-root}"
+    chown "${KEY_OWNER}:staff" "${TEST_KEY}" "${TEST_KEY_PUB}"
+    chmod 600 "${TEST_KEY}"
     chmod 644 "${TEST_KEY_PUB}"
 fi
 
@@ -349,21 +361,32 @@ if ! (echo >"/dev/tcp/${HOST}/${PORT}") 2>/dev/null; then
 fi
 
 # ---- 11. end-to-end smoke test with key auth ----------------------------
-# Drive a real SSH handshake from this script (as root, which is fine —
-# the sshd_config allows PermitRootLogin yes for the test) to confirm
-# the keypair is wired correctly. This catches: wrong home-dir perms,
-# authorized_keys not picked up, sshd_config typo, SACL grant missing.
-echo "==> Smoke-testing ssh key auth..."
-if ! ssh -i "${TEST_KEY}" \
-        -p "${PORT}" \
+# Drive a real SSH handshake to confirm the keypair is wired correctly.
+# This catches: wrong home-dir perms, authorized_keys not picked up,
+# sshd_config typo, SACL grant missing.
+#
+# IMPORTANT: run ssh as the key's owner (KEY_OWNER, set in step 3 to
+# the unprivileged runner user). ssh's secure_filename() check refuses
+# keys whose st_uid doesn't match the calling process's getuid(), AND
+# rejects "too open" perms regardless of effective UID. Running the
+# smoke test as root against a runner-owned 600 key would fail one or
+# the other check, aborting the step before the integration tests even
+# run. The integration tests run as the runner user anyway, so a
+# runner-as-runner smoke test exercises the exact same identity the
+# tests will use.
+echo "==> Smoke-testing ssh key auth (as ${KEY_OWNER})..."
+if ! sudo -u "${KEY_OWNER}" -H bash -c "
+    ssh -i '${TEST_KEY}' \
+        -p '${PORT}' \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
         -o BatchMode=yes \
         -o ConnectTimeout=5 \
-        "${USER}@${HOST}" \
-        "echo ssh_key_auth_ok" 2>&1; then
+        '${USER}@${HOST}' \
+        'echo ssh_key_auth_ok'
+"; then
     echo "FATAL: ssh key auth probe failed; check sshd log" >&2
-    tail -n 80 "${SSHD_LOG}" >&2 || true
+    sudo tail -n 80 "${SSHD_LOG}" >&2 || true
     exit 1
 fi
 
