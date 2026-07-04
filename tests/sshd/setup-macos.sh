@@ -115,7 +115,7 @@ HOME_DIR="/Users/${USER}"
 # PAM auth at test time — abort before launching sshd.
 echo "Setting password for ${USER} via sudo passwd driven by python3 pty..."
 SUCC="false"
-if python3 - "$USER" "$PASS" <<'PYEOF' 2>&1; then
+if python3 - "$USER" "$PASS" <<'PYEOF' 2>&1
 import pty, os, sys, time, select, errno
 
 user, pw = sys.argv[1], sys.argv[2]

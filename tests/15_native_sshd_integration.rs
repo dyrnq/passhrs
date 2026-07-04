@@ -1044,20 +1044,25 @@ fn test_proxy_jump_self() {
 fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, String) {
     let mut cmd = Command::new(BIN);
     cmd.args(args);
-    // `Command::env` only ADDS the variable to the explicit list — it
-    // does NOT replace entries that are already in the inherited parent
-    // env. On GitHub-hosted runners, for example, the runner always
-    // exports `LANG=C.UTF-8` to its own process; a child that calls
-    // `cmd.env("LANG", "en_US.UTF-8")` inherits BOTH and the parent
-    // value wins in the child (because the explicit envs are appended
-    // after the inherited ones — and on Linux the LAST occurrence
-    // wins only for `envs(IntoIterator)`, not for `env(K, V)`).
-    // To guarantee the test value is what passhrs sees and forwards,
-    // we first strip the variable from the inherited environment.
-    for (k, v) in envs {
-        cmd.env_remove(k);
-        cmd.env(k, v);
-    }
+    // `Command::env(K, V)` is implemented as `envs(Some((K, V)))`,
+    // and `envs` CLEARS the explicit env list on every call. So a
+    // loop like
+    //     for (k, v) in envs { cmd.env(k, v); }
+    // ends up with only the LAST pair in the explicit env; every
+    // earlier `env()` invocation's additions are wiped before being
+    // seen by the child.
+    //
+    // We also want to strip any inherited parent env entries with the
+    // same name (e.g. GitHub's Ubuntu runners export `LANG=C.UTF-8`
+    // to every process, so without explicit unsetting the test's
+    // `LANG=en_US.UTF-8` would lose out to the inherited one).
+    //
+    // `env_clear()` empties the inherited env table and starts a
+    // fresh explicit env from an empty base. Calling `envs(...)`
+    // once with all key=value pairs in a single iterator then
+    // installs them all atomically without clearing between calls.
+    cmd.env_clear();
+    cmd.envs(envs.iter().map(|(k, v)| (*k, *v)));
     let output = cmd.output().expect("run passhrs");
     (
         output.status.success(),
