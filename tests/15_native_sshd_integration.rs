@@ -202,57 +202,55 @@ fn run_phr(args: &[&str]) -> (bool, String, String) {
 ///   - Lone ESC chars (defensive — some terminals emit them as
 ///     cancel sequences)
 fn strip_ansi(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b != 0x1b {
-            // Pass through; re-encode as UTF-8 safely via String::push_str
-            // below in the surrogate escape branch.
-            out.push(b as char);
-            i += 1;
+    // Iterate by Unicode scalar value, not by byte: every ESC
+    // introducer / CSI parameter byte / final byte / BEL is in
+    // 0x00..=0x7f (i.e. 1-byte UTF-8), so char-level scanning
+    // works for the escape grammar AND preserves multi-byte UTF-8
+    // in the passthrough (the previous byte-level implementation
+    // pushed each 0x80..=0xff byte as a separate char, mangling
+    // sequences like '中' into several replacement codepoints).
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
             continue;
         }
-        // ESC: try to consume a known sequence shape. If we don't
-        // recognise the introducer, drop just the ESC and keep
-        // scanning — better to over-strip than to leave a stray
-        // `\x1b` in the output.
-        if i + 1 >= bytes.len() {
-            break;
-        }
-        let intro = bytes[i + 1];
-        match intro {
-            b'[' => {
-                // CSI: skip until final byte (0x40..=0x7e)
-                let mut j = i + 2;
-                while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
-                    j += 1;
-                }
-                i = if j < bytes.len() { j + 1 } else { j };
-            }
-            b']' | b'P' | b'^' | b'_' => {
-                // OSC / DCS / PM / APC: skip until BEL or ESC \\
-                let mut j = i + 2;
-                while j < bytes.len() {
-                    if bytes[j] == 0x07 {
-                        j += 1;
+        // ESC: dispatch on the introducer char.
+        match chars.next() {
+            Some('[') => {
+                // CSI: ESC [ <params 0x30-0x3f> <intermediate 0x20-0x2f>
+                // <final 0x40-0x7e>. We don't need to validate the
+                // intermediate classes — anything that's not the
+                // final byte yet is part of the sequence.
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&nc) {
                         break;
                     }
-                    if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
-                        j += 2;
+                }
+            }
+            Some(']') | Some('P') | Some('^') | Some('_') => {
+                // OSC / DCS / PM / APC: terminator is BEL (`\u{07}`)
+                // or ST (ESC `\`). We must consume both bytes of the
+                // ST terminator so the inner ESC doesn't re-trigger
+                // the outer match arm.
+                while let Some(nc) = chars.next() {
+                    if nc == '\u{07}' {
                         break;
                     }
-                    j += 1;
+                    if nc == '\u{1b}' && chars.next() == Some('\\') {
+                        break;
+                    }
                 }
-                i = j;
             }
-            b'=' | b'>' | b'}' => {
-                i += 2;
+            Some('=') | Some('>') | Some('}') => {
+                // DECKPAM / DECKPNM / etc. — single-char escapes,
+                // already consumed.
             }
             _ => {
-                // Unknown — drop just the ESC.
-                i += 1;
+                // Unknown introducer — drop just the lone ESC and
+                // let the outer loop resume from the next char.
             }
         }
     }
@@ -827,10 +825,30 @@ fn test_command_uname() {
     ];
     let (ok, stdout, stderr) = run_phr(&a);
     assert!(ok, "uname failed: {}", stderr);
+    // `uname -s` returns the kernel name: "Linux" on Linux,
+    // "Darwin" on macOS, "Windows_NT" / "MSYS_*" on Windows
+    // (GitHub's Windows runners report MSYS_NT-*). Hardcoding
+    // "Linux" made this test green on the ubuntu runner but
+    // broke on the macos-14 and windows-2022 runners after the
+    // matrix was widened — switch to a per-target expected token.
+    let expected = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        // GitHub's windows-2022 runner reports MSYS_NT-*; the
+        // bash-from-Git-Bash environment passhrs ends up in
+        // emits "MSYS_NT-10.0-20348 ...". A substring match on
+        // the kernel name ("nt" lowercased) is portable across
+        // MSYS, Cygwin, and pure cmd.exe invocations.
+        "nt"
+    } else {
+        "linux"
+    };
+    let lowered = stdout.to_lowercase();
     assert!(
-        stdout.to_lowercase().contains("linux"),
-        "should be Linux: {}",
-        stdout
+        lowered.contains(expected),
+        "uname -s should report {} on this platform: {}",
+        expected,
+        stdout,
     );
 }
 
