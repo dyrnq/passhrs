@@ -9,7 +9,7 @@
 # so no Local Security Policy tweak is required.
 [CmdletBinding()]
 param(
-    [string]$User = 'testuser',
+    [string]$User = 'runner',
     # PassTest1234# satisfies Windows password complexity (upper + lower
     # + digit + special, 13 chars). Same value used by every platform
     # setup script and the e2e tests so the test sshd authenticates
@@ -210,18 +210,16 @@ Write-Host "After lockdown, icacls ${HostKey}:"
 icacls $HostKey | Out-Host
 Write-Host "sshd -V: $sshdAfterUpgrade"
 
-# 6. Create testuser with a known password. The default $Pass value
-#    ('PassTest1234#') already satisfies Windows password complexity
-#    (upper + lower + digit + special, 13 chars), so no policy tweak
-#    is required.
+# 6. Set the runner user's password to the known test value. The
+#    `runner` user is created by the GitHub-hosted Windows image with
+#    admin privileges; we don't New-LocalUser it. Resetting the
+#    password via `net user` is the supported way and survives across
+#    re-runs. The default $Pass value ('PassTest1234#') already
+#    satisfies Windows password complexity (upper + lower + digit +
+#    special, 13 chars), so no policy tweak is required.
 if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
-    $secure = ConvertTo-SecureString $Pass -AsPlainText -Force
-    New-LocalUser -Name $User -Password $secure `
-        -Description 'Passhrs e2e test user' `
-        -PasswordNeverExpires `
-        -UserMayNotChangePassword | Out-Null
+    throw "FATAL: ${User} user not present (expected on GitHub Windows runner)"
 }
-# Always reset the password so re-runs are deterministic.
 & net user $User $Pass | Out-Null
 
 # 7. Allow testuser to authenticate via sshd: add to the SSH users group

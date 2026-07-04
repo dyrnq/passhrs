@@ -7,12 +7,19 @@
 # Debian/Ubuntu-based host with sudo.
 set -euo pipefail
 
-USER="testuser"
+USER="runner"
 # PassTest1234# meets Windows password complexity (upper + lower + digit
 # + special, 13 chars). The same value is used by every platform setup
 # script and the e2e tests so the test sshd always authenticates the
 # passhrs client with the same credentials.
 PASS="PassTest1234#"
+# NOTE: USER used to be 'testuser' (created via useradd). The macOS
+# setup hit a wall because macOS's pam_sacl.so + pam_opendirectory
+# require SACL authorizationdb grants that we couldn't easily write
+# from the setup script. Switched all platforms to the pre-existing
+# `runner` user (GitHub-hosted runners ship with this account;
+# Linux has /home/runner, macOS has /Users/runner, Windows has
+# C:\Users\runner). We just chpasswd it.
 PORT="22222"
 HOST="127.0.0.1"
 SSHD_CFG_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -59,9 +66,13 @@ if [ ! -f "${HOST_KEY}" ]; then
     ssh-keygen -t ed25519 -f "${HOST_KEY}" -N "" -q
 fi
 
-# 5. Create testuser with the known password (no-op if it already exists).
+# 5. Set the runner user's password to the known test value. The
+#    runner user is created by the GitHub-hosted Ubuntu image; we
+#    don't useradd it. Setting the password via chpasswd is the
+#    supported way and survives across re-runs.
 if ! id "${USER}" >/dev/null 2>&1; then
-    sudo useradd -m -s /bin/sh "${USER}"
+    echo "FATAL: ${USER} user not present (expected on GitHub Ubuntu runner)" >&2
+    exit 1
 fi
 echo "${USER}:${PASS}" | sudo chpasswd
 

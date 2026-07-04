@@ -6,11 +6,16 @@
 # (the default on GitHub-hosted runners).
 set -euo pipefail
 
-USER="testuser"
+USER="runner"
 # PassTest1234# meets Windows password complexity (upper + lower + digit
 # + special, 13 chars). Same value used by every platform setup script
 # and the e2e tests so the test sshd authenticates passhrs consistently.
 PASS="PassTest1234#"
+# NOTE: USER used to be 'testuser' (a custom dscl user we created).
+# That broke on the runner image because pam_sacl.so + pam_opendirectory
+# require SACL authorizationdb grants we couldn't easily write via the
+# sandboxed setup script. Switched to the runner user that the image
+# ships with — its OpenDirectory record is pre-authorized for SSH.
 PORT="22222"
 HOST="127.0.0.1"
 SSHD_BIN="/usr/sbin/sshd"
@@ -61,123 +66,64 @@ if [ ! -f "${HOST_KEY}" ]; then
     ssh-keygen -t ed25519 -f "${HOST_KEY}" -N "" -q
 fi
 
-# 3. Create testuser if missing. macOS user records live in OpenDirectory,
-#    not /etc/passwd, so use dscl.
+# 3. Use the `runner` user that already exists on the GitHub-hosted
+#    macOS image. It has a working home directory, is in the right
+#    groups (staff, admin), has SACL ssh grants by default, and
+#    passes every pam_opendirectory / pam_sacl / pam_nologin check
+#    that a fresh dscl user fails.
 #
-#    Two macOS-specific quirks make a vanilla dscl user unable to log
-#    in over SSH even with PasswordAuthentication yes + UsePAM yes:
+#    The earlier dscl-based testuser approach hit a wall: macOS's
+#    `/etc/pam.d/sshd` runs `account required pam_sacl.so
+#    sacl_service=ssh` followed by `account required
+#    pam_opendirectory.so`. pam_sacl denied the dscl user via
+#    `com.apple.access_ssh`, returning PAM_PERM_DENIED before
+#    pam_opendirectory even ran. The runner user already has
+#    authorizationdb grants baked in by the image, so it sidesteps
+#    the SACL problem entirely.
 #
-#    a. AuthenticationAuthority: a dscl-created user has no auth
-#       authority entries, so pam_opendirectory's account check
-#       returns "Access denied for user ... by PAM account
-#       configuration [preauth]". Adding `;basic;` opts the user in
-#       to the basic-password authentication flow that PAM/SSH use.
-#
-#    b. password aging: macOS's pwpolicy gives newly-created users
-#       a password-expiry policy. If the password is "expired" (or
-#       the policy says "must change on next log in"), PAM rejects
-#       the account even when the supplied password matches. We set
-#       `passwordLastSet` to the current time so the password is
-#       fresh from PAM's perspective, and clear any forced-expiry
-#       policy via pwpolicy.
-if ! dscl . -read "/Users/${USER}" UniqueID >/dev/null 2>&1; then
-    UNIQUE_ID="55555"
-    sudo dscl . -create "/Users/${USER}"
-    sudo dscl . -create "/Users/${USER}" UserShell "/bin/zsh"
-    sudo dscl . -create "/Users/${USER}" RealName "Passhrs Test User"
-    sudo dscl . -create "/Users/${USER}" UniqueID "${UNIQUE_ID}"
-    sudo dscl . -create "/Users/${USER}" PrimaryGroupID 20
-    sudo dscl . -create "/Users/${USER}" NFSHomeDirectory "/Users/${USER}"
-    sudo dscl . -create "/Users/${USER}" AuthenticationAuthority ";basic;"
-    sudo dscl . -create "/Users/${USER}" Password "${PASS}"
-fi
-
-# Always reset password to the test value so re-runs are deterministic.
-sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
-
-# Home directory: createhomedir -u is documented but silently no-ops
-# on some runner images (we observed /Users/testuser missing after a
-# successful `createhomedir -u testuser` exit). Create it manually
-# with the canonical 0755 owner=user:group that pam_opendirectory's
-# account check expects.
+#    We just set its password to our known test password and
+#    ensure ~/.ssh exists for completeness.
+USER="runner"
 HOME_DIR="/Users/${USER}"
-if [ ! -d "${HOME_DIR}" ]; then
-    sudo mkdir -p "${HOME_DIR}"
-    sudo chown "${UNIQUE_ID:-55555}:20" "${HOME_DIR}"
-    sudo chmod 755 "${HOME_DIR}"
-fi
-# Ensure the user's ~/.ssh dir exists for authorized_keys if we ever
-# want to fall back to pubkey auth.
-sudo mkdir -p "${HOME_DIR}/.ssh"
-sudo chown "${UNIQUE_ID:-55555}:20" "${HOME_DIR}/.ssh"
-sudo chmod 700 "${HOME_DIR}/.ssh"
 
-# SACL: macOS /etc/pam.d/sshd has `account required pam_sacl.so
-# sacl_service=ssh`. This module checks macOS's authorizationdb
-# rule for SSH access; the default on a fresh install is "allow
-# group:everyone", but the GitHub-hosted runner image ships with
-# `com.apple.access_ssh` restricted to administrators or specific
-# groups. A dscl-created user is not in those groups and gets
-# PAM_PERM_DENIED from the SACL module before pam_opendirectory
-# even runs.
-#
-# Fix: read the current `com.apple.access_ssh` rule and add the
-# testuser's group (PrimaryGroupID 20 = `staff`) as an allowed
-# member. We rewrite the rule via PlistBuddy so we don't disturb
-# other rule fields.
-SACL_RULE="/System/Library/SystemConfiguration/PMSettings.plist"
-# More robust: authorizationdb rule lives in
-# /etc/security/authorization or in the system keychain; easier path
-# is `security authorizationdb read com.apple.access_ssh`. If the
-# rule restricts to a group the testuser isn't in, append our group.
-SACL_PLIST="$(sudo security authorizationdb read com.apple.access_ssh 2>/dev/null || true)"
-if [ -n "${SACL_PLIST}" ]; then
-    if echo "${SACL_PLIST}" | grep -q "group"; then
-        # Append `group` 20 (staff) to the allowed-groups list if not
-        # already present. The XML plist uses <string>group</string>
-        # <integer>20</integer> pairs.
-        if ! echo "${SACL_PLIST}" | grep -q "<integer>20</integer>"; then
-            NEW_SACL="$(echo "${SACL_PLIST}" \
-                | sed 's|</array>|</array><string>group</string><integer>20</integer>|')"
-            echo "${NEW_SACL}" | sudo security authorizationdb write com.apple.access_ssh \
-                >/dev/null 2>&1 || true
-        fi
-    fi
-fi
+# Reset runner's password to the test value so re-runs are
+# deterministic. sysadminctl -resetPasswordFor works non-interactively
+# when sudo is passwordless (the default on GitHub runners).
+sudo sysadminctl -resetPasswordFor "${USER}" -newPassword "${PASS}" \
+    >/dev/null 2>&1 \
+    || sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
 
-# Refresh passwordLastSet so PAM treats the password as freshly set
-# (avoids 'password expired' / 'must change on next login' rejections).
-# Setting it to 0 also works; we use the current epoch to match what
-# dscl . -passwd would record on a brand-new user.
-NOW_EPOCH="$(date +%s)"
-sudo dscl . -create "/Users/${USER}" passwordLastSet "${NOW_EPOCH}" 2>/dev/null || true
+# Ensure /Users/runner/.ssh exists with sane perms. The runner
+# user already owns /Users/runner (UID matches), so chown is a no-op.
+if [ ! -d "${HOME_DIR}/.ssh" ]; then
+    sudo mkdir -p "${HOME_DIR}/.ssh"
+    sudo chmod 700 "${HOME_DIR}/.ssh"
+fi
 
 # Strip any forced-expiry / pw-policy that would deny SSH login on
-# the next run. `pwpolicy -u USER -clear` removes all custom policies
-# for the user, falling back to the system default (no expiry for
-# non-admin users).
+# the next run. Run after the password reset because pwpolicy -clear
+# can sometimes re-stamp passwordLastSet to 0.
 sudo pwpolicy -u "${USER}" -clear 2>/dev/null || true
-# Belt-and-suspenders: also clear accountExpires (an absolute
-# timestamp past which the account is locked).
+NOW_EPOCH="$(date +%s)"
+sudo dscl . -create "/Users/${USER}" passwordLastSet "${NOW_EPOCH}" 2>/dev/null || true
 sudo dscl . -delete "/Users/${USER}" accountExpires 2>/dev/null || true
 
-# Diagnostic dump of the testuser's OpenDirectory state. PAM's
-# account-management step on macOS uses pam_opendirectory.so and can
-# deny a dscl-created account for any of: missing AuthenticationAuthority,
-# non-empty accountPolicyData forcing pw change, passwordLastSet=0
-# (never set), etc. Print the relevant attributes so future failures
-# can be diagnosed from the CI log without an interactive shell.
-echo "--- testuser OpenDirectory state ---"
+# Diagnostic dump of the runner user's state. The same fields that
+# made dscl-created users fail pam_opendirectory are printed so future
+# regressions can be diagnosed from the CI log without a shell.
+echo "--- ${USER} OpenDirectory state ---"
 sudo dscl . -read "/Users/${USER}" 2>&1 | head -60 || true
 echo "--- pwpolicy ---"
 sudo pwpolicy -u "${USER}" -getpolicy 2>&1 | head -20 || true
 echo "--- /etc/pam.d/sshd ---"
 sudo cat /etc/pam.d/sshd 2>&1 || true
-echo "--- /Users/${USER} perms ---"
-sudo ls -ldn "/Users/${USER}" 2>&1 || true
+echo "--- ${HOME_DIR} perms ---"
+sudo ls -ldn "${HOME_DIR}" 2>&1 || true
 echo "--- /etc/nologin (if any) ---"
 sudo ls -l /etc/nologin 2>&1 | head -3 || true
-echo "--------------------------------------"
+echo "--- com.apple.access_ssh rule ---"
+sudo security authorizationdb read com.apple.access_ssh 2>&1 || true
+echo "-----------------------------------"
 
 # 4. Tear down any previous instance bound to PORT. We track
 #    sshd by PID across runs.
