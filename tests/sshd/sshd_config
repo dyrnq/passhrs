@@ -46,22 +46,22 @@ MaxSessions 100
 # auth path on shared CI networks and produce flakes.
 UseDNS no
 
-# Disable OpenSSH 9.2+ per-source connection-rate penalty. The test
-# suite hammers sshd with rapid back-to-back sessions all from
-# 127.0.0.1; srclimit's default config tags each connection as
-# 'no authentication attempted' or 'failed authentication' and
-# starts RST-ing new connections from 127.0.0.1 once a few seconds
-# of penalty have accumulated. The fix here is to disable srclimit
-# entirely — the source IP is loopback, the threat model is "our
-# own test binary" rather than "internet attacker", and the
-# MaxStartups knob above already handles the connection-count
-# dimension that srclimit overlaps with.
-# (Brew openssh on macos-14 is 9.8p1 by default; the in-repo
-# Ubuntu/Debian openssh is similar. This directive is a no-op on
-# OpenSSH < 9.2 — the parser ignores unknown keywords rather than
-# erroring out, which keeps setup-linux.sh/setup-windows.ps1 working
-# on older runners.)
-srclimit no
+# srclimit was disabled per the OpenSSH 9.2 per-source connection-rate
+# penalty discussion in commit 0771c57. However, the `srclimit no`
+# directive itself is rejected as a "Bad configuration option" by the
+# sshd binaries actually shipping on the CI runners — Ubuntu 24.04's
+# openssh-server 9.6p1 and Homebrew's openssh 10.3p1 — so this line is
+# now commented out to keep sshd's parser happy. The per-source rate
+# penalty is still present in 9.2+ defaults; if a future CI flake is
+# traced back to it (look for "Connection reset by peer (os error 54)"
+# mid-handshake from 127.0.0.1), reintroduce the directive under a
+# runtime-conditional that checks `sshd -T 2>&1 | grep -i srclimit` —
+# e.g. only emit `srclimit no` when sshd accepts the option — so older
+# builds skip the directive and newer builds opt out of the penalty.
+# (MaxStartups above already handles the connection-count dimension
+# that srclimit would overlap with, so most loops should be safe even
+# without disabling it.)
+# srclimit no
 
 # Quiet logging. Tests observe passhrs behavior, not sshd diagnostics.
 LogLevel ERROR
