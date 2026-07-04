@@ -232,25 +232,43 @@ $svc = Get-Service -Name sshd -ErrorAction Stop
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 Set-Service -Name sshd -StartupType Manual
-Start-Service -Name sshd
+# Start-Service under `$ErrorActionPreference = 'Stop'` raises a
+# terminating error on failure, which would otherwise exit the script
+# before the readiness / diagnostic paths below fire. Wrap explicitly
+# to capture success/failure and emit the dump on failure.
+$sshdStartupOk = $false
+try {
+    Start-Service -Name sshd -ErrorAction Stop
+    $sshdStartupOk = $true
+} catch {
+    Write-Error "Start-Service sshd threw: $_"
+}
 Start-Sleep -Seconds 1
 
 # 10. Wait for port 22222 to accept connections.
-$ready = $false
-for ($i = 0; $i -lt 50; $i++) {
-    Start-Sleep -Milliseconds 200
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $client.Connect($ListenHost, $Port)
-        $client.Close()
-        $ready = $true
-        break
-    } catch {
-        # not ready yet
+if ($sshdStartupOk) {
+    $ready = $false
+    for ($i = 0; $i -lt 50; $i++) {
+        Start-Sleep -Milliseconds 200
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.Connect($ListenHost, $Port)
+            $client.Close()
+            $ready = $true
+            break
+        } catch {
+            # not ready yet
+        }
     }
 }
 
-if (-not $ready) {
+if (-not $sshdStartupOk) {
+    Write-Error "Start-Service sshd failed; emitting diagnostic dump:"
+} elseif (-not $ready) {
+    Write-Error "sshd did not accept connections within 10s; emitting diagnostic dump:"
+}
+
+if (-not $sshdStartupOk -or -not $ready) {
     Write-Error "sshd did not accept connections within 10s."
     Write-Error "Service status:"
     Get-Service -Name sshd | Format-List | Out-String | Write-Error
