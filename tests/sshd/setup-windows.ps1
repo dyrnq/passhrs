@@ -97,10 +97,15 @@ if ($LASTEXITCODE -ne 0) {
     throw "ssh-keygen -A failed (exit $LASTEXITCODE)"
 }
 
-# 5c. Re-lock each newly generated host key ACL as belt-and-suspenders,
-#     in case ssh-keygen's -A wrote anything loose. We keep the explicit
-#     overrides because the parent directory ACL already restricts the
-#     SIDs that can read the key.
+# 5c. Re-lock each newly generated host key ACL with the EXACT minimal
+#     shape OpenSSH 8.1p1's permission check accepts: owner + ONE ACE
+#     (FA for the owner). The check prints
+#       "Bad permissions. Try removing permissions for user: <SID>"
+#     for *each* non-owner ACE in the DACL, so adding Administrators
+#     or NT SERVICE\sshd as additional SIDs makes sshd reject the key
+#     even though those SIDs are tightly scoped. The sshd service runs
+#     in the LocalSystem context, which matches the SYSTEM owner here,
+#     so it can read the key without any other ACE.
 Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*_key' -Force | ForEach-Object {
     $keyFile = $_.FullName
     takeown /F $keyFile /A | Out-Null
@@ -109,13 +114,9 @@ Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*_key' -Force | ForEach-Object {
     foreach ($rule in @($keyAcl.Access)) {
         $keyAcl.RemoveAccessRuleSpecific($rule)
     }
-    $sshdSvcSid = (New-Object System.Security.Principal.NTAccount('NT SERVICE', 'sshd')
-        ).Translate([System.Security.Principal.SecurityIdentifier])
-    foreach ($sid in @($systemSid, $adminsSid, $sshdSvcSid)) {
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $sid, 'FullControl', 'Allow')
-        $keyAcl.AddAccessRule($rule)
-    }
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $systemSid, 'FullControl', 'Allow')
+    $keyAcl.AddAccessRule($rule)
     $keyAcl.SetOwner($systemSid)
     Set-Acl -Path $keyFile -AclObject $keyAcl
 }
@@ -180,19 +181,21 @@ if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
 }
 Add-LocalGroupMember -Group $group -Member $User -ErrorAction SilentlyContinue
 
-# 8. Validate the config syntactically before launching sshd. `sshd -t`
-#    parses the file and exits non-zero on any error, printing the
-#    offending line to stderr.
-& sshd -t -f $SshdCfg
-if ($LASTEXITCODE -ne 0) {
-    throw "sshd config validation failed (exit $LASTEXITCODE)"
-}
+# 8. Skip the usual `sshd -t -f $SshdCfg` syntax check. The runner user
+#    (Administrator) cannot read the SYSTEM-owned host key that the
+#    config points to, so sshd -t fails with the same "Bad permissions"
+#    warning even when the key ACL is correct for the SSH service. The
+#    Start-Service + port-readiness wait below serves as the validation:
+#    if sshd could not load the keys (any ACL issue or config parse
+#    error), the service exits and 127.0.0.1:22222 is never bound.
 
 # 9. Start sshd via the Windows service that the OpenSSH capability
 #    installs. The service reads $SshdCfg by default (this is where the
 #    installer expects it). Starting via the service avoids the
 #    process-lifecycle quirks of `Start-Process` with -D (the daemon
-#    mode the Windows sshd build does not reliably support).
+#    mode the Windows sshd build does not reliably support). The
+#    service runs as LocalSystem, which is the owner of the host key
+#    file so the OpenSSH permission check now accepts the key.
 $svc = Get-Service -Name sshd -ErrorAction Stop
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
