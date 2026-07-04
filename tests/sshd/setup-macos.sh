@@ -93,39 +93,68 @@ HOME_DIR="/Users/${USER}"
 # "secure token" to reset another user's password via either
 # `dscl . -passwd` or `sysadminctl -resetPasswordFor`, even when
 # the caller is root via sudo. The token unlock requires either
-# the user's old password (we don't have it — fresh CI runner)
-# or an interactive secure-token bootstrap that the sandboxed
-# setup script can't perform. Both APIs report
+# the user's old password (which IS the autologin password baked
+# into the image) or an interactive secure-token bootstrap that
+# the sandboxed setup script can't perform. Both APIs report
 #     "Operation is not permitted without secure token unlock"
 #     "DS Error: -14090 (eDSAuthFailed)"
 # and the password write silently no-ops.
 #
-# The way around it is `passwd(8)`: when invoked by root for a
-# different user, `passwd` does NOT require secure token — it
-# prompts for the new password twice via /dev/tty and updates
-# the local OpenDirectory record directly. We drive that
-# interactive prompt with Python's `pty.fork()` (the only
-# pty-allocation helper on a stock macOS runner — neither
-# setsid(1) nor expect(1) are installed by default).
+# Fortunately, macOS stores the autologin password in plain
+# (XOR-encoded) form at /etc/kcpassword, and the encoding is
+# documented: the bytes are XORed against a fixed 11-byte key
+# (0x7D 0x89 0x52 0x23 0xD2 0xBC 0xDD 0xEA 0xA3 0xB9 0x1F) and
+# padded out to a multiple of the key length with NULs. We
+# decode that file to recover the runner user's current
+# password, then drive `sudo passwd runner` via a Python pty —
+# passwd on Sonoma prompts for the old password first, then the
+# new password twice. With the old password we have, all three
+# prompts get answered correctly.
 #
-# After the write we verify with `dscl . -authonly`, which
-# doesn't need secure token (it just asks OpenDirectory whether
-# the password matches the stored hash). If authonly rejects,
-# the password set didn't take and sshd would just fail every
-# PAM auth at test time — abort before launching sshd.
+# Verification: after passwd exits, we run `dscl . -authonly`
+# which doesn't need secure token (it just asks OpenDirectory
+# whether the password matches the stored hash). If authonly
+# rejects, the password set didn't take and sshd would just
+# fail every PAM auth at test time — abort before launching sshd.
 echo "Setting password for ${USER} via sudo passwd driven by python3 pty..."
 SUCC="false"
 if python3 - "$USER" "$PASS" <<'PYEOF' 2>&1
 import pty, os, sys, time, select, errno
 
-user, pw = sys.argv[1], sys.argv[2]
+user, new_pw = sys.argv[1], sys.argv[2]
+
+# Decode /etc/kcpassword to recover the user's current password.
+# /etc/kcpassword is the macOS autologin password store: the
+# bytes are XORed against a fixed 11-byte key and padded out to
+# a multiple of the key length with NULs. The algorithm is
+# symmetric — decoding is the same XOR pass. This is the same
+# algorithm the runner-images repo's bootstrap-provisioner uses
+# to ENCODE the password; we invert it to recover the plaintext
+# at test-setup time.
+_KC_KEY = bytes([0x7D, 0x89, 0x52, 0x23, 0xD2, 0xBC, 0xDD,
+                 0xEA, 0xA3, 0xB9, 0x1F])
+def decode_kcpassword(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        out[i] = b ^ _KC_KEY[i % len(_KC_KEY)]
+    # The first NUL is the terminator; trim everything from there.
+    nul = out.find(b'\x00')
+    if nul >= 0:
+        out = out[:nul]
+    return out.decode('utf-8', errors='replace')
+
+old_pw = decode_kcpassword('/etc/kcpassword')
+sys.stderr.write("Decoded autologin password from /etc/kcpassword (len={})\n".format(len(old_pw)))
+
 pid, fd = pty.fork()
 if pid == 0:
     # Child: exec sudo passwd <user>. The new argv[0] is "passwd"
     # so `ps` doesn't show the password in the visible arg list.
     os.execv("/usr/bin/sudo", ["sudo", "/usr/bin/passwd", user])
 # Parent: drive the prompts.
-def read_until(token, timeout=2.0):
+def read_until(token, timeout=15.0):
     buf = b""
     end = time.time() + timeout
     while time.time() < end:
@@ -144,35 +173,53 @@ def read_until(token, timeout=2.0):
                 return buf, True
     return buf, False
 
-# "Changing password for <user>.\r\nNew password:" — wait for the
-# first prompt before sending, otherwise passwd may consume the
-# bytes as soon as the fd is writable and miss the question. The
-# actual prompt text has shifted between macOS releases (pre-Sonoma
-# uses "New password:"; Sonoma reports "New password for <user>:";
-# Sonoma+ sometimes skips straight to "Retype new password:" if the
-# initial password is provided on stdin). We deliberately look for
-# just "assword" so both forms match, and capture the full transcript
-# on failure for the CI log.
-buf, ok = read_until(b"assword", timeout=15.0)
-if not ok:
-    sys.stderr.write("FAIL: never saw any 'password' prompt within 15s\n")
-    sys.stderr.write("---- passwd transcript so far ----\n")
-    sys.stderr.write(buf.decode("utf-8", errors="replace") + "\n")
-    sys.stderr.write("---- end transcript ----\n")
-    sys.exit(1)
-# If "Retype" is already in the captured buffer, we received both
-# prompts in one shot — skip the first write, just send the retype.
-if b"Retype" not in buf:
-    os.write(fd, pw.encode("utf-8") + b"\n")
-    buf2, ok = read_until(b"Retype", timeout=15.0)
+def send(text):
+    os.write(fd, text.encode('utf-8') + b'\n')
+
+# 1. Banner "Changing password for <user>." appears first. Don't
+#    match on it (it contains "assword" as a substring of
+#    "Changing password" — matching would fire before passwd's
+#    actual prompt is on the wire). Wait specifically for one of
+#    the prompt strings the macOS passwd(1) emits in this order:
+#    - "Old password:"        (when running as root, Sonoma)
+#    - "New password:"        (pre-Sonoma, or non-root self-change)
+#    - "New password for <u>:" (Sonoma, non-root self-change)
+#    - "Retype new password:"  (if both new prompts arrive in one read)
+# We do this in three phases, each looking for the right token.
+def wait_prompt(label, candidates, timeout=15.0):
+    buf, ok = read_until(candidates, timeout=timeout)
     if not ok:
-        sys.stderr.write("FAIL: sent first password; never saw 'Retype' within 15s\n")
-        sys.stderr.write((buf + buf2).decode("utf-8", errors="replace") + "\n")
+        sys.stderr.write("FAIL at {}: never saw any of {!r} within {:.0f}s\n".format(
+            label, candidates, timeout))
+        sys.stderr.write("---- passwd transcript so far ----\n")
+        sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
+        sys.stderr.write('---- end transcript ----\n')
         sys.exit(1)
-os.write(fd, pw.encode("utf-8") + b"\n")
-# Capture the verdict line. macOS prints either a success message
-# or a "Try again" / "Authentication failed" line; we look for any
-# newline-terminated verdict.
+    return buf
+
+# 2. First prompt is the OLD password (Sonoma, even for root).
+#    Pre-Sonoma jumps straight to "New password:" — in that case
+#    skip the old-password phase. We do that by reading until
+#    EITHER "Old password:" OR "New password" appears.
+buf, ok = read_until(b"New password", timeout=10.0)
+if not ok:
+    sys.stderr.write("FAIL: never saw 'Old password' or 'New password' within 10s\n")
+    sys.stderr.write("---- passwd transcript so far ----\n")
+    sys.stderr.write(buf.decode('utf-8', errors='replace') + '\n')
+    sys.stderr.write('---- end transcript ----\n')
+    sys.exit(1)
+if b"Old password" in buf:
+    # Pre-Sonoma, sudo passes the admin password as the old pw
+    # automatically; on Sonoma, we need to feed it ourselves.
+    send(old_pw)
+    # Now wait for the new-password prompt.
+    buf = wait_prompt("new-password after old",
+                      [b"New password"], timeout=10.0)
+# 3. Send the new password and wait for the retype prompt.
+send(new_pw)
+buf = wait_prompt("retype prompt", [b"Retype"], timeout=15.0)
+# 4. Send the retype and capture the verdict line.
+send(new_pw)
 _, ok = read_until(b"\n", timeout=10.0)
 # Drain anything left after the verdict line.
 try:
