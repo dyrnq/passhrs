@@ -146,17 +146,34 @@ def read_until(token, timeout=2.0):
 
 # "Changing password for <user>.\r\nNew password:" — wait for the
 # first prompt before sending, otherwise passwd may consume the
-# bytes as soon as the fd is writable and miss the question.
-_, ok = read_until(b"New password:", timeout=5.0)
+# bytes as soon as the fd is writable and miss the question. The
+# actual prompt text has shifted between macOS releases (pre-Sonoma
+# uses "New password:"; Sonoma reports "New password for <user>:";
+# Sonoma+ sometimes skips straight to "Retype new password:" if the
+# initial password is provided on stdin). We deliberately look for
+# just "assword" so both forms match, and capture the full transcript
+# on failure for the CI log.
+buf, ok = read_until(b"assword", timeout=15.0)
 if not ok:
-    sys.exit("timeout waiting for 'New password:' prompt")
+    sys.stderr.write("FAIL: never saw any 'password' prompt within 15s\n")
+    sys.stderr.write("---- passwd transcript so far ----\n")
+    sys.stderr.write(buf.decode("utf-8", errors="replace") + "\n")
+    sys.stderr.write("---- end transcript ----\n")
+    sys.exit(1)
+# If "Retype" is already in the captured buffer, we received both
+# prompts in one shot — skip the first write, just send the retype.
+if b"Retype" not in buf:
+    os.write(fd, pw.encode("utf-8") + b"\n")
+    buf2, ok = read_until(b"Retype", timeout=15.0)
+    if not ok:
+        sys.stderr.write("FAIL: sent first password; never saw 'Retype' within 15s\n")
+        sys.stderr.write((buf + buf2).decode("utf-8", errors="replace") + "\n")
+        sys.exit(1)
 os.write(fd, pw.encode("utf-8") + b"\n")
-_, ok = read_until(b"Retype new password:", timeout=2.0)
-if not ok:
-    sys.exit("timeout waiting for 'Retype new password:' prompt")
-os.write(fd, pw.encode("utf-8") + b"\n")
-# Capture the final lines (success / failure verdict).
-_, ok = read_until(b"\n", timeout=5.0)
+# Capture the verdict line. macOS prints either a success message
+# or a "Try again" / "Authentication failed" line; we look for any
+# newline-terminated verdict.
+_, ok = read_until(b"\n", timeout=10.0)
 # Drain anything left after the verdict line.
 try:
     while True:
