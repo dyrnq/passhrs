@@ -125,19 +125,22 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: sudo ./tests/sshd/setup-linux.sh
 
-      - name: Probe Docker-on-macOS via colima (macOS)
+      - name: Provision sshd via Homebrew openssh + key auth (macOS)
         # Replaces the previous native-sshd provision on macos-14.
         # macOS Sonoma+ secure-token lockout makes the native
         # testuser password path fundamentally unreliable (dscl
         # . -passwd, sysadminctl -resetPasswordFor, and passwd all
         # fail unless you supply the user's old password). Instead
-        # of fighting it, this step installs colima + docker CLI
-        # and starts a Lima VM so the next iteration can run a
-        # Linux openssh-server container on 127.0.0.1:22222.
+        # of fighting it, this step installs Homebrew's openssh,
+        # drops an ed25519 public key into testuser's
+        # authorized_keys (key auth bypasses the password path
+        # entirely), and configures sshd with PasswordAuthentication
+        # no so any future regression that re-enables password tries
+        # fails fast with a clear "Permission denied (publickey)".
         # Linux and Windows continue to use their native sshd
-        # provisions — this probe is macOS-only.
+        # provisions — this is macOS-only.
         if: matrix.os == 'macos-14'
-        run: sudo ./tests/sshd/setup-macos-docker.sh
+        run: sudo ./tests/sshd/setup-macos-brew-openssh.sh
 
       - name: Provision native sshd (Windows)
         if: matrix.os == 'windows-2022'

@@ -68,8 +68,51 @@ fn sshd_ok() -> bool {
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
+/// Authentication arguments prepended to every `run_phr` call.
+///
+/// Linux + Windows keep the original `--password PASS` shape — the
+/// native sshd is configured with `PasswordAuthentication yes` and the
+/// runner's password is reset to PASS via chpasswd / Set-LocalUser.
+///
+/// macOS pivots to SSH key auth. Sonoma+ secure-token lockout blocks
+/// every password-set API for a freshly-created user (dscl . -passwd,
+/// sysadminctl -resetPasswordFor, passwd) from a non-interactive CI
+/// script — see tests/sshd/setup-macos-brew-openssh.sh for the long
+/// version. The brew-openssh setup script drops an ed25519 public key
+/// into testuser's authorized_keys and exports the matching private
+/// key path via the `PHR_TEST_KEY` env var (written to `$GITHUB_ENV`
+/// so it survives across CI steps). When that's set, we use it;
+/// otherwise we fall back to the password path.
+fn auth_args() -> Vec<String> {
+    if let Ok(key) = std::env::var("PHR_TEST_KEY") {
+        vec!["-i".to_string(), key]
+    } else {
+        vec!["--password".to_string(), PASS.to_string()]
+    }
+}
+
 fn run_phr(args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(BIN).args(args).output().expect("run passhrs");
+    // Auth args used to live inline in every test's arg array
+    // (`"--password", PASS,`). They moved here so a single env-var
+    // flip (PHR_TEST_KEY) switches the entire test binary from
+    // password auth (Linux/Windows) to key auth (macOS) without
+    // touching 30 call sites.
+    //
+    // Smart-inject: if the caller already passed `--password` or
+    // `-i` we don't double up. That covers the password-from-file
+    // test, which legitimately needs `--password @/path/to/file`
+    // on Linux/Windows (auth_args would otherwise inject a second
+    // `--password PassTest1234!` first).
+    let caller_has_auth = args.iter().any(|a| *a == "--password" || *a == "-i");
+    let mut full_args = Vec::new();
+    if !caller_has_auth {
+        full_args.extend(auth_args());
+    }
+    full_args.extend(args.iter().map(|s| s.to_string()));
+    let output = Command::new(BIN)
+        .args(&full_args)
+        .output()
+        .expect("run passhrs");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -96,8 +139,6 @@ fn test_basic_command_exec() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -132,8 +173,6 @@ fn test_push_pull_file() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -154,8 +193,6 @@ fn test_push_pull_file() {
     let a2 = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -197,8 +234,6 @@ fn test_push_dir() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -257,8 +292,6 @@ fn test_rsync_upload_basic() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -310,8 +343,6 @@ fn test_rsync_delta() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -346,8 +377,6 @@ fn test_rsync_with_exclude() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -387,8 +416,6 @@ fn test_exec_env_remote() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -408,6 +435,7 @@ fn test_exec_env_remote() {
 // 密码从文件读取集成测试
 // ======================================================================
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_password_from_file_integration() {
@@ -483,8 +511,6 @@ fn test_connect_timeout_integration() {
         .args([
             "--connect-timeout",
             "3",
-            "--password",
-            PASS,
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -515,8 +541,6 @@ fn test_command_exit_code_zero() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -539,8 +563,6 @@ fn test_command_multiple_args() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -573,8 +595,6 @@ fn test_command_uname() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -603,8 +623,6 @@ fn test_command_which() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -629,8 +647,6 @@ fn test_command_yes_head() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -659,8 +675,6 @@ fn test_command_compress_flag() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-C",
         "-o",
         "StrictHostKeyChecking=no",
@@ -690,8 +704,6 @@ fn test_command_with_pty() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -719,8 +731,6 @@ fn test_ps_with_pipe() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -749,8 +759,6 @@ fn test_force_tty_flag() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -780,8 +788,6 @@ fn test_command_with_dest_ipv6() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -811,8 +817,6 @@ fn test_local_forward_spawn() {
         .args([
             "-p",
             PORT,
-            "--password",
-            PASS,
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -842,8 +846,6 @@ fn test_socks5_proxy_spawn() {
         .args([
             "-p",
             PORT,
-            "--password",
-            PASS,
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -873,8 +875,6 @@ fn test_http_connect_proxy_spawn() {
         .args([
             "-p",
             PORT,
-            "--password",
-            PASS,
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -908,8 +908,6 @@ fn test_fork_background() {
         .args([
             "-p",
             PORT,
-            "--password",
-            PASS,
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
@@ -939,8 +937,6 @@ fn test_multiple_ssh_options() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
@@ -970,8 +966,6 @@ fn test_verbose_quiet_flags() {
     let a_vv = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-vv",
         "-o",
         "StrictHostKeyChecking=no",
@@ -990,8 +984,6 @@ fn test_verbose_quiet_flags() {
     let a_q = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-q",
         "-o",
         "StrictHostKeyChecking=no",
@@ -1020,8 +1012,6 @@ fn test_proxy_jump_self() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-J",
         &format!("{}:{}", HOST, PORT),
         "-o",
@@ -1090,8 +1080,6 @@ fn test_locale_env_forwarded() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-t",
         "-o",
         "StrictHostKeyChecking=no",
@@ -1132,8 +1120,6 @@ fn test_unrelated_env_not_forwarded() {
     let a = [
         "-p",
         PORT,
-        "--password",
-        PASS,
         "-t",
         "-o",
         "StrictHostKeyChecking=no",
