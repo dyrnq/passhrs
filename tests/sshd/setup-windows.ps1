@@ -267,7 +267,7 @@ if (-not $ready) {
     Write-Error "sshd.exe on disk reports version:"
     & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | ForEach-Object { Write-Error $_ }
 
-    Write-Error "sshd -t -f $SshdCfg:"
+    Write-Error "sshd -t -f ${SshdCfg}:"
     & sshd -t -f $SshdCfg 2>&1 | ForEach-Object { Write-Error $_ }
 
     Write-Error "sshd -ddd (debug):"
