@@ -166,9 +166,21 @@ jobs:
               "/var/log/auth.log"; do
               if [ -e "$log" ]; then
                   echo "=== sshd log: $log ==="
-                  sudo -n tail -n 200 "$log" 2>/dev/null \
-                      || tail -n 200 "$log" 2>/dev/null \
-                      || true
+                  # Dump the FULL log on macOS so we see the debug
+                  # lines around the auth attempt (PAM module list,
+                  # each module's verdict) — tailing loses the
+                  # earlier context that's the difference between
+                  # "fix dscl" and "fix sshd_config".
+                  if [ "$log" = "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log" ] \
+                      || [ "$log" = "/tmp/passhrs-test-sshd/sshd.log" ]; then
+                      sudo -n cat "$log" 2>/dev/null \
+                          || cat "$log" 2>/dev/null \
+                          || true
+                  else
+                      sudo -n tail -n 200 "$log" 2>/dev/null \
+                          || tail -n 200 "$log" 2>/dev/null \
+                          || true
+                  fi
               fi
           done
           # Also dump the rendered sshd_config so we can see what
