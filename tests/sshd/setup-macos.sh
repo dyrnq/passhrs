@@ -66,10 +66,17 @@ sudo dscl . -passwd "/Users/${USER}" "${PASS}" >/dev/null
 #    plist rather than killing by PID: a stale label might still
 #    own an orphaned sshd whose pidfile was cleared by a previous
 #    failed run, and we'd rather launchctl revoke it cleanly.
+#
+#    The `user/$(id -u)` domain is the correct non-GUI session
+#    domain — `gui/$(id -u)` requires a WindowServer / Aqua session
+#    that the GitHub Actions macOS runner does not have (bootstrap
+#    fails with exit 125 / "Domain does not support specified
+#    action"). `user/<uid>` is the equivalent for headless sessions
+#    and has been the supported path since macOS 10.10.
 PLIST="${HOME}/Library/LaunchAgents/com.passhrs.test-sshd.plist"
 mkdir -p "$(dirname "${PLIST}")"
-GUI_DOMAIN="gui/$(id -u)"
-sudo launchctl bootout "${GUI_DOMAIN}" "${PLIST}" 2>/dev/null || true
+LAUNCHD_DOMAIN="user/$(id -u)"
+sudo launchctl bootout "${LAUNCHD_DOMAIN}" "${PLIST}" 2>/dev/null || true
 # Belt-and-suspenders: also kill any orphaned sshd bound to PORT
 # from an even earlier run that pre-dated the launchd path.
 if [ -f "${SSHD_PID_FILE}" ]; then
@@ -144,7 +151,7 @@ EOF
 
 # Submit the new job. launchd will launch sudo -> sshd immediately
 # because RunAtLoad=true.
-sudo launchctl bootstrap "${GUI_DOMAIN}" "${PLIST}"
+sudo launchctl bootstrap "${LAUNCHD_DOMAIN}" "${PLIST}"
 
 # 6. Wait for the daemon to accept connections (max 10s).
 SSHD_PID=""
@@ -162,6 +169,6 @@ for i in $(seq 1 50); do
 done
 
 echo "FATAL: sshd did not start within 10s" >&2
-sudo launchctl bootout "${GUI_DOMAIN}" "${PLIST}" 2>/dev/null || true
+sudo launchctl bootout "${LAUNCHD_DOMAIN}" "${PLIST}" 2>/dev/null || true
 tail -n 50 "${SSHD_LOG}" >&2 || true
 exit 1
