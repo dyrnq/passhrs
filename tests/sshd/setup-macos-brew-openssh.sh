@@ -281,6 +281,15 @@ fi
 # into a brand-new session + pgid that the runner's step-cleanup
 # doesn't target. -D keeps sshd in the foreground of its new
 # session so we get a stable PID for liveness + teardown.
+#
+# Pre-create the log file with world-readable mode BEFORE launching
+# sshd (same rationale as setup-linux.sh step 6b). sshd opens -E
+# targets with O_APPEND — it doesn't set the mode bits — so the
+# 644 we set here is what the unprivileged `Upload sshd log (unix)`
+# step in ci.yml will see. Letting sshd create it as root 600 hits
+# EACCES on the upload step.
+sudo install -m 644 /dev/null "${SSHD_LOG}"
+
 SSHD_PID=$(
     python3 -c '
 import os, sys
@@ -304,13 +313,6 @@ os.execv(argv[0], argv)
         -D
 )
 echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
-# sshd created the log file via sudo — root-owned, mode 600. The
-# `Upload sshd log (unix)` step in ci.yml runs as the unprivileged
-# runner user and would hit EACCES trying to read it. chmod 644 so
-# the artifact upload succeeds (the log contains only hostnames,
-# usernames, and the libssh protocol transcript — fine for a
-# throwaway test environment).
-sudo chmod 644 "${SSHD_LOG}" || true
 echo "Launched detached sshd (pid=${SSHD_PID}, ${SSHD_BIN}) via python3 os.setsid"
 
 # ---- 10. wait for sshd to accept connections ----------------------------

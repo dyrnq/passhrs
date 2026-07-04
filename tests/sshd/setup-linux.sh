@@ -102,6 +102,16 @@ if [ -f "${SSHD_PID_FILE}" ]; then
     fi
 fi
 
+# 6b. Pre-create the log file with world-readable mode BEFORE sshd
+#     launches. sshd opens the -E target with O_APPEND (not O_CREAT
+#     with explicit mode), so the bits we set here are the bits that
+#     stick — sshd never re-chmods the log. If we let sshd create it,
+#     it ends up root:root mode 600, which the unprivileged
+#     `Upload sshd log (unix)` step in ci.yml can't read (EACCES). The
+#     log contains only hostnames, usernames, and the libssh
+#     transcript — fine for a throwaway test environment.
+sudo install -m 644 /dev/null "${SSHD_LOG}"
+
 # 7. Launch sshd in the background. -D keeps it in the foreground of the
 #    child process; we background the child so the script can return.
 sudo /usr/sbin/sshd \
@@ -112,13 +122,6 @@ sudo /usr/sbin/sshd \
     -D &
 SSHD_PID=$!
 echo "${SSHD_PID}" > "${SSHD_PID_FILE}"
-# sshd created the log file as root (we're under sudo). The
-# `Upload sshd log (unix)` step in ci.yml runs as the unprivileged
-# runner user, which can't read a root-owned /tmp file. chmod 644
-# so the upload step's EACCES goes away — the log itself contains
-# only hostnames, usernames, and the libssh protocol transcript,
-# nothing sensitive for a throwaway test environment.
-sudo chmod 644 "${SSHD_LOG}" || true
 
 # 8. Wait for the daemon to accept connections (max 10s).
 for i in $(seq 1 50); do
