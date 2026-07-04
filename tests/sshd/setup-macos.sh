@@ -122,6 +122,12 @@ echo "--- testuser OpenDirectory state ---"
 sudo dscl . -read "/Users/${USER}" 2>&1 | head -60 || true
 echo "--- pwpolicy ---"
 sudo pwpolicy -u "${USER}" -getpolicy 2>&1 | head -20 || true
+echo "--- /etc/pam.d/sshd ---"
+sudo cat /etc/pam.d/sshd 2>&1 || true
+echo "--- /Users/${USER} perms ---"
+sudo ls -ldn "/Users/${USER}" 2>&1 || true
+echo "--- /etc/nologin (if any) ---"
+sudo ls -l /etc/nologin 2>&1 | head -3 || true
 echo "--------------------------------------"
 
 # 4. Tear down any previous instance bound to PORT. We track
