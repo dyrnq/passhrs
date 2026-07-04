@@ -166,6 +166,14 @@ jobs:
         # diagnosis (uploaded as an artifact below, always — not
         # gated on `failure()` — so a green run's logs are still
         # available if a flake shows up on a later run).
+        #
+        # shell: bash — the script below uses `2>&1 | tee`, `${PIPESTATUS[0]}`
+        # etc. which are bash-only. Without this override, the windows-2022
+        # runner defaults to PowerShell, which doesn't recognise `2>&1`
+        # as redirection and fails with "The term '2>&1' is not recognized
+        # as a name of a cmdlet ...". Git Bash ships pre-installed on
+        # windows-2019/2022 GitHub-hosted runners, so this works.
+        shell: bash
         env:
           RUST_LOG: passhrs=debug
         run: |
