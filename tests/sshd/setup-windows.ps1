@@ -254,14 +254,37 @@ if (-not $ready) {
     Write-Error "sshd did not accept connections within 10s."
     Write-Error "Service status:"
     Get-Service -Name sshd | Format-List | Out-String | Write-Error
+
+    # Confirm the service really points to our upgraded binary. After
+    # overwriting inbox binaries in-place the path stays the same, but
+    # surface it so we know which sshd.exe was attempted.
+    $svcPath = (Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue).PathName
+    Write-Error "Service BinaryPathName: $svcPath"
+
+    Write-Error "sc.exe qc sshd:"
+    sc.exe qc sshd 2>&1 | ForEach-Object { Write-Error $_ }
+
+    Write-Error "sshd.exe on disk reports version:"
+    & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | ForEach-Object { Write-Error $_ }
+
+    Write-Error "sshd -t -f $SshdCfg:"
+    & sshd -t -f $SshdCfg 2>&1 | ForEach-Object { Write-Error $_ }
+
+    Write-Error "sshd -ddd (debug):"
+    & sshd -ddd 2>&1 | Out-String | Write-Error
+
     Write-Error "Recent sshd log entries:"
     if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Error }
+
     Write-Error "Windows Event Log (sshd):"
     Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Error $_.Message }
     Write-Error "Windows Event Log (System, sshd-related):"
     Get-WinEvent -LogName System -MaxEvents 50 -ErrorAction SilentlyContinue |
         Where-Object { $_.ProviderName -match 'sshd' -or $_.Message -match 'sshd' } |
+        ForEach-Object { Write-Error $_.Message }
+    Write-Error "Windows Event Log (Application, last 20):"
+    Get-WinEvent -LogName Application -MaxEvents 20 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Error $_.Message }
     exit 1
 }
