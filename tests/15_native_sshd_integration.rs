@@ -371,10 +371,10 @@ fn test_push_pull_file() {
         eprintln!("SKIP: no container");
         return;
     }
-    let local = "/tmp/phr_test_push.txt";
-    let remote = "/tmp/phr_remote_push.txt";
-    let local2 = "/tmp/phr_test_pulled.txt";
-    std::fs::write(local, b"hello sftp push").unwrap();
+    let local = format!("{}/phr_test_push.txt", tmp_root().display());
+    let remote = format!("{}/phr_remote_push.txt", tmp_root().display());
+    let local2 = format!("{}/phr_test_pulled.txt", tmp_root().display());
+    std::fs::write(&local, b"hello sftp push").unwrap();
 
     let spec1 = format!("{}:{}", local, remote);
     let d = dest();
@@ -412,13 +412,13 @@ fn test_push_pull_file() {
     ];
     let (ok3, _, stderr3) = run_phr(&a2);
     assert!(ok3, "pull failed: {}", stderr3);
-    let pulled = std::fs::read_to_string(local2).unwrap_or_default();
+    let pulled = std::fs::read_to_string(&local2).unwrap_or_default();
     assert!(
         pulled.contains("hello sftp push"),
         "pulled content mismatch"
     );
-    let _ = std::fs::remove_file(local);
-    let _ = std::fs::remove_file(local2);
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&local2);
     let _ = std::fs::remove_file(&remote);
 }
 
@@ -429,13 +429,13 @@ fn test_push_dir() {
         eprintln!("SKIP: no container");
         return;
     }
-    let dir = "/tmp/phr_test_pushdir";
-    let remote_dir = "/tmp/phr_remote_dir";
-    let _ = std::fs::create_dir_all(dir);
+    let dir = format!("{}/phr_test_pushdir", tmp_root().display());
+    let remote_dir = format!("{}/phr_remote_dir", tmp_root().display());
+    let _ = std::fs::create_dir_all(&dir);
     std::fs::write(format!("{}/a.txt", dir), b"file a").unwrap();
     let _ = std::fs::create_dir_all(format!("{}/sub", dir));
     std::fs::write(format!("{}/sub/c.txt", dir), b"file c").unwrap();
-    let _ = std::fs::remove_dir_all(remote_dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
 
     let spec = format!("{}/:{}", dir, remote_dir);
     let d = dest();
@@ -514,12 +514,12 @@ fn test_rsync_upload_basic() {
         eprintln!("SKIP: no container");
         return;
     }
-    let dir = "/tmp/phr_rsync_src";
-    let remote_dir = "/tmp/phr_rsync_dst";
-    let _ = std::fs::create_dir_all(dir);
+    let dir = format!("{}/phr_rsync_src", tmp_root().display());
+    let remote_dir = format!("{}/phr_rsync_dst", tmp_root().display());
+    let _ = std::fs::create_dir_all(&dir);
     std::fs::write(format!("{}/f1.txt", dir), b"rsync test file 1").unwrap();
     std::fs::write(format!("{}/f2.txt", dir), b"rsync test file 2").unwrap();
-    setup_rsync_remote(remote_dir);
+    setup_rsync_remote(remote_dir.as_str());
 
     let spec = format!("{}/:{}/", dir, remote_dir);
     let d = dest();
@@ -545,8 +545,8 @@ fn test_rsync_upload_basic() {
             f
         );
     }
-    let _ = std::fs::remove_dir_all(dir);
-    let _ = std::fs::remove_dir_all(remote_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
 #[test]
@@ -556,9 +556,9 @@ fn test_rsync_delta() {
         eprintln!("SKIP: no container");
         return;
     }
-    let remote_dir = "/tmp/phr_delta_dst";
-    let local_dir = "/tmp/phr_delta_src";
-    setup_rsync_remote(remote_dir);
+    let remote_dir = format!("{}/phr_delta_dst", tmp_root().display());
+    let local_dir = format!("{}/phr_delta_src", tmp_root().display());
+    setup_rsync_remote(remote_dir.as_str());
     // Seed the remote file. The native sshd host means we can write
     // directly and chmod world-writable so testuser can overwrite it
     // during the rsync delta test.
@@ -569,7 +569,7 @@ fn test_rsync_delta() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&remote_file, std::fs::Permissions::from_mode(0o666));
     }
-    let _ = std::fs::create_dir_all(local_dir);
+    let _ = std::fs::create_dir_all(&local_dir);
     std::fs::write(format!("{}/file.txt", local_dir), b"MODIFIED_CONTENT").unwrap();
 
     let spec = format!("{}/:{}/", local_dir, remote_dir);
@@ -588,8 +588,8 @@ fn test_rsync_delta() {
     ];
     let (ok, _, stderr) = run_phr(&a);
     assert!(ok, "rsync delta failed: {}", stderr);
-    let _ = std::fs::remove_dir_all(local_dir);
-    let _ = std::fs::remove_dir_all(remote_dir);
+    let _ = std::fs::remove_dir_all(&local_dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
 #[test]
@@ -599,12 +599,12 @@ fn test_rsync_with_exclude() {
         eprintln!("SKIP: no container");
         return;
     }
-    let dir = "/tmp/phr_rsync_excl";
-    let remote_dir = "/tmp/phr_rsync_excl_dst";
-    let _ = std::fs::create_dir_all(dir);
+    let dir = format!("{}/phr_rsync_excl", tmp_root().display());
+    let remote_dir = format!("{}/phr_rsync_excl_dst", tmp_root().display());
+    let _ = std::fs::create_dir_all(&dir);
     std::fs::write(format!("{}/keep.txt", dir), b"keep me").unwrap();
     std::fs::write(format!("{}/ignore.txt", dir), b"ignore me").unwrap();
-    setup_rsync_remote(remote_dir);
+    setup_rsync_remote(remote_dir.as_str());
 
     let spec = format!("{}/:{}/", dir, remote_dir);
     let d = dest();
@@ -677,8 +677,8 @@ fn test_password_from_file_integration() {
         eprintln!("SKIP: no container");
         return;
     }
-    let pw_path = "/tmp/phr_test_pw_file.txt";
-    std::fs::write(pw_path, PASS).unwrap();
+    let pw_path = format!("{}/phr_test_pw_file.txt", tmp_root().display());
+    std::fs::write(&pw_path, PASS).unwrap();
     let pw_file = format!("@{}", pw_path);
     let d = dest();
     let a = [
@@ -707,8 +707,8 @@ fn test_password_file_flag_integration() {
         eprintln!("SKIP: no container");
         return;
     }
-    let pw_path = "/tmp/phr_test_pw_flag.txt";
-    std::fs::write(pw_path, PASS).unwrap();
+    let pw_path = format!("{}/phr_test_pw_flag.txt", tmp_root().display());
+    std::fs::write(&pw_path, PASS).unwrap();
     let d = dest();
     let a = [
         "-p",
