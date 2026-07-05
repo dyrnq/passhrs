@@ -204,6 +204,26 @@ sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
 #     there authenticate via the runner account which has fully-formed
 #     PAM records and UsePAM no would break the password path.
 sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
+# Runtime-conditional `srclimit no`: OpenSSH 9.2+ adds a per-source-IP
+# connection-rate penalty that is ON by default. After 30+ back-to-back
+# test runs from 127.0.0.1 the cumulative penalty drops late-run
+# connections mid-handshake with ECONNRESET, breaking the last 2
+# integration tests. The `srclimit` config directive was added in
+# OpenSSH 9.8; the 9.6p1/10.3p1 binaries shipping on the runners
+# historically rejected it as "Bad configuration option", which is why
+# the template keeps it commented out. Probe sshd itself: if `sshd -T`
+# (which prints the effective config) mentions srclimit, this build
+# supports the directive and we can safely append `srclimit no` to
+# disable the penalty. Older builds (no srclimit line in -T output)
+# skip the append and inherit the 9.2+ default behaviour.
+if "${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1 | grep -qi '^srclimit'; then
+    echo "    sshd supports srclimit directive — appending 'srclimit no'"
+    cat >> "${SSHD_CFG}" <<EOF
+srclimit no
+EOF
+else
+    echo "    sshd lacks srclimit directive — keeping 9.2+ default penalty"
+fi
 cat >> "${SSHD_CFG}" <<EOF
 
 # --- passhrs CI overrides (Homebrew openssh + key auth) ---
