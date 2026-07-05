@@ -477,8 +477,35 @@ fn test_push_dir() {
 fn setup_rsync_remote(remote_dir: &str) {
     let _ = std::fs::remove_dir_all(remote_dir);
     std::fs::create_dir_all(remote_dir).expect("create remote rsync dir");
-    // No chown needed: testuser owns its own home and per-user temp dirs
-    // on the native sshd host.
+    // On native-sshd CI the remote dir is created by the runner user (the
+    // user that invokes cargo test), but passhrs authenticates as testuser
+    // over SFTP. testuser therefore cannot create files inside a
+    // runner-owned 0755 directory — `sftp.create(...)` returns
+    // Permission denied and the rsync test fails. (The container-based
+    // predecessor made the SFTP user the same UID as the test runner, so
+    // the dir was always writable and this never surfaced.) Force the
+    // remote dir world-writable so the cross-user SFTP write succeeds on
+    // every platform. No chown: chown would need sudo on Linux and a
+    // privileged helper on Windows; chmod is portable and the test dir
+    // is short-lived inside /tmp.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(remote_dir, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod 0o777 remote rsync dir");
+    }
+    #[cfg(windows)]
+    {
+        // Windows doesn't honour Unix mode bits; instead, ensure the
+        // directory ACL grants Everyone write access. Use std-only APIs
+        // so this works from the test binary without Win32 FFI.
+        let mut perms = std::fs::metadata(remote_dir)
+            .expect("stat remote rsync dir")
+            .permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(remote_dir, perms)
+            .expect("clear readonly on remote rsync dir");
+    }
 }
 
 #[test]
