@@ -503,8 +503,7 @@ fn setup_rsync_remote(remote_dir: &str) {
             .expect("stat remote rsync dir")
             .permissions();
         perms.set_readonly(false);
-        std::fs::set_permissions(remote_dir, perms)
-            .expect("clear readonly on remote rsync dir");
+        std::fs::set_permissions(remote_dir, perms).expect("clear readonly on remote rsync dir");
     }
 }
 
