@@ -188,10 +188,22 @@ echo "    sftp-server: ${SFTP_SERVER}"
 sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
     "${SSHD_CFG_TEMPLATE}" \
     > "${SSHD_CFG}"
-# OpenSSH honours the FIRST LogLevel it sees, so we have to delete
-# the template's `LogLevel ERROR` before appending DEBUG3 — otherwise
-# auth-failure context we'd want on failure is silently suppressed.
-sed -i '' '/^LogLevel /d' "${SSHD_CFG}"
+# OpenSSH honours the FIRST occurrence of each directive, so we have to
+# strip template defaults before appending per-run overrides.
+#   - `LogLevel ERROR`: replaced with DEBUG3 so SFTP subsystem session
+#     attempts and auth-failure context (PAM module verdicts, signature
+#     verify results) are visible when a future regression hits us.
+#   - `UsePAM yes`: replaced with `UsePAM no` because macOS's dscl-built
+#     testuser has no secure-token attached — pam_opendirectory.so's
+#     account phase then unconditionally returns PAM_PERM_DENIED after
+#     the publickey signature is already verified, surfacing as
+#     `Failed publickey ... Access denied for user <u> by PAM account
+#     configuration` in the sshd log. With UsePAM no, sshd handles
+#     pubkey auth entirely itself (no PAM for auth, account, session
+#     or password). Linux/Windows keep UsePAM yes — the test runners
+#     there authenticate via the runner account which has fully-formed
+#     PAM records and UsePAM no would break the password path.
+sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
 cat >> "${SSHD_CFG}" <<EOF
 
 # --- passhrs CI overrides (Homebrew openssh + key auth) ---
@@ -205,6 +217,10 @@ PasswordAuthentication no
 ChallengeResponseAuthentication no
 KerberosAuthentication no
 GSSAPIAuthentication no
+# Sonoma+ PAM account phase denies dscl-created users without a
+# secure token — see comment block above. Disable PAM entirely on
+# macOS; pubkey auth is handled by sshd itself.
+UsePAM no
 EOF
 
 # ---- 3. generate host key + test-user keypair -----------------------------
