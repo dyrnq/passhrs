@@ -172,6 +172,24 @@ async fn main() -> Result<()> {
     let need_ssh = !host.is_empty();
     if need_ssh {
         info!("Connecting to {}:{} as {}", host, port, user);
+        // DEBUG (caf58d8 follow-up): trace exactly which user is
+        // bound into the russh userauth path. The DEBUG3 sshd log on
+        // caf58d8 showed the first few passhrs tests sending
+        // `for user runner method password` to sshd even though the
+        // info!() above clearly said "as testuser". We need to know
+        // (a) whether cli.user is being set somewhere we don't see
+        // and (b) whether the OS-level $USER is leaking into the
+        // auth path. Logging both at debug level so it only shows
+        // when RUST_LOG=passhrs=debug (which CI sets).
+        debug!(
+            "auth ctx: cli.user={:?} user_from_dest={:?} resolved user={:?} \
+             cli.identity_file={:?} OS_USER={:?}",
+            cli.user,
+            user_from_dest,
+            user,
+            cli.identity_file,
+            std::env::var("USER").ok(),
+        );
         let connect_timeout = cli.connect_timeout;
         let mut config = client::Config::default();
         if cli.inactivity_timeout > 0 {

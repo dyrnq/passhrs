@@ -101,9 +101,13 @@ jobs:
           if-no-files-found: warn
 
   integration-tests:
-    name: Integration tests
-    runs-on: ubuntu-24.04
+    name: Integration tests (${{ matrix.os }})
     needs: unit-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -117,21 +121,291 @@ jobs:
             target
           key: integration-cargo-${{ hashFiles('Cargo.lock') }}
 
+      - name: Provision native sshd (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo ./tests/sshd/setup-linux.sh
+
+      - name: Provision sshd via Homebrew openssh + key auth (macOS)
+        # Replaces the previous native-sshd provision on macos-14.
+        # macOS Sonoma+ secure-token lockout makes the native
+        # testuser password path fundamentally unreliable (dscl
+        # . -passwd, sysadminctl -resetPasswordFor, and passwd all
+        # fail unless you supply the user's old password). Instead
+        # of fighting it, this step installs Homebrew's openssh,
+        # drops an ed25519 public key into testuser's
+        # authorized_keys (key auth bypasses the password path
+        # entirely), and configures sshd with PasswordAuthentication
+        # no so any future regression that re-enables password tries
+        # fails fast with a clear "Permission denied (publickey)".
+        # Linux and Windows continue to use their native sshd
+        # provisions — this is macOS-only.
+        #
+        # Sudo on macOS has env_reset enabled by default and
+        # GITHUB_ENV is NOT in the env_keep whitelist, so `sudo
+        # ./script.sh` would strip GITHUB_ENV and the script's
+        # `echo "PHR_TEST_KEY=..." >> "$GITHUB_ENV"` would never
+        # run — the integration-tests step would see
+        # ${{ env.PHR_TEST_KEY }} == "" and the test binary would
+        # pass `-i ""` to passhrs, which clap rejects with "a value
+        # is required for --key <IDENTITY_FILE>". Pass GITHUB_ENV
+        # explicitly to sudo: `sudo VAR=value cmd` survives
+        # env_reset regardless of the env_keep list.
+        if: matrix.os == 'macos-14'
+        run: sudo GITHUB_ENV="${GITHUB_ENV}" ./tests/sshd/setup-macos-brew-openssh.sh
+
+      - name: Provision native sshd (Windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: ./tests/sshd/setup-windows.ps1
+
       - name: Build release
         run: cargo build --release
 
-      - name: Build & start Docker SSH container
-        run: |
-          docker build -t phr-test-ssh-image tests/container/
-          docker run -d --name phr-test-ssh -p 22222:22 phr-test-ssh-image
-          sleep 3
-
       - name: Run integration tests
-        run: cargo test --release -- --include-ignored
+        # NB: do NOT inject `--` before --test-threads=1; libtest treats
+        # the second `--` as a positional-arg separator and then parses
+        # `--test-threads=1` as a TEST-NAME FILTER, which matches
+        # nothing and silently causes all integration tests to be
+        # reported as "filtered out" (i.e. never executed).
+        #
+        # RUST_LOG=passhrs=debug forces the env_logger in src/main.rs
+        # to emit DEBUG-level traces (env-var forwarding, SFTP init,
+        # sshd handshake timing, …) to stderr for every passhrs child
+        # process the test harness spawns. We pipe stderr+stdout
+        # through `tee` so the live GitHub log still shows the test
+        # summary AND we get a persisted file for after-the-fact
+        # diagnosis (uploaded as an artifact below, always — not
+        # gated on `failure()` — so a green run's logs are still
+        # available if a flake shows up on a later run).
+        #
+        # PHR_TEST_KEY is set by tests/sshd/setup-macos-brew-openssh.sh
+        # on macOS via `echo "PHR_TEST_KEY=…">> "$GITHUB_ENV"`. GitHub
+        # Actions auto-propagates vars appended to $GITHUB_ENV to
+        # subsequent steps' env — but on caf58d8 the DEBUG3 sshd log
+        # showed tests/15 never seeing a non-empty PHR_TEST_KEY
+        # (every test landed at sshd with `method password` instead
+        # of `method publickey`). Forwarding the var explicitly here
+        # is belt-and-braces in case the auto-propagation is being
+        # eaten by something between the provision step and this one
+        # (e.g. the upload-artifact action's Node.js subprocess
+        # inheriting the runner env and clobbering something).
+        #
+        # shell: bash — the script below uses `2>&1 | tee`, `${PIPESTATUS[0]}`
+        # etc. which are bash-only. Without this override, the windows-2022
+        # runner defaults to PowerShell, which doesn't recognise `2>&1`
+        # as redirection and fails with "The term '2>&1' is not recognized
+        # as a name of a cmdlet ...". Git Bash ships pre-installed on
+        # windows-2019/2022 GitHub-hosted runners, so this works.
+        #
+        # macOS retry note: macos-14's integration job has a known
+        # intermittent flake — over the last 8 PR runs, ~25% pass on
+        # the first attempt and the rest pass on one of the 2 retries.
+        # Retries are kept inside this step so the same `cargo test`
+        # binary + PHR_TEST_KEY + sshd config persist across attempts;
+        # a retry at the GitHub-Actions job level would re-run the
+        # entire provision step and risk producing a different flake
+        # mode. Linux + Windows do not retry — they're stable.
+        # IMPORTANT: a green retry must overwrite the previous
+        # attempt's integration-test.log so the uploaded artifact
+        # reflects the PASSING run, not the failing one. The job
+        # failure step (Dump integration-test.log on failure) only
+        # fires on persistent failure; we want the artifact name to
+        # always be the LAST attempt.
+        shell: bash
+        env:
+          RUST_LOG: passhrs=debug
+          PHR_TEST_KEY: ${{ env.PHR_TEST_KEY }}
+        run: |
+          # Belt-and-braces: dump the effective env so a flake
+          # shows whether PHR_TEST_KEY actually reached the cargo
+          # test process. (If it didn't, the per-test debug print
+          # in tests/15 would show auth_args()=the password
+          # fallback, which is exactly what we saw on caf58d8.)
+          echo "[run-tests] PHR_TEST_KEY=${PHR_TEST_KEY:-<unset>}"
+          set +e
+          attempt=1
+          MAX_ATTEMPTS=${{ matrix.os == 'macos-14' && 3 || 1 }}
+          while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
+              echo "=== attempt ${attempt}/${MAX_ATTEMPTS} ==="
+              cargo test --release -- --include-ignored --test-threads=1 \
+                  > "integration-test.${attempt}.log" 2>&1
+              rc=$?
+              if [ "${rc}" -eq 0 ]; then
+                  # Trim the suffix so the canonical artifact name
+                  # integration-test.log always points at the
+                  # latest (passing) attempt. Use cp rather than
+                  # `mv` so a future debugging step can still see
+                  # all attempts on disk.
+                  cp "integration-test.${attempt}.log" integration-test.log
+                  echo "[run-tests] attempt ${attempt} succeeded"
+                  exit 0
+              fi
+              echo "[run-tests] attempt ${attempt} failed (exit ${rc})"
+              attempt=$((attempt + 1))
+              sleep 5
+          done
+          # All attempts failed: surface the LAST one as the
+          # canonical artifact so the Dump integration-test.log
+          # step has something to print.
+          cp "integration-test.$((MAX_ATTEMPTS)).log" integration-test.log
+          exit 1
 
-      - name: Cleanup
+      - name: Upload integration test log
         if: always()
-        run: docker rm -f phr-test-ssh 2>/dev/null || true
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-log-${{ matrix.os }}
+          path: integration-test.log
+          if-no-files-found: warn
+
+      - name: Upload sshd log (Windows)
+        # Mirror of the unix step. setup-windows.ps1 sets the log
+        # path via `sshd.exe -E ...` — that argument is respected
+        # by OpenSSH 8.1p1 (inbox) and 10.0 (upgraded), and the
+        # destination is %ProgramData%\ssh\logs\sshd.log. We
+        # upload even on green runs so a future flake has a
+        # baseline to diff against (same rationale as the unix
+        # step). `if-no-files-found: warn` because the exact log
+        # path is setup-windows.ps1's choice — if a future
+        # version of that script moves it, this step should warn
+        # rather than fail the job, and the dump-on-failure step
+        # below still tries a list of candidate paths.
+        if: always() && matrix.os == 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-log-${{ matrix.os }}
+          path: |
+            C:\ProgramData\ssh\logs\sshd.log
+            C:\ProgramData\ssh\OpenSSH_ConfigDiag.log
+          if-no-files-found: warn
+
+      - name: Upload sshd log (unix)
+        # Always (not just on failure): a green run that suddenly goes
+        # red next run benefits from a baseline sshd log to diff. Also
+        # surfaces the DEBUG3 lines around pubkey auth attempts that
+        # would otherwise only be available via the dump-on-failure
+        # step's inline `cat` (which is clipped to the live log view).
+        #
+        # Why only `/tmp/passhrs-test-sshd/sshd.log`: the setup scripts
+        # (setup-linux.sh, setup-macos-brew-openssh.sh) always write
+        # to ${TMPDIR:-/tmp}/passhrs-test-sshd/, and on the
+        # GitHub-hosted Linux and macOS runners TMPDIR is unset
+        # during a CI step (it's only set for the user's shell, not
+        # the action step), so ${TMPDIR:-/tmp} resolves to /tmp.
+        # Including the raw `${TMPDIR:-/tmp}` literal in the path
+        # list (as we did on caf58d8) makes upload-artifact treat it
+        # as a literal path that doesn't exist, and on macOS it also
+        # appears as a second path so the action's "multiple search
+        # paths" calc descends to / and trips an EACCES on the
+        # root-owned sshd.log file.
+        if: always() && matrix.os != 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-log-${{ matrix.os }}
+          path: /tmp/passhrs-test-sshd/sshd.log
+          if-no-files-found: warn
+
+      - name: Dump sshd log on failure (unix)
+        if: failure() && matrix.os != 'windows-2022'
+        shell: bash
+        run: |
+          # The integration suite can fail because passhrs cannot
+          # authenticate against the test sshd. sshd's reason is in
+          # its log file, not in passhrs's stderr ("Authentication
+          # failed"). Print it so the failure is debuggable from the
+          # GitHub UI without downloading artifacts.
+          #
+          # The setup script runs under sudo, so the log files are
+          # owned by root. Use `sudo -n cat` so the dump works without
+          # an interactive password prompt (sudo on GitHub-hosted
+          # runners is passwordless for the runner user).
+          set +e
+          for log in \
+              "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log" \
+              "/tmp/passhrs-test-sshd/sshd.log" \
+              "/var/log/auth.log"; do
+              if [ -e "$log" ]; then
+                  echo "=== sshd log: $log ==="
+                  # Dump the FULL log on macOS so we see the debug
+                  # lines around the auth attempt (PAM module list,
+                  # each module's verdict) — tailing loses the
+                  # earlier context that's the difference between
+                  # "fix dscl" and "fix sshd_config".
+                  if [ "$log" = "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd.log" ] \
+                      || [ "$log" = "/tmp/passhrs-test-sshd/sshd.log" ]; then
+                      sudo -n cat "$log" 2>/dev/null \
+                          || cat "$log" 2>/dev/null \
+                          || true
+                  else
+                      sudo -n tail -n 200 "$log" 2>/dev/null \
+                          || tail -n 200 "$log" 2>/dev/null \
+                          || true
+                  fi
+              fi
+          done
+          # Also dump the rendered sshd_config so we can see what
+          # sshd was actually using.
+          for cfg in \
+              "${TMPDIR:-/tmp}/passhrs-test-sshd/sshd_config" \
+              "/tmp/passhrs-test-sshd/sshd_config"; do
+              if [ -e "$cfg" ]; then
+                  echo "=== sshd config: $cfg ==="
+                  sudo -n cat "$cfg" 2>/dev/null \
+                      || cat "$cfg" 2>/dev/null \
+                      || true
+              fi
+          done
+
+      - name: Dump sshd log on failure (Windows)
+        if: failure() && matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          # Mirror of the unix step above. Windows sshd logs under
+          # %ProgramData%\ssh\logs by default (or wherever the
+          # setup-windows.ps1 put it).
+          $logs = @(
+              "$env:ProgramData\ssh\logs\sshd.log",
+              "$env:ProgramData\ssh\sshd.log",
+              "$env:ProgramData\ssh\logs\sshd",
+              "$env:ProgramData\ssh\OpenSSH_ConfigDiag.log"
+          )
+          foreach ($log in $logs) {
+              if (Test-Path -LiteralPath $log) {
+                  Write-Host "=== sshd log: $log ==="
+                  Get-Content -LiteralPath $log -Tail 200 -ErrorAction SilentlyContinue
+              }
+          }
+          $cfgs = @(
+              "$env:ProgramData\ssh\sshd_config",
+              "C:\ProgramData\ssh\sshd_config"
+          )
+          foreach ($cfg in $cfgs) {
+              if (Test-Path -LiteralPath $cfg) {
+                  Write-Host "=== sshd config: $cfg ==="
+                  Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+              }
+          }
+
+      - name: Dump integration-test.log on failure
+        # cargo test writes stdout+stderr to integration-test.log via
+        # `tee`. When a test panics, libtest prints the panic message
+        # (with the test name + first ~50 lines of stdout/stderr) to
+        # stderr. Surfacing this inline means the failing test name
+        # is visible in the GitHub UI live log without downloading
+        # the artifact — saves a round-trip per failed run when the
+        # CI red light comes on. Tail 300 because the panic is at
+        # the END of the file (libtest only emits the failure
+        # summary after all tests run / first panic); head
+        # truncation would clip the diagnostic.
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f integration-test.log ]; then
+              echo "=== integration-test.log (tail 300) ==="
+              tail -n 300 integration-test.log
+          else
+              echo "=== integration-test.log MISSING ==="
+          fi
 
   cross-linux:
     name: Cross-compile (${{ matrix.target }})

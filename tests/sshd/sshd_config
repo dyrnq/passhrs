@@ -1,0 +1,82 @@
+# Shared test sshd config used by Linux / macOS / Windows CI runners.
+# Generated per-platform by tests/sshd/setup-*.sh; the platform-specific
+# setup script is responsible for substituting __SFTP_SERVER_PATH__ and
+# any directives the host platform does not support.
+
+Port 22222
+# ListenAddress unset on purpose: sshd defaults to all loopback addresses
+# (127.0.0.1 and ::1) on whatever ports Port applies. tests/15
+# runs test_command_with_dest_ipv6 against [::1], so we must accept
+# dual-stack loopback. Set AddressFamily any (already below) to also
+# be safe on the Windows runner where sshd treats the v4 default
+# literally.
+AddressFamily any
+
+# Authentication — passhrs e2e tests authenticate with
+# --password PassTest1234! (meets Windows password complexity too).
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+UsePAM yes
+
+# Forwarding — required by -L / -R / -D tests, and by the locale-env
+# forwarding tests that rely on sshd to negotiate env with the client.
+AllowTcpForwarding yes
+AllowAgentForwarding yes
+AllowStreamLocalForwarding yes
+GatewayPorts yes
+
+# AcceptEnv — mirrors OpenSSH default SendEnv LANG LC_*. Without this,
+# sshd silently drops client env requests and the locale_env_forwarded
+# test will see an empty env on the remote side.
+AcceptEnv LANG LC_*
+
+# Speed up connection establishment during the test run. MaxStartups
+# is generous (default 10:30:100 drops 30% of unauthenticated
+# connections once 10 are queued) because the test suite hammers sshd
+# with rapid back-to-back sessions; without headroom we see
+# "Connection reset by peer" mid-handshake on a busy moment.
+LoginGraceTime 60
+MaxAuthTries 10
+MaxStartups 50:100:200
+MaxSessions 100
+
+# Disable features we do not want in CI: DNS reverse lookups can stall the
+# auth path on shared CI networks and produce flakes.
+UseDNS no
+
+# srclimit was disabled per the OpenSSH 9.2 per-source connection-rate
+# penalty discussion in commit 0771c57. However, the `srclimit no`
+# directive itself is rejected as a "Bad configuration option" by the
+# sshd binaries actually shipping on the CI runners — Ubuntu 24.04's
+# openssh-server 9.6p1 and Homebrew's openssh 10.3p1 — so this line is
+# now commented out to keep sshd's parser happy. The per-source rate
+# penalty is still present in 9.2+ defaults; if a future CI flake is
+# traced back to it (look for "Connection reset by peer (os error 54)"
+# mid-handshake from 127.0.0.1), reintroduce the directive under a
+# runtime-conditional that checks `sshd -T 2>&1 | grep -i srclimit` —
+# e.g. only emit `srclimit no` when sshd accepts the option — so older
+# builds skip the directive and newer builds opt out of the penalty.
+# (MaxStartups above already handles the connection-count dimension
+# that srclimit would overlap with, so most loops should be safe even
+# without disabling it.)
+# srclimit no
+
+# Quiet logging. Tests observe passhrs behavior, not sshd diagnostics.
+LogLevel ERROR
+
+# Subsystem line: the platform-specific setup script does `sed
+# s|__SFTP_SERVER_PATH__|/path/to/sftp-server|` to inject the
+# correct binary path for the host OS. The line must NOT be
+# commented out — when it is, sshd silently drops every
+# `subsystem request for sftp` (log line: 'subsystem request
+# for sftp by user <u> failed, subsystem not found') and the
+# SFTP tests hang in SftpSession::new waiting for an INIT
+# packet that will never come. (The commented line in earlier
+# revisions of this file was a documentation placeholder
+# expecting the setup script to append an uncommented line;
+# that approach was replaced by sed-in-place substitution
+# without uncommenting, hence the SFTP subsystem being
+# effectively disabled on every platform.)
+Subsystem sftp __SFTP_SERVER_PATH__
