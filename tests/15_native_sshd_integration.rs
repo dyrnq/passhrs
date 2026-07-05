@@ -49,8 +49,26 @@ const BIN: &str = "./target/release/passhrs";
 /// paths used in push/pull/rsync tests are rooted here so they resolve
 /// correctly on Linux, macOS and Windows runners without relying on a
 /// hard-coded `/tmp`.
+///
+/// Why not just `std::env::temp_dir()` everywhere: on macOS the runner
+/// has `TMPDIR=/var/folders/.../T/` set per-user, so a path the test
+/// creates as `runner` (UID A) is unwritable by `testuser` (UID B) when
+/// sshd runs the SFTP child as UID B — the integration tests get
+/// "Permission denied" trying to push to that path. The previous
+/// hard-coded `/tmp/phr_*` worked because `/tmp` is world-writable on
+/// every Unix (mode 1777). Pin Unix to `/tmp` and let Windows use
+/// `%TEMP%` via `std::env::temp_dir()` (Windows has no `/tmp`, and
+/// %TEMP% per-user is fine because the Windows sshd runs in the
+/// runner's own user context — no cross-user SFTP problem).
 fn tmp_root() -> PathBuf {
-    std::env::temp_dir()
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(windows)]
+    {
+        std::env::temp_dir()
+    }
 }
 
 /// Returns true when a real sshd is listening on `127.0.0.1:22222` and
