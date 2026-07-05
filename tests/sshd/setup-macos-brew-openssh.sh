@@ -211,19 +211,29 @@ sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
 # integration tests. The `srclimit` config directive was added in
 # OpenSSH 9.8; the 9.6p1/10.3p1 binaries shipping on the runners
 # historically rejected it as "Bad configuration option", which is why
-# the template keeps it commented out. Probe sshd itself: if `sshd -T`
-# (which prints the effective config) mentions srclimit, this build
-# supports the directive and we can safely append `srclimit no` to
-# disable the penalty. Older builds (no srclimit line in -T output)
-# skip the append and inherit the 9.2+ default behaviour.
-if "${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1 | grep -qi '^srclimit'; then
+# the template keeps it commented out.
+#
+# Two probe strategies in order:
+#   1. `sshd -T` line-level probe (cheap; works when sshd prints the
+#      effective srclimit value even at default)
+#   2. Write `srclimit no` to a scratch config, run `sshd -T -f`, check
+#      exit status. sshd -T exits 0 if the config parses, non-zero
+#      if it contains a directive this build does not recognise.
+# This dual-probe catches builds that DO accept the directive but do
+# NOT advertise it in -T output at default value.
+SCRATCH_CFG="$(mktemp -t sshd-srclimit-probe.XXXXXX)"
+cp "${SSHD_CFG}" "${SCRATCH_CFG}"
+printf '\nsrclimit no\n' >> "${SCRATCH_CFG}"
+if "${SSHD_BIN}" -T -f "${SCRATCH_CFG}" >/dev/null 2>&1 \
+    || "${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1 | grep -qi '^srclimit'; then
     echo "    sshd supports srclimit directive — appending 'srclimit no'"
     cat >> "${SSHD_CFG}" <<EOF
 srclimit no
 EOF
 else
-    echo "    sshd lacks srclimit directive — keeping 9.2+ default penalty"
+    echo "    sshd rejects srclimit directive — keeping 9.2+ default penalty"
 fi
+rm -f "${SCRATCH_CFG}"
 cat >> "${SSHD_CFG}" <<EOF
 
 # --- passhrs CI overrides (Homebrew openssh + key auth) ---
