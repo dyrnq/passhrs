@@ -353,6 +353,27 @@ jobs:
               }
           }
 
+      - name: Dump integration-test.log on failure
+        # cargo test writes stdout+stderr to integration-test.log via
+        # `tee`. When a test panics, libtest prints the panic message
+        # (with the test name + first ~50 lines of stdout/stderr) to
+        # stderr. Surfacing this inline means the failing test name
+        # is visible in the GitHub UI live log without downloading
+        # the artifact — saves a round-trip per failed run when the
+        # CI red light comes on. Tail 300 because the panic is at
+        # the END of the file (libtest only emits the failure
+        # summary after all tests run / first panic); head
+        # truncation would clip the diagnostic.
+        if: failure()
+        shell: bash
+        run: |
+          if [ -f integration-test.log ]; then
+              echo "=== integration-test.log (tail 300) ==="
+              tail -n 300 integration-test.log
+          else
+              echo "=== integration-test.log MISSING ==="
+          fi
+
   cross-linux:
     name: Cross-compile (${{ matrix.target }})
     runs-on: ubuntu-24.04
