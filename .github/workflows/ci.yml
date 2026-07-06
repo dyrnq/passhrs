@@ -394,11 +394,15 @@ jobs:
           # fail (likely on Get-WinEvent -LogName 'OpenSSH/Operational'
           # before the channel had any events — Get-WinEvent throws
           # "No events were found" which -ErrorAction SilentlyContinue
-          # does NOT reliably suppress). With the marker, the dump
-          # always gets written and the upload step always has a file
-          # to pick up. The step's exit code is the Set-Content result,
-          # so the step succeeds as long as the file gets written.
-          $dumpFile = Join-Path $GITHUB_WORKSPACE 'sshd-dump.txt'
+          # does NOT reliably suppress). The whole script is also wrapped
+          # in an outer try/catch so even a path-resolution failure (e.g.
+          # GITHUB_WORKSPACE unset) ends with a stub file on disk that
+          # the upload step can still pick up — empty is better than
+          # missing, because "missing" leaves us blind to whether the
+          # problem is the diagnostic path or the diagnostic data.
+          $workspaceRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { $env:TEMP }
+          $dumpFile = Join-Path $workspaceRoot 'sshd-dump.txt'
+          try {
           $dump = New-Object System.Text.StringBuilder
           function Append-Line([string]$s) {
               [void]$dump.AppendLine($s)
@@ -412,7 +416,7 @@ jobs:
               }
           }
           Append-Line "=== sshd dump at $(Get-Date -Format o) ==="
-          Append-Line "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          Append-Line "GITHUB_WORKSPACE=$env:GITHUB_WORKSPACE"
           Append-Line "env:ProgramData=$env:ProgramData"
           $logs = @(
               "$env:ProgramData\ssh\logs\sshd-debug.log",
@@ -492,6 +496,23 @@ jobs:
           # utf8 across PS 5.1 / PS 7+ boundaries.
           [System.IO.File]::WriteAllText($dumpFile, $dump.ToString())
           Write-Host "Wrote dump to $dumpFile ($((Get-Item $dumpFile).Length) bytes)"
+          } catch {
+              # Outer catch: if anything before the inner try/catches
+              # throws (e.g. Join-Path on a null workspace, a typo in
+              # $dumpFile), we still want a stub file on disk so the
+              # upload step has something to pick up. Write a minimal
+              # "[dump step crashed: ...]" marker to the file, then
+              # exit 0 so the step is marked success.
+              $err = $_.Exception.Message
+              try {
+                  [System.IO.File]::WriteAllText(
+                      $dumpFile,
+                      "=== sshd dump crashed at $(Get-Date -Format o) ===`r`nOuter: $err`r`n"
+                  )
+              } catch {
+                  Write-Host "Could not even write $dumpFile : $($_.Exception.Message)"
+              }
+          }
           # The job-step exit code is the LAST command's exit code —
           # explicitly exit 0 so a transient WriteAllText quirk or
           # trailing pipeline element doesn't mark the step failed.
