@@ -386,7 +386,34 @@ jobs:
           # — useful when the live log view is hard to share (the dump
           # can run to several hundred KB on a red run, which gets
           # clipped in the GitHub UI). The on-screen output is unchanged.
+          #
+          # Implementation note: every individual read is wrapped in
+          # try/catch and the catch writes a "[error: ...]" marker into
+          # the dump. This is essential because on 28779531462 the
+          # previous version of this script caused the step itself to
+          # fail (likely on Get-WinEvent -LogName 'OpenSSH/Operational'
+          # before the channel had any events — Get-WinEvent throws
+          # "No events were found" which -ErrorAction SilentlyContinue
+          # does NOT reliably suppress). With the marker, the dump
+          # always gets written and the upload step always has a file
+          # to pick up. The step's exit code is the Set-Content result,
+          # so the step succeeds as long as the file gets written.
           $dumpFile = Join-Path $GITHUB_WORKSPACE 'sshd-dump.txt'
+          $dump = New-Object System.Text.StringBuilder
+          function Append-Line([string]$s) {
+              [void]$dump.AppendLine($s)
+              Write-Host $s
+          }
+          function Try-Append([string]$label, [scriptblock]$block) {
+              try {
+                  & $block
+              } catch {
+                  Append-Line "  [error: $label : $($_.Exception.Message)]"
+              }
+          }
+          Append-Line "=== sshd dump at $(Get-Date -Format o) ==="
+          Append-Line "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          Append-Line "env:ProgramData=$env:ProgramData"
           $logs = @(
               "$env:ProgramData\ssh\logs\sshd-debug.log",
               "$env:ProgramData\ssh\logs\sshd.log",
@@ -394,28 +421,21 @@ jobs:
               "$env:ProgramData\ssh\logs\sshd",
               "$env:ProgramData\ssh\OpenSSH_ConfigDiag.log"
           )
-          $dump = New-Object System.Text.StringBuilder
-          [void]$dump.AppendLine("=== sshd dump at $(Get-Date -Format o) ===")
           foreach ($log in $logs) {
               if (Test-Path -LiteralPath $log) {
                   # sshd-debug.log is the protocol trace; tail 500
                   # lines. The other logs are short operational
                   # summaries; tail 200 like before.
                   $tailLines = if ($log -like '*sshd-debug.log*') { 500 } else { 200 }
-                  $header = "=== sshd log (tail $tailLines): $log ==="
-                  Write-Host $header
-                  [void]$dump.AppendLine($header)
-                  $content = Get-Content -LiteralPath $log -Tail $tailLines -ErrorAction SilentlyContinue
-                  if ($null -ne $content) {
-                      foreach ($line in $content) {
-                          Write-Host $line
-                          [void]$dump.AppendLine($line)
+                  Append-Line "=== sshd log (tail $tailLines): $log ==="
+                  Try-Append "Get-Content $log" {
+                      $content = Get-Content -LiteralPath $log -Tail $tailLines -ErrorAction Stop
+                      if ($null -ne $content) {
+                          foreach ($line in $content) { Append-Line $line }
                       }
                   }
               } else {
-                  $missing = "  (no $log)"
-                  Write-Host $missing
-                  [void]$dump.AppendLine($missing)
+                  Append-Line "  (no $log)"
               }
           }
           $cfgs = @(
@@ -424,14 +444,11 @@ jobs:
           )
           foreach ($cfg in $cfgs) {
               if (Test-Path -LiteralPath $cfg) {
-                  $header = "=== sshd config: $cfg ==="
-                  Write-Host $header
-                  [void]$dump.AppendLine($header)
-                  $content = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
-                  if ($null -ne $content) {
-                      foreach ($line in $content) {
-                          Write-Host $line
-                          [void]$dump.AppendLine($line)
+                  Append-Line "=== sshd config: $cfg ==="
+                  Try-Append "Get-Content $cfg" {
+                      $content = Get-Content -LiteralPath $cfg -ErrorAction Stop
+                      if ($null -ne $content) {
+                          foreach ($line in $content) { Append-Line $line }
                       }
                   }
               }
@@ -441,18 +458,11 @@ jobs:
           # override silently inactive, and the -ddd log will be
           # empty. Showing the actual values in the failure log
           # tells us at-a-glance whether the override took effect.
-          $regHeader = "=== OpenSSH-Server-Ini registry ==="
-          Write-Host $regHeader
-          [void]$dump.AppendLine($regHeader)
-          $reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH-Server-Ini' -ErrorAction SilentlyContinue
-          if ($null -eq $reg) {
-              $none = "  (HKLM:\SOFTWARE\OpenSSH-Server-Ini not present)"
-              Write-Host $none
-              [void]$dump.AppendLine($none)
-          } else {
+          Append-Line "=== OpenSSH-Server-Ini registry ==="
+          Try-Append "Get-ItemProperty OpenSSH-Server-Ini" {
+              $reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH-Server-Ini' -ErrorAction Stop
               $regStr = $reg | Format-List | Out-String
-              Write-Host $regStr
-              [void]$dump.AppendLine($regStr)
+              foreach ($line in ($regStr -split "`n")) { Append-Line $line.TrimEnd() }
           }
           # Event Log queries. Bumped from 20 to 500 in PR #14
           # diagnostic: a 33-test connection storm covers more than 20
@@ -462,23 +472,30 @@ jobs:
           # run these even if sshd-debug.log is empty: on Win32-OpenSSH
           # builds that ignore LogFile/LogLevel, the Event Log is the
           # only per-connection trace we have.
-          $evHeader = "=== OpenSSH/Operational Event Log (last 500) ==="
-          Write-Host $evHeader
-          [void]$dump.AppendLine($evHeader)
-          $ev = Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue
-          if ($null -eq $ev) {
-              $none = "  (no OpenSSH/Operational events)"
-              Write-Host $none
-              [void]$dump.AppendLine($none)
-          } else {
-              foreach ($e in $ev) {
-                  $line = "{0:O} {1}" -f $e.TimeCreated, $e.Message
-                  Write-Host $line
-                  [void]$dump.AppendLine($line)
+          Append-Line "=== OpenSSH/Operational Event Log (last 500) ==="
+          Try-Append "Get-WinEvent OpenSSH/Operational" {
+              $ev = @(Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 500 -ErrorAction Stop)
+              if ($ev.Count -eq 0) {
+                  Append-Line "  (no OpenSSH/Operational events)"
+              } else {
+                  foreach ($e in $ev) {
+                      $line = "{0:o} {1}" -f $e.TimeCreated, $e.Message
+                      Append-Line $line
+                  }
               }
           }
-          Set-Content -LiteralPath $dumpFile -Value $dump.ToString() -Encoding utf8
+          # Always write the file, even if everything above errored —
+          # the file's existence is what the upload step looks for.
+          # -NoNewline is implicit because we built the string with
+          # AppendLine (which adds CRLF). [System.IO.File]::WriteAllText
+          # avoids any BOM issues that plague Set-Content -Encoding
+          # utf8 across PS 5.1 / PS 7+ boundaries.
+          [System.IO.File]::WriteAllText($dumpFile, $dump.ToString())
           Write-Host "Wrote dump to $dumpFile ($((Get-Item $dumpFile).Length) bytes)"
+          # The job-step exit code is the LAST command's exit code —
+          # explicitly exit 0 so a transient WriteAllText quirk or
+          # trailing pipeline element doesn't mark the step failed.
+          exit 0
 
       - name: Upload sshd dump on failure (Windows)
         # Companion to "Dump sshd log on failure (Windows)": uploads
