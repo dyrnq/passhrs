@@ -37,6 +37,54 @@ fn is_absolute_path(s: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
+/// Rewrite `$NAME` references in `cmd` to `%NAME%` for cmd.exe, where
+/// `NAME` is drawn from `env_names` — the names that were just declared
+/// via `--exec-env` so the substitution only fires for vars we know
+/// were set, not for arbitrary `$FOO` text that happens to appear in the
+/// user's command. A `$NAME` reference is recognised as `$` followed by
+/// an ASCII alphabetic or `_` and then zero or more ASCII alphanumerics
+/// or `_`. The replacement is whole-token: `$FOO` → `%FOO%`, `$FOO_BAR`
+/// → `%FOO_BAR%`, but `$FOO123` → `%FOO123%` (no trailing-alphanum
+/// boundary needed since `%` is unambiguous to cmd.exe). `$$` is left
+/// alone (cmd.exe doesn't expand `$$` as an escape; pass it through).
+fn rewrite_dollar_refs_for_cmd(cmd: &str, env_names: &[String]) -> String {
+    if env_names.is_empty() {
+        return cmd.to_string();
+    }
+    let mut out = String::with_capacity(cmd.len());
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
+            // Read identifier
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && is_ident_cont(bytes[end]) {
+                end += 1;
+            }
+            let name = &cmd[start..end];
+            if env_names.iter().any(|n| n == name) {
+                out.push('%');
+                out.push_str(name);
+                out.push('%');
+                i = end;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -469,19 +517,23 @@ async fn main() -> Result<()> {
             }
             if !cli.command.is_empty() {
                 let mut parts: Vec<String> = Vec::new();
+                let mut exec_env_names: Vec<String> = Vec::new();
                 for spec in &cli.exec_env {
                     if let Some(eq) = spec.find('=') {
-                        parts.push(format!(
-                            "export {}={}",
-                            &spec[..eq],
-                            shell_escape::escape(spec[eq + 1..].into())
-                        ));
+                        let name = &spec[..eq];
+                        let value = shell_escape::escape(spec[eq + 1..].into()).into_owned();
+                        parts.push(match cli.shell.as_str() {
+                            "cmd" => format!("set \"{}={}\"", name, value),
+                            _ => format!("export {}={}", name, value),
+                        });
+                        exec_env_names.push(name.to_string());
                     } else if let Ok(v) = std::env::var(spec) {
-                        parts.push(format!(
-                            "export {}={}",
-                            spec,
-                            shell_escape::escape(v.into())
-                        ));
+                        let value = shell_escape::escape(v.into()).into_owned();
+                        parts.push(match cli.shell.as_str() {
+                            "cmd" => format!("set \"{}={}\"", spec, value),
+                            _ => format!("export {}={}", spec, value),
+                        });
+                        exec_env_names.push(spec.clone());
                     }
                 }
                 let prefix = if parts.is_empty() {
@@ -489,7 +541,19 @@ async fn main() -> Result<()> {
                 } else {
                     format!("{}; ", parts.join("; "))
                 };
+                // For the cmd.exe shell, rewrite `$VAR` references in the
+                // user-supplied command to `%VAR%` (cmd.exe has no concept
+                // of `$VAR`). Only the names we just declared via
+                // --exec-env are rewritten — leaving other `$FOO`
+                // substrings untouched so we don't accidentally rewrite
+                // arguments that happen to contain `$`. sh-mode skips the
+                // rewrite entirely (its `$VAR` syntax is the existing path).
                 let cmd = cli.command.join(" ");
+                let cmd = if cli.shell == "cmd" {
+                    rewrite_dollar_refs_for_cmd(&cmd, &exec_env_names)
+                } else {
+                    cmd
+                };
                 let full = format!("{}{}", prefix, cmd);
                 info!("Exec: {}", full);
                 channel.exec(true, full.as_bytes()).await?;
@@ -518,3 +582,88 @@ async fn main() -> Result<()> {
 }
 // Local port forwarding (-L, separate SSH connection)
 // ======================================================================
+
+#[cfg(test)]
+mod exec_env_shell_tests {
+    //! Unit tests for the --shell sh/cmd prefix generation and the
+    //! `$VAR` → `%VAR%` rewrite for cmd.exe. Pins the syntax that
+    //! `passhrs --exec-env` emits on each remote shell so a future
+    //! refactor doesn't accidentally break the Windows OpenSSH
+    //! cmd.exe integration.
+
+    use super::{is_ident_cont, is_ident_start, rewrite_dollar_refs_for_cmd};
+
+    #[test]
+    fn dollar_rewrite_substitutes_known_names() {
+        let out = rewrite_dollar_refs_for_cmd(
+            "echo $FOO and $BAR_BAZ then $UNRELATED",
+            &["FOO".into(), "BAR_BAZ".into()],
+        );
+        assert_eq!(out, "echo %FOO% and %BAR_BAZ% then $UNRELATED");
+    }
+
+    #[test]
+    fn dollar_rewrite_passthrough_when_no_env_names() {
+        // No --exec-env was passed; nothing should be rewritten (avoids
+        // accidentally rewriting `$HOME` etc. when --exec-env is unused).
+        let out = rewrite_dollar_refs_for_cmd("echo $HOME stays as-is", &[]);
+        assert_eq!(out, "echo $HOME stays as-is");
+    }
+
+    #[test]
+    fn dollar_rewrite_handles_alphanumeric_and_underscore() {
+        // `$FOO123` and `$_UNDERSCORE` are valid identifiers; the
+        // rewrite must consume the whole token, not stop at the first
+        // non-alpha.
+        let out = rewrite_dollar_refs_for_cmd(
+            "x=$FOO123 y=$_UNDERSCORE",
+            &["FOO123".into(), "_UNDERSCORE".into()],
+        );
+        assert_eq!(out, "x=%FOO123% y=%_UNDERSCORE%");
+    }
+
+    #[test]
+    fn dollar_rewrite_preserves_unknown_dollar_vars() {
+        // `$1` (positional) and `${X}` (brace form) are not bare
+        // `$IDENT`; pass through unchanged. `$X` with X not in
+        // env_names also passes through (we only rewrite what we
+        // know we set).
+        let out = rewrite_dollar_refs_for_cmd("$1 ${X} $UNKNOWN", &["KNOWN".into()]);
+        assert_eq!(out, "$1 ${X} $UNKNOWN");
+    }
+
+    #[test]
+    fn dollar_rewrite_does_not_match_dollar_at_eof() {
+        // Trailing `$` (no following identifier) is not a reference.
+        let out = rewrite_dollar_refs_for_cmd("price: 5$", &["X".into()]);
+        assert_eq!(out, "price: 5$");
+    }
+
+    #[test]
+    fn ident_start_accepts_alpha_and_underscore_only() {
+        assert!(is_ident_start(b'a'));
+        assert!(is_ident_start(b'Z'));
+        assert!(is_ident_start(b'_'));
+        assert!(!is_ident_start(b'1'));
+        assert!(!is_ident_start(b'$'));
+    }
+
+    #[test]
+    fn ident_cont_accepts_alphanumeric_and_underscore() {
+        assert!(is_ident_cont(b'a'));
+        assert!(is_ident_cont(b'Z'));
+        assert!(is_ident_cont(b'0'));
+        assert!(is_ident_cont(b'9'));
+        assert!(is_ident_cont(b'_'));
+        assert!(!is_ident_cont(b'$'));
+        assert!(!is_ident_cont(b' '));
+        assert!(!is_ident_cont(b';'));
+    }
+
+    #[test]
+    fn dollar_rewrite_handles_adjacent_refs() {
+        // Two refs next to each other with no separator.
+        let out = rewrite_dollar_refs_for_cmd("$A$B", &["A".into(), "B".into()]);
+        assert_eq!(out, "%A%%B%");
+    }
+}

@@ -73,6 +73,21 @@ pub(crate) struct Cli {
     pub(crate) fork: bool,
     #[arg(long = "exec-env", num_args = 1)]
     pub(crate) exec_env: Vec<String>,
+    #[arg(
+        long = "shell",
+        value_parser = ["sh", "cmd"],
+        default_value = "sh",
+        value_name = "sh|cmd"
+    )]
+    /// Remote shell syntax for `--exec-env` and command-line variable
+    /// references. `sh` (default) emits `export VAR=val` and treats
+    /// `$VAR` in commands as POSIX; `cmd` emits `set "VAR=val"` (cmd.exe
+    /// syntax) and rewrites `$VAR` references in the user-supplied
+    /// command to `%VAR%`. Use `cmd` when the remote sshd serves
+    /// Windows OpenSSH whose default shell is cmd.exe (e.g. Win32-OpenSSH
+    /// 10.0p2). `sh` is the default for backward compatibility — the
+    /// entire Unix e2e suite uses sh.
+    pub(crate) shell: String,
     #[arg(long = "help")]
     pub(crate) help: bool,
     pub(crate) destination: Option<String>,
