@@ -657,13 +657,6 @@ fn test_rsync_with_exclude() {
 // 环境变量测试
 // ======================================================================
 
-// Windows-only known issue: passhrs --exec-env emits
-// `export VAR=val && $VAR` for the remote shell. Windows sshd defaults
-// to cmd.exe which has no `export` builtin and rejects the command with
-// "'export' is not recognized as an internal or external command".
-// Test is gated to Unix until passhrs grows a Windows-aware exec-env
-// shim (e.g. emit `set VAR=val && echo %VAR%` for cmd.exe).
-#[cfg(not(target_os = "windows"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_exec_env_remote() {
@@ -672,19 +665,46 @@ fn test_exec_env_remote() {
         return;
     }
     let d = dest();
-    let a = [
+    // On Windows sshd defaults to cmd.exe (which has no `export`
+    // builtin and no `$VAR` substitution), so pass `--shell cmd`
+    // and reference the variable via `%VAR%` (which the rewrite
+    // for cmd mode also handles internally, but passing it through
+    // is clearer and tests the public surface). On Unix sh-mode is
+    // the default; `$VAR` is the native syntax.
+    let shell_flag = if cfg!(target_os = "windows") {
+        Some("--shell")
+    } else {
+        None
+    };
+    let shell_value = if cfg!(target_os = "windows") {
+        "cmd"
+    } else {
+        "sh"
+    };
+    let var_ref = if cfg!(target_os = "windows") {
+        "%PHR_TEST_VAR%"
+    } else {
+        "$PHR_TEST_VAR"
+    };
+    let mut a: Vec<&str> = vec![
         "-p",
         PORT,
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
+    ];
+    if let Some(flag) = shell_flag {
+        a.push(flag);
+        a.push(shell_value);
+    }
+    a.extend_from_slice(&[
         "--exec-env",
         "PHR_TEST_VAR=hello_from_env",
         &d,
         "echo",
-        "$PHR_TEST_VAR",
-    ];
+        var_ref,
+    ]);
     let (ok, stdout, stderr) = run_phr(&a);
     assert!(ok, "exec-env failed: {}", stderr);
     assert_eq!(stdout.trim(), "hello_from_env", "stdout: {}", stdout);

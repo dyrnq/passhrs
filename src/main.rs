@@ -37,6 +37,89 @@ fn is_absolute_path(s: &str) -> bool {
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
+/// Rewrite `$NAME` references in `cmd` to `%NAME%` for cmd.exe, where
+/// `NAME` is drawn from `env_names` — the names that were just declared
+/// via `--exec-env` so the substitution only fires for vars we know
+/// were set, not for arbitrary `$FOO` text that happens to appear in the
+/// user's command. A `$NAME` reference is recognised as `$` followed by
+/// an ASCII alphabetic or `_` and then zero or more ASCII alphanumerics
+/// or `_`. The replacement is whole-token: `$FOO` → `%FOO%`, `$FOO_BAR`
+/// → `%FOO_BAR%`, but `$FOO123` → `%FOO123%` (no trailing-alphanum
+/// boundary needed since `%` is unambiguous to cmd.exe). `$$` is left
+/// alone (cmd.exe doesn't expand `$$` as an escape; pass it through).
+fn rewrite_dollar_refs_for_cmd(cmd: &str, env_names: &[String]) -> String {
+    if env_names.is_empty() {
+        return cmd.to_string();
+    }
+    let mut out = String::with_capacity(cmd.len());
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
+            // Read identifier
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && is_ident_cont(bytes[end]) {
+                end += 1;
+            }
+            let name = &cmd[start..end];
+            if env_names.iter().any(|n| n == name) {
+                out.push('%');
+                out.push_str(name);
+                out.push('%');
+                i = end;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Build the env-var prefix that's prepended to the user-supplied
+/// command. For each `--exec-env` spec we generated either
+/// `set "NAME=val"` (cmd) or `export NAME=val` (sh) in `parts`; this
+/// joins them with the right shell-specific separator and appends
+/// the same separator before the command itself.
+///
+/// Separator choice: sh uses `;` (POSIX); cmd.exe uses `&`. cmd.exe
+/// has no concept of `;` as a command separator — `;` is a literal
+/// char, so `set "X=1"; echo Y` parses as ONE command line where
+/// `set` receives `"X=1";`, `echo`, `Y` as args, the `echo` never
+/// runs, and stdout comes out empty (this was the Issue #5 CI
+/// failure on windows-2022 first attempt). `&` is cmd.exe's
+/// unconditional sequence operator — the closest equivalent to `;`
+/// in POSIX sh.
+///
+/// The user command itself (in cmd mode with non-empty parts) is
+/// wrapped in a NESTED `cmd /c "…"` at the call site. The outer
+/// cmd (started by sshd) parses the whole string upfront and
+/// expands `%X%` BEFORE the preceding `set "X=v"` runs, so without
+/// the inner wrap, `set "X=1" & echo %X%` echoes literal `%X%` (X
+/// undefined at parse time). The inner `cmd /c "…"` gives the
+/// user command its own parse context, AFTER the `set` has run,
+/// so its parse of `%X%` sees X as inherited and populated.
+fn build_exec_env_prefix(parts: &[String], shell: &str) -> String {
+    if parts.is_empty() {
+        return String::new();
+    }
+    if shell == "cmd" {
+        format!("{} & ", parts.join(" & "))
+    } else {
+        let separator = "; ";
+        format!("{}{}", parts.join(separator), separator)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -469,28 +552,96 @@ async fn main() -> Result<()> {
             }
             if !cli.command.is_empty() {
                 let mut parts: Vec<String> = Vec::new();
+                let mut exec_env_names: Vec<String> = Vec::new();
                 for spec in &cli.exec_env {
                     if let Some(eq) = spec.find('=') {
-                        parts.push(format!(
-                            "export {}={}",
-                            &spec[..eq],
-                            shell_escape::escape(spec[eq + 1..].into())
-                        ));
+                        let name = &spec[..eq];
+                        let value = shell_escape::escape(spec[eq + 1..].into()).into_owned();
+                        parts.push(match cli.shell.as_str() {
+                            "cmd" => format!("set \"{}={}\"", name, value),
+                            _ => format!("export {}={}", name, value),
+                        });
+                        exec_env_names.push(name.to_string());
                     } else if let Ok(v) = std::env::var(spec) {
-                        parts.push(format!(
-                            "export {}={}",
-                            spec,
-                            shell_escape::escape(v.into())
-                        ));
+                        let value = shell_escape::escape(v.into()).into_owned();
+                        parts.push(match cli.shell.as_str() {
+                            "cmd" => format!("set \"{}={}\"", spec, value),
+                            _ => format!("export {}={}", spec, value),
+                        });
+                        exec_env_names.push(spec.clone());
                     }
                 }
-                let prefix = if parts.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}; ", parts.join("; "))
-                };
+                let prefix = build_exec_env_prefix(&parts, &cli.shell);
+                // For the cmd.exe shell, rewrite `$VAR` references in the
+                // user-supplied command to `%VAR%` (cmd.exe has no concept
+                // of `$VAR`). Only the names we just declared via
+                // --exec-env are rewritten — leaving other `$FOO`
+                // substrings untouched so we don't accidentally rewrite
+                // arguments that happen to contain `$`. sh-mode skips the
+                // rewrite entirely (its `$VAR` syntax is the existing path).
+                //
+                // After the `$`→`%` rewrite, we still hit cmd.exe's
+                // `cmd /c "…"` parse-time-expansion bug: cmd.exe expands
+                // `%VAR%` references in the entire command string BEFORE
+                // any command runs, so `set "X=1" & echo %X%` always
+                // echoes empty / literal `%X%` because X is undefined at
+                // parse time. The second rewrite turns `%KNOWN_VAR%` into
+                // `!KNOWN_VAR!`, and `build_exec_env_prefix` (cmd branch)
+                // prepends `setlocal enabledelayedexpansion` so the
+                // expansion fires at execution time — AFTER the `set` has
+                // populated the variable. Built-in cmd vars (PATH,
+                // COMPUTERNAME, …) are left as `%X%` because they're
+                // always defined and the user expects immediate expansion.
                 let cmd = cli.command.join(" ");
+                let cmd = if cli.shell == "cmd" {
+                    // sh-style `$VAR` references in the user command
+                    // get converted to cmd-style `%VAR%` so users
+                    // can write either form. The `%VAR%` references
+                    // (whether from the user or from this rewrite)
+                    // are then handled by the inner `cmd /c "…"`
+                    // wrap below — the inner cmd's parse-time
+                    // expansion sees `$VAR`/`%VAR%` and substitutes
+                    // correctly because the preceding `set "VAR=v"`
+                    // has already run in the outer cmd's env (the
+                    // inner cmd inherits the parent's env).
+                    rewrite_dollar_refs_for_cmd(&cmd, &exec_env_names)
+                } else {
+                    cmd
+                };
                 let full = format!("{}{}", prefix, cmd);
+                // For cmd mode with exec_env to set, wrap the user
+                // command in a NESTED `cmd /c "…"`. The outer cmd
+                // (started by sshd) parses the whole string
+                // upfront — its parse-time expansion of `%X%` would
+                // see X as undefined and leave the reference as
+                // literal (or empty), even though `set "X=1"`
+                // appears earlier in the same string. The nested
+                // `cmd /c "…"` gives the user command its OWN parse
+                // context, AFTER the `set` has run, so the inner
+                // cmd's parse of `%X%` sees X already populated.
+                // Concretely: passhrs exec payload is
+                //     set "X=1" & cmd /c "echo %X%"
+                // sshd starts cmd.exe /c "<above>"; the outer cmd
+                // parses, sees `cmd /c "echo %X%"` as a single
+                // sub-command, and dispatches to the inner cmd with
+                // the literal /c arg `echo %X%` (X undefined at
+                // outer's parse time, so the outer leaves it as
+                // literal `%X%`). The inner cmd then parses
+                // `echo %X%` in its own context, where X is
+                // inherited as set, and expands `%X%` correctly.
+                // Any `"` in the user command is escaped as `\"` so
+                // the outer cmd treats the inner string as a single
+                // quoted arg of its `cmd` invocation.
+                let full = if cli.shell == "cmd" && !parts.is_empty() {
+                    let user = cmd.clone();
+                    let user_escaped = user.replace('"', r#"\""#);
+                    let set_block = build_exec_env_prefix(&parts, &cli.shell);
+                    // set_block already ends with " & " for cmd
+                    // mode. Append the wrapped user command.
+                    format!(r#"{}cmd /c "{}""#, set_block, user_escaped)
+                } else {
+                    full
+                };
                 info!("Exec: {}", full);
                 channel.exec(true, full.as_bytes()).await?;
                 let code = run_session(channel, cli.redirect_stdin).await?;
@@ -518,3 +669,149 @@ async fn main() -> Result<()> {
 }
 // Local port forwarding (-L, separate SSH connection)
 // ======================================================================
+
+#[cfg(test)]
+mod exec_env_shell_tests {
+    //! Unit tests for the --shell sh/cmd prefix generation and the
+    //! `$VAR` → `%VAR%` rewrite for cmd.exe. Pins the syntax that
+    //! `passhrs --exec-env` emits on each remote shell so a future
+    //! refactor doesn't accidentally break the Windows OpenSSH
+    //! cmd.exe integration.
+
+    use super::{
+        build_exec_env_prefix, is_ident_cont, is_ident_start, rewrite_dollar_refs_for_cmd,
+    };
+
+    #[test]
+    fn dollar_rewrite_substitutes_known_names() {
+        let out = rewrite_dollar_refs_for_cmd(
+            "echo $FOO and $BAR_BAZ then $UNRELATED",
+            &["FOO".into(), "BAR_BAZ".into()],
+        );
+        assert_eq!(out, "echo %FOO% and %BAR_BAZ% then $UNRELATED");
+    }
+
+    #[test]
+    fn dollar_rewrite_passthrough_when_no_env_names() {
+        // No --exec-env was passed; nothing should be rewritten (avoids
+        // accidentally rewriting `$HOME` etc. when --exec-env is unused).
+        let out = rewrite_dollar_refs_for_cmd("echo $HOME stays as-is", &[]);
+        assert_eq!(out, "echo $HOME stays as-is");
+    }
+
+    #[test]
+    fn dollar_rewrite_handles_alphanumeric_and_underscore() {
+        // `$FOO123` and `$_UNDERSCORE` are valid identifiers; the
+        // rewrite must consume the whole token, not stop at the first
+        // non-alpha.
+        let out = rewrite_dollar_refs_for_cmd(
+            "x=$FOO123 y=$_UNDERSCORE",
+            &["FOO123".into(), "_UNDERSCORE".into()],
+        );
+        assert_eq!(out, "x=%FOO123% y=%_UNDERSCORE%");
+    }
+
+    #[test]
+    fn dollar_rewrite_preserves_unknown_dollar_vars() {
+        // `$1` (positional) and `${X}` (brace form) are not bare
+        // `$IDENT`; pass through unchanged. `$X` with X not in
+        // env_names also passes through (we only rewrite what we
+        // know we set).
+        let out = rewrite_dollar_refs_for_cmd("$1 ${X} $UNKNOWN", &["KNOWN".into()]);
+        assert_eq!(out, "$1 ${X} $UNKNOWN");
+    }
+
+    #[test]
+    fn dollar_rewrite_does_not_match_dollar_at_eof() {
+        // Trailing `$` (no following identifier) is not a reference.
+        let out = rewrite_dollar_refs_for_cmd("price: 5$", &["X".into()]);
+        assert_eq!(out, "price: 5$");
+    }
+
+    #[test]
+    fn ident_start_accepts_alpha_and_underscore_only() {
+        assert!(is_ident_start(b'a'));
+        assert!(is_ident_start(b'Z'));
+        assert!(is_ident_start(b'_'));
+        assert!(!is_ident_start(b'1'));
+        assert!(!is_ident_start(b'$'));
+    }
+
+    #[test]
+    fn ident_cont_accepts_alphanumeric_and_underscore() {
+        assert!(is_ident_cont(b'a'));
+        assert!(is_ident_cont(b'Z'));
+        assert!(is_ident_cont(b'0'));
+        assert!(is_ident_cont(b'9'));
+        assert!(is_ident_cont(b'_'));
+        assert!(!is_ident_cont(b'$'));
+        assert!(!is_ident_cont(b' '));
+        assert!(!is_ident_cont(b';'));
+    }
+
+    #[test]
+    fn dollar_rewrite_handles_adjacent_refs() {
+        // Two refs next to each other with no separator.
+        let out = rewrite_dollar_refs_for_cmd("$A$B", &["A".into(), "B".into()]);
+        assert_eq!(out, "%A%%B%");
+    }
+
+    // ---- build_exec_env_prefix: separator + nested cmd /c wrap (Issue #5) ----
+    //
+    // Two related bugs were caught on windows-2022:
+    //   1. `;` is not a separator in cmd.exe — the original `;` join
+    //      parsed the whole prelude as one command and the echo
+    //      never ran. Fix: use `&` (cmd.exe's unconditional-sequence
+    //      operator).
+    //   2. Even with `&`, cmd.exe `cmd /c "…"` expands `%X%` at
+    //      PARSE time of the whole string, BEFORE any command runs.
+    //      So `set "X=1" & echo %X%` echoes literal `%X%` (X
+    //      undefined at parse time). Fix: the call site wraps the
+    //      user command in a nested `cmd /c "…"` so the inner
+    //      cmd's parse-time expansion of `%X%` sees X as inherited
+    //      and populated (the preceding `set "X=v"` has already run
+    //      in the outer's env).
+
+    #[test]
+    fn prefix_sh_uses_semicolon_separator() {
+        let parts = vec![
+            r#"export FOO=bar"#.to_string(),
+            r#"export BAZ=qux"#.to_string(),
+        ];
+        let p = build_exec_env_prefix(&parts, "sh");
+        assert_eq!(p, r#"export FOO=bar; export BAZ=qux; "#);
+    }
+
+    #[test]
+    fn prefix_cmd_uses_ampersand_separator() {
+        // The nested `cmd /c "…"` wrap (assembled in main, not
+        // here) is what re-parses the user command in a fresh
+        // cmd.exe context, AFTER the `set "X=v"` lines have run
+        // in the outer's env. The prefix's job is just to emit
+        // the set lines joined with cmd.exe's `&` sequence
+        // operator.
+        let parts = vec![r#"set "PHR_TEST_VAR=hello_from_env""#.to_string()];
+        let p = build_exec_env_prefix(&parts, "cmd");
+        assert_eq!(p, r#"set "PHR_TEST_VAR=hello_from_env" & "#);
+    }
+
+    #[test]
+    fn prefix_cmd_multi_part_ampersand_join() {
+        let parts = vec![r#"set "A=1""#.to_string(), r#"set "B=2""#.to_string()];
+        let p = build_exec_env_prefix(&parts, "cmd");
+        assert_eq!(p, r#"set "A=1" & set "B=2" & "#);
+    }
+
+    #[test]
+    fn prefix_empty_parts_returns_empty_string() {
+        // No --exec-env supplied — no prefix, no leading separator,
+        // and no `cmd /c "…"` wrap (nothing to re-parse in a fresh
+        // cmd context).
+        let p = build_exec_env_prefix(&[], "sh");
+        assert_eq!(p, "");
+        let p = build_exec_env_prefix(&[], "cmd");
+        assert_eq!(p, "");
+    }
+
+    // ---- end of exec_env_shell_tests ----
+}
