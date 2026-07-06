@@ -81,67 +81,6 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-/// Rewrite `%NAME%` references in `cmd` to `!NAME!` for cmd.exe
-/// delayed expansion, where `NAME` is drawn from `env_names` — the
-/// names that were just declared via `--exec-env`. This is the
-/// second pass of the cmd-mode rewrite (the first pass is
-/// `rewrite_dollar_refs_for_cmd` which handles the sh-style `$NAME`
-/// → cmd-style `%NAME%` conversion for users who wrote sh syntax in
-/// their command).
-///
-/// Why this is needed: cmd.exe `cmd /c "…"` expands `%NAME%`
-/// references at PARSE time of the whole string, BEFORE any
-/// command runs. So `set "X=1" & echo %X%` always echoes literal
-/// `%X%` (X is undefined at parse time) even though `set` runs
-/// before `echo` in the sequence. The fix is to enable delayed
-/// expansion (`setlocal enabledelayedexpansion` in
-/// `build_exec_env_prefix`) and rewrite `%KNOWN%` to `!KNOWN!` so
-/// the expansion fires at execution time, AFTER the `set` has run.
-///
-/// Built-in cmd vars (PATH, COMPUTERNAME, USERPROFILE, …) are left
-/// as `%X%` because they're always defined and the user expects
-/// immediate expansion for them. `%%` is left as `%%` (literal `%`
-/// in cmd.exe's escape form). `%X` (unclosed) is left untouched
-/// since it's not a valid reference and the user clearly meant
-/// something else by it.
-fn rewrite_percent_refs_for_cmd(cmd: &str, env_names: &[String]) -> String {
-    if env_names.is_empty() {
-        return cmd.to_string();
-    }
-    let mut out = String::with_capacity(cmd.len());
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
-            // Read identifier
-            let start = i + 1;
-            let mut end = start;
-            while end < bytes.len() && is_ident_cont(bytes[end]) {
-                end += 1;
-            }
-            if end < bytes.len() && bytes[end] == b'%' {
-                // Closing `%` present — it's a `%NAME%` reference.
-                let name = &cmd[start..end];
-                if env_names.iter().any(|n| n == name) {
-                    out.push('!');
-                    out.push_str(name);
-                    out.push('!');
-                    i = end + 1;
-                    continue;
-                }
-                // Known-looking reference but not in env_names
-                // (e.g. `%PATH%`): leave as-is so cmd.exe does its
-                // normal immediate expansion on it.
-            }
-            // Not a valid `%NAME%` reference (no closing `%` or
-            // name not in env_names). Pass through unchanged.
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
-}
-
 fn is_ident_cont(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -161,18 +100,14 @@ fn is_ident_cont(b: u8) -> bool {
 /// unconditional sequence operator — the closest equivalent to `;`
 /// in POSIX sh.
 ///
-/// Delayed expansion is enabled at the call site (cmd mode with
-/// non-empty parts) by wrapping the full command in
-/// `cmd /v:on /c "…"`. Putting `setlocal enabledelayedexpansion`
-/// inside the prelude didn't work: cmd.exe `cmd /c "…"` expands
-/// `%X%` and `!X!` references at PARSE time of the WHOLE string,
-/// before any command runs — so the setlocal took effect AFTER the
-/// parser had already decided what to expand, and the `!X!` in the
-/// user command was left as literal. `/v:on` flips delayed
-/// expansion on BEFORE the inner `cmd` parses the string, which is
-/// what the rewrite (`%KNOWN%` → `!KNOWN!`) needs to expand at
-/// execution time. Combined with the rewrite, `!X!` is expanded
-/// AFTER the `set "X=v"` runs.
+/// The user command itself (in cmd mode with non-empty parts) is
+/// wrapped in a NESTED `cmd /c "…"` at the call site. The outer
+/// cmd (started by sshd) parses the whole string upfront and
+/// expands `%X%` BEFORE the preceding `set "X=v"` runs, so without
+/// the inner wrap, `set "X=1" & echo %X%` echoes literal `%X%` (X
+/// undefined at parse time). The inner `cmd /c "…"` gives the
+/// user command its own parse context, AFTER the `set` has run,
+/// so its parse of `%X%` sees X as inherited and populated.
 fn build_exec_env_prefix(parts: &[String], shell: &str) -> String {
     if parts.is_empty() {
         return String::new();
@@ -659,29 +594,51 @@ async fn main() -> Result<()> {
                 // always defined and the user expects immediate expansion.
                 let cmd = cli.command.join(" ");
                 let cmd = if cli.shell == "cmd" {
-                    let step1 = rewrite_dollar_refs_for_cmd(&cmd, &exec_env_names);
-                    rewrite_percent_refs_for_cmd(&step1, &exec_env_names)
+                    // sh-style `$VAR` references in the user command
+                    // get converted to cmd-style `%VAR%` so users
+                    // can write either form. The `%VAR%` references
+                    // (whether from the user or from this rewrite)
+                    // are then handled by the inner `cmd /c "…"`
+                    // wrap below — the inner cmd's parse-time
+                    // expansion sees `$VAR`/`%VAR%` and substitutes
+                    // correctly because the preceding `set "VAR=v"`
+                    // has already run in the outer cmd's env (the
+                    // inner cmd inherits the parent's env).
+                    rewrite_dollar_refs_for_cmd(&cmd, &exec_env_names)
                 } else {
                     cmd
                 };
                 let full = format!("{}{}", prefix, cmd);
-                // For cmd mode with exec_env to set, wrap the full
-                // prelude+user-command in `cmd /v:on /c "…"`. The `/v:on`
-                // flag enables cmd.exe's delayed expansion BEFORE the
-                // inner `cmd` parses the string — which is what makes the
-                // `%KNOWN%` → `!KNOWN!` rewrite in the user command
-                // actually expand at execution time (after the `set "X=v"`
-                // runs), not at parse time. `setlocal
-                // enabledelayedexpansion` inside the prelude didn't work
-                // because the outer `cmd /c "…"` parses the whole string
-                // upfront, before the setlocal takes effect (CI windows-2022
-                // second attempt: stdout was literal `!PHR_TEST_VAR!`).
-                // Any `"` in the inner string is escaped as `\"` so the
-                // outer `cmd` sees the inner string as a single quoted
-                // arg of its own `cmd` invocation.
+                // For cmd mode with exec_env to set, wrap the user
+                // command in a NESTED `cmd /c "…"`. The outer cmd
+                // (started by sshd) parses the whole string
+                // upfront — its parse-time expansion of `%X%` would
+                // see X as undefined and leave the reference as
+                // literal (or empty), even though `set "X=1"`
+                // appears earlier in the same string. The nested
+                // `cmd /c "…"` gives the user command its OWN parse
+                // context, AFTER the `set` has run, so the inner
+                // cmd's parse of `%X%` sees X already populated.
+                // Concretely: passhrs exec payload is
+                //     set "X=1" & cmd /c "echo %X%"
+                // sshd starts cmd.exe /c "<above>"; the outer cmd
+                // parses, sees `cmd /c "echo %X%"` as a single
+                // sub-command, and dispatches to the inner cmd with
+                // the literal /c arg `echo %X%` (X undefined at
+                // outer's parse time, so the outer leaves it as
+                // literal `%X%`). The inner cmd then parses
+                // `echo %X%` in its own context, where X is
+                // inherited as set, and expands `%X%` correctly.
+                // Any `"` in the user command is escaped as `\"` so
+                // the outer cmd treats the inner string as a single
+                // quoted arg of its `cmd` invocation.
                 let full = if cli.shell == "cmd" && !parts.is_empty() {
-                    let escaped = full.replace('"', r#"\""#);
-                    format!(r#"cmd /v:on /c "{}""#, escaped)
+                    let user = cmd.clone();
+                    let user_escaped = user.replace('"', r#"\""#);
+                    let set_block = build_exec_env_prefix(&parts, &cli.shell);
+                    // set_block already ends with " & " for cmd
+                    // mode. Append the wrapped user command.
+                    format!(r#"{}cmd /c "{}""#, set_block, user_escaped)
                 } else {
                     full
                 };
@@ -723,7 +680,6 @@ mod exec_env_shell_tests {
 
     use super::{
         build_exec_env_prefix, is_ident_cont, is_ident_start, rewrite_dollar_refs_for_cmd,
-        rewrite_percent_refs_for_cmd,
     };
 
     #[test]
@@ -800,7 +756,7 @@ mod exec_env_shell_tests {
         assert_eq!(out, "%A%%B%");
     }
 
-    // ---- build_exec_env_prefix: separator + delayed expansion (Issue #5) ----
+    // ---- build_exec_env_prefix: separator + nested cmd /c wrap (Issue #5) ----
     //
     // Two related bugs were caught on windows-2022:
     //   1. `;` is not a separator in cmd.exe — the original `;` join
@@ -810,10 +766,11 @@ mod exec_env_shell_tests {
     //   2. Even with `&`, cmd.exe `cmd /c "…"` expands `%X%` at
     //      PARSE time of the whole string, BEFORE any command runs.
     //      So `set "X=1" & echo %X%` echoes literal `%X%` (X
-    //      undefined at parse time). Fix: prepend `setlocal
-    //      enabledelayedexpansion` and rewrite `%KNOWN_VAR%` →
-    //      `!KNOWN_VAR!` in the user command (see
-    //      `rewrite_percent_refs_for_cmd`).
+    //      undefined at parse time). Fix: the call site wraps the
+    //      user command in a nested `cmd /c "…"` so the inner
+    //      cmd's parse-time expansion of `%X%` sees X as inherited
+    //      and populated (the preceding `set "X=v"` has already run
+    //      in the outer's env).
 
     #[test]
     fn prefix_sh_uses_semicolon_separator() {
@@ -827,10 +784,12 @@ mod exec_env_shell_tests {
 
     #[test]
     fn prefix_cmd_uses_ampersand_separator() {
-        // The `cmd /v:on /c "…"` wrap (assembled in main, not here)
-        // is what enables delayed expansion for the inner cmd.
-        // The prefix's job is just to emit the set lines joined
-        // with cmd.exe's `&` sequence operator.
+        // The nested `cmd /c "…"` wrap (assembled in main, not
+        // here) is what re-parses the user command in a fresh
+        // cmd.exe context, AFTER the `set "X=v"` lines have run
+        // in the outer's env. The prefix's job is just to emit
+        // the set lines joined with cmd.exe's `&` sequence
+        // operator.
         let parts = vec![r#"set "PHR_TEST_VAR=hello_from_env""#.to_string()];
         let p = build_exec_env_prefix(&parts, "cmd");
         assert_eq!(p, r#"set "PHR_TEST_VAR=hello_from_env" & "#);
@@ -846,72 +805,13 @@ mod exec_env_shell_tests {
     #[test]
     fn prefix_empty_parts_returns_empty_string() {
         // No --exec-env supplied — no prefix, no leading separator,
-        // and no `setlocal enabledelayedexpansion` (no point
-        // enabling delayed expansion if nothing is being set).
+        // and no `cmd /c "…"` wrap (nothing to re-parse in a fresh
+        // cmd context).
         let p = build_exec_env_prefix(&[], "sh");
         assert_eq!(p, "");
         let p = build_exec_env_prefix(&[], "cmd");
         assert_eq!(p, "");
     }
 
-    // ---- rewrite_percent_refs_for_cmd: delayed-expansion rewrite ----
-    //
-    // Companion to the `setlocal enabledelayedexpansion` prologue.
-    // Without this rewrite, cmd.exe expands `%X%` at parse time of
-    // the whole `cmd /c "…"` string — BEFORE the `set "X=v"` runs
-    // — and the user command sees the undefined value. The rewrite
-    // turns known `%X%` references into `!X!` so delayed expansion
-    // fires at execution time, after `set`.
-
-    #[test]
-    fn percent_rewrite_substitutes_known_names() {
-        let out = rewrite_percent_refs_for_cmd(
-            "echo %FOO% and %BAR_BAZ% then %UNRELATED%",
-            &["FOO".into(), "BAR_BAZ".into()],
-        );
-        assert_eq!(out, "echo !FOO! and !BAR_BAZ! then %UNRELATED%");
-    }
-
-    #[test]
-    fn percent_rewrite_passthrough_when_no_env_names() {
-        // No --exec-env was passed; nothing should be rewritten —
-        // leaves built-in cmd vars like %PATH% to their normal
-        // immediate expansion.
-        let out = rewrite_percent_refs_for_cmd("echo %PATH% stays as-is", &[]);
-        assert_eq!(out, "echo %PATH% stays as-is");
-    }
-
-    #[test]
-    fn percent_rewrite_preserves_builtin_known_looking_vars() {
-        // `%PATH%` looks like a candidate but PATH isn't in
-        // env_names, so it must NOT be rewritten — users rely on
-        // immediate expansion for built-in cmd vars.
-        let out = rewrite_percent_refs_for_cmd("echo %PATH% vs %FOO%", &["FOO".into()]);
-        assert_eq!(out, "echo %PATH% vs !FOO!");
-    }
-
-    #[test]
-    fn percent_rewrite_leaves_unclosed_percent_alone() {
-        // `%X` (no closing `%`) is not a valid reference. Leave
-        // untouched so cmd.exe's own parser decides what to do.
-        let out = rewrite_percent_refs_for_cmd("price: 5% then %FOO%", &["FOO".into()]);
-        assert_eq!(out, "price: 5% then !FOO!");
-    }
-
-    #[test]
-    fn percent_rewrite_preserves_double_percent_literal() {
-        // `%%` is cmd.exe's escape for a literal `%` (e.g. in a
-        // `for` loop). Don't treat it as a reference.
-        let out = rewrite_percent_refs_for_cmd("100%%done then %FOO%", &["FOO".into()]);
-        assert_eq!(out, "100%%done then !FOO!");
-    }
-
-    #[test]
-    fn percent_rewrite_handles_alphanumeric_and_underscore() {
-        let out = rewrite_percent_refs_for_cmd(
-            "x=%FOO123% y=%_UNDERSCORE%",
-            &["FOO123".into(), "_UNDERSCORE".into()],
-        );
-        assert_eq!(out, "x=!FOO123! y=!_UNDERSCORE!");
-    }
+    // ---- end of exec_env_shell_tests ----
 }
