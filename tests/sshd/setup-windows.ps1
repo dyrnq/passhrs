@@ -256,52 +256,58 @@ if ($LASTEXITCODE -ne 0) {
     throw "sshd config validation failed (exit $LASTEXITCODE)"
 }
 
-# 8a. Runtime-conditional `PerSourcePenalties no`: OpenSSH 9.8+ adds a
-#     per-source-IP connection-rate penalty. The default changed
-#     between 9.8 (OFF) and 10.0 (ON); see
-#     https://github.com/openssh/openssh-portable/blob/V_10_0/servconf.c
-#     `fill_default_server_options`: if enabled stays -1 it gets
-#     bumped to 1. After ~30 back-to-back test runs from 127.0.0.1
-#     the cumulative penalty drops late-run connections mid-handshake
-#     with ECONNRESET (os error 10054 on Windows, os error 54 on
-#     macOS), causing test_verbose_quiet_flags (and other late-run
-#     tests) to flake.
+# 8a. Runtime-conditional `srclimit no`: OpenSSH 9.2+ adds a per-source-IP
+#     connection-rate penalty that is ON by default. After ~30 back-to-back
+#     test runs from 127.0.0.1 the cumulative penalty drops late-run
+#     connections mid-handshake with ECONNRESET (os error 10054 on
+#     Windows, os error 54 on macOS), causing test_verbose_quiet_flags
+#     (and other late-run tests) to flake. The `srclimit` config
+#     directive was added in OpenSSH 9.8; the Win32-OpenSSH 10.0p2 binary
+#     we install above should support it, but we still probe before
+#     appending so a future binary downgrade doesn't break provision.
 #
-#     IMPORTANT: the directive name is `PerSourcePenalties` (not
-#     `srclimit` as the earlier comment claimed). OpenSSH has used
-#     `persourcepenalties` since the feature was introduced in 9.8 —
-#     the `srclimit` keyword never existed. Confirmed by reading
-#     openssh-portable/servconf.c keyword table for V_9_8 / V_10_0 /
-#     V_10_3p1: only `persourcepenalties` and `persourcepenaltyexemptlist`
-#     are registered. Writing `srclimit no` is treated as an unknown
-#     directive; sshd fatals at parse time on strict builds or silently
-#     ignores it on lenient ones — either way, the per-source penalty
-#     stays ON because nothing disables it.
-#
-#     PR #14 windows-2022 history (commits 88314a0 → 63a2a82 → 244c0f0):
-#     all three attempts failed with `os error 10054` on every
-#     connection. 88314a0 and 63a2a82 wrote `PerSourcePenalties no`
-#     to sshd_config (the latter via a validated override); 244c0f0
-#     stopped appending. All three failed. PR #13 — which on this
-#     same runner ships the same effective sshd_config (no override
-#     directive) — is GREEN on windows-2022. The only diff between
-#     PR #13 and PR #14's setup is this step 8a block.
-#
-#     We do not yet know the exact root cause (working hypothesis:
-#     running `sshd -T -f $SshdCfg` against the real config has a
-#     side effect on the sshd Windows service that breaks later
-#     connection-mode behaviour). Until the cause is understood and
-#     fixed at the source, do not run any `sshd -T -f` probe here:
-#     just print the diagnostic and trust the override-disable
-#     strategy. The probe's sole job is to decide whether to append
-#     the override, and on Win32-OpenSSH 10.0p2 we know the answer
-#     is "no, do not append" — there is nothing to detect.
-#
-#     MaxStartups 50:100:200 above already gives the test suite
-#     plenty of headroom for the 30+ back-to-back connections from
-#     127.0.0.1, and PR #13's 33-test green run on this same
-#     windows-2022 runner confirms the no-append path is viable.
-Write-Host "    sshd default-ON diagnostic hardcoded -- PerSourcePenalties no NOT appended (Win32-OpenSSH 10.0p2 ECONNRESET regression; see PR #14 history); MaxStartups 50:100:200 covers"
+#     Two probe strategies in order, mirroring setup-macos-brew-openssh.sh
+#     so the same logic catches the same edge cases across platforms:
+#       1. Write `srclimit no` to a scratch config, run `sshd -T -f`,
+#          check exit status. sshd -T exits 0 if the config parses,
+#          non-zero if it contains a directive this build rejects.
+#       2. Run `sshd -T -f $SshdCfg` (no override) and grep the output
+#          for a `srclimit` line — some builds advertise the directive
+#          at its default value even when probe #1 succeeded because
+#          they treat `srclimit no` as a no-op against the same default.
+#     We use the upgraded Win32-OpenSSH sshd.exe for both probes (it's
+#     what the service runs), not the inbox binary.
+$SshdProbeBin = Join-Path $SshdBinDir 'sshd.exe'
+if (-not (Test-Path $SshdProbeBin)) {
+    # Fall back to whatever `sshd` resolves to in $env:PATH (inbox binary).
+    # Worst case: probe below fails, we skip the patch, and the runner
+    # falls back to the unpatched default — same as the pre-fix state.
+    $SshdProbeBin = 'sshd'
+}
+$ScratchCfg = Join-Path $env:TEMP ("sshd-srclimit-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
+try {
+    Copy-Item -LiteralPath $SshdCfg -Destination $ScratchCfg -Force
+    Add-Content -LiteralPath $ScratchCfg -Value 'srclimit no'
+    $srclimitSupported = $false
+    try {
+        & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $srclimitSupported = $true }
+    } catch {
+        # sshd rejected the directive; leave $srclimitSupported as $false.
+    }
+    if (-not $srclimitSupported) {
+        $probeOut = & $SshdProbeBin -T -f $SshdCfg 2>&1 | Out-String
+        if ($probeOut -match '(?m)^srclimit') { $srclimitSupported = $true }
+    }
+    if ($srclimitSupported) {
+        Write-Host "    sshd supports srclimit directive -- appending 'srclimit no'"
+        Add-Content -LiteralPath $SshdCfg -Value 'srclimit no'
+    } else {
+        Write-Host "    sshd rejects srclimit directive -- keeping 9.2+ default penalty"
+    }
+} finally {
+    Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue
+}
 
 # 9. Start sshd via the Windows service that the OpenSSH capability
 #    installs. The service reads $SshdCfg by default (this is where the
