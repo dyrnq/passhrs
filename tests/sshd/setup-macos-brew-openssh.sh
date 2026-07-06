@@ -224,39 +224,69 @@ sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
 # ignores it on lenient ones — either way, the per-source penalty
 # stays ON because nothing disables it.
 #
-# Two probe strategies in order (the original 7388b7a pattern is
-# kept so a future binary downgrade or rename still degrades
-# gracefully to "no override"):
-#   1. Write `PerSourcePenalties no` to a scratch config, run
-#      `sshd -T -f`, and DEFINITIVELY grep the output for a line
-#      matching `^persourcepenalties no\b`. Exit-code-only probing
-#      is not reliable — some sshd builds parse the directive
-#      without error but report it as the default value (i.e. they
-#      print `persourcepenalties yes` even when the config says
-#      `no`); the grep catches that.
-#   2. Fallback for binaries that don't advertise per-source
-#      penalties in -T output at all: rely on probe 1's exit code
-#      alone (sshd -T exits non-zero on parse error).
+# Two probe strategies in order (revised after PR #14 windows-2022
+# failure exposed a false-positive in the original single-probe
+# approach):
+#   1. Run `sshd -T -f` against the BASELINE config (no override
+#      directive) and inspect the dump output:
+#        - OpenSSH 10.0+ (default ON): prints a long stats line
+#          beginning with `persourcepenalties crash:` — penalty is
+#          ACTIVE, we need to override.
+#        - OpenSSH 9.8 (default OFF): prints `persourcepenalties no`
+#          — penalty is ALREADY off, the directive is a no-op, do
+#          NOT append.
+#   2. If (and only if) the baseline says default-ON, write
+#      `PerSourcePenalties no` to a scratch config, re-run `sshd -T
+#      -f`, and confirm the dump output FLIPS to
+#      `persourcepenalties no` AND the `crash:` line is gone.
+#      Belt-and-braces against a build where the directive parses
+#      but is silently ignored (uncommon, cheap to detect).
+#
+# Why the original single-probe pattern was wrong: OpenSSH 9.8's
+# dump function emits `persourcepenalties no` whenever
+# `per_source_penalty.enabled == 0`, regardless of whether the
+# directive was explicitly set or just defaulted. So matching that
+# line in the scratch config (where we wrote the directive) was
+# meaningless — the same line would have appeared without it. The
+# probe always matched on default-OFF binaries, and appending the
+# directive to sshd_config on Win32-OpenSSH 10.0p2 broke every
+# Windows integration test connection with os error 10054.
 SCRATCH_CFG="$(mktemp -t sshd-persrc-probe.XXXXXX)"
-cp "${SSHD_CFG}" "${SCRATCH_CFG}"
-printf '\nPerSourcePenalties no\n' >> "${SCRATCH_CFG}"
-PROBE_OUT="$("${SSHD_BIN}" -T -f "${SCRATCH_CFG}" 2>&1)"
-PROBE_RC=$?
-if [ "${PROBE_RC}" -eq 0 ] \
-    && printf '%s\n' "${PROBE_OUT}" | grep -qiE '^persourcepenalties[[:space:]]+no\b'; then
-    echo "    sshd accepts and reports 'PerSourcePenalties no' — appending"
-    cat >> "${SSHD_CFG}" <<'EOF'
+DEFAULT_OUT="$("${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1)"
+DEFAULT_RC=$?
+if [ "${DEFAULT_RC}" -ne 0 ]; then
+    echo "    sshd -T baseline probe failed (rc=${DEFAULT_RC}); skipping PerSourcePenalties override"
+elif printf '%s\n' "${DEFAULT_OUT}" | grep -qE '^persourcepenalties[[:space:]]+crash:'; then
+    # Default-ON binary (OpenSSH 10.0+ dump format). Validate the
+    # override flips the dump to `persourcepenalties no` before
+    # committing to it.
+    cp "${SSHD_CFG}" "${SCRATCH_CFG}"
+    printf '\nPerSourcePenalties no\n' >> "${SCRATCH_CFG}"
+    OVERRIDE_OUT="$("${SSHD_BIN}" -T -f "${SCRATCH_CFG}" 2>&1)"
+    OVERRIDE_RC=$?
+    if [ "${OVERRIDE_RC}" -eq 0 ] \
+        && printf '%s\n' "${OVERRIDE_OUT}" | grep -qiE '^persourcepenalties[[:space:]]+no\b' \
+        && ! printf '%s\n' "${OVERRIDE_OUT}" | grep -qE '^persourcepenalties[[:space:]]+crash:'; then
+        echo "    sshd default is ON, 'PerSourcePenalties no' applied as effective — appending"
+        cat >> "${SSHD_CFG}" <<'EOF'
 
-# Disable per-source-IP connection penalty (Issue #9). OpenSSH 9.8+
+# Disable per-source-IP connection penalty (Issue #9). OpenSSH 10.0+
 # enables this by default; the test suite hammers 127.0.0.1 with
 # ~30+ connections during one job, so without this override the
 # last ~2 integration tests get mid-handshake ECONNRESET drops.
 PerSourcePenalties no
 EOF
-elif [ "${PROBE_RC}" -eq 0 ]; then
-    echo "    sshd parses 'PerSourcePenalties no' but does not report it as effective — skipping (penalty will stay ON)"
+    else
+        echo "    sshd default is ON but 'PerSourcePenalties no' did not flip dump output (rc=${OVERRIDE_RC}); keeping default (penalty stays ON; MaxStartups should cover)"
+    fi
+elif printf '%s\n' "${DEFAULT_OUT}" | grep -qiE '^persourcepenalties[[:space:]]+no\b'; then
+    # Default-OFF binary (OpenSSH 9.8 dump format). The directive is
+    # a no-op; do NOT append.
+    echo "    sshd default is OFF ('persourcepenalties no') — no override needed"
 else
-    echo "    sshd rejects 'PerSourcePenalties no' (rc=${PROBE_RC}) — keeping 9.8+ default penalty"
+    # Either binary predates PerSourcePenalties (pre-9.8) or its
+    # dump output is unexpected. Skip — same as the pre-fix state.
+    echo "    sshd dump output has no persourcepenalties line — pre-9.8 binary or unexpected, keeping default"
 fi
 rm -f "${SCRATCH_CFG}"
 cat >> "${SSHD_CFG}" <<EOF

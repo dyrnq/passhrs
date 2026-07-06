@@ -257,12 +257,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # 8a. Runtime-conditional `PerSourcePenalties no`: OpenSSH 9.8+ adds a
-#     per-source-IP connection-rate penalty that is ON by default.
-#     After ~30 back-to-back test runs from 127.0.0.1 the cumulative
-#     penalty drops late-run connections mid-handshake with
-#     ECONNRESET (os error 10054 on Windows, os error 54 on macOS),
-#     causing test_verbose_quiet_flags (and other late-run tests) to
-#     flake.
+#     per-source-IP connection-rate penalty. The default changed
+#     between 9.8 (OFF) and 10.0 (ON); see
+#     https://github.com/openssh/openssh-portable/blob/V_10_0/servconf.c
+#     `fill_default_server_options`: if enabled stays -1 it gets
+#     bumped to 1. After ~30 back-to-back test runs from 127.0.0.1
+#     the cumulative penalty drops late-run connections mid-handshake
+#     with ECONNRESET (os error 10054 on Windows, os error 54 on
+#     macOS), causing test_verbose_quiet_flags (and other late-run
+#     tests) to flake.
 #
 #     IMPORTANT: the directive name is `PerSourcePenalties` (not
 #     `srclimit` as the earlier comment claimed). OpenSSH has used
@@ -275,45 +278,97 @@ if ($LASTEXITCODE -ne 0) {
 #     ignores it on lenient ones — either way, the per-source penalty
 #     stays ON because nothing disables it.
 #
-#     Probe strategy: write `PerSourcePenalties no` to a scratch
-#     config, run `sshd -T -f`, DEFINITIVELY grep the output for a
-#     line matching `^persourcepenalties no\b`. Exit-code-only probing
-#     is not reliable — some sshd builds parse the directive without
-#     error but report it as the default value (i.e. they print
-#     `persourcepenalties yes` even when the config says `no`); the
-#     grep catches that. We use the upgraded Win32-OpenSSH sshd.exe
-#     for both probes (it's what the service runs), not the inbox
-#     binary.
+#     Probe strategy (revised after PR #14 windows-2022 failure): the
+#     earlier single-probe approach (write `PerSourcePenalties no` to a
+#     scratch config and grep sshd -T -f output for
+#     `^persourcepenalties no\b`) has a false-positive bug on binaries
+#     whose dump function emits `persourcepenalties no` for the
+#     default-OFF state. Upstream OpenSSH 9.8's
+#     `dump_config_func` emits that exact line whenever
+#     `per_source_penalty.enabled == 0`, which is BOTH the default
+#     state (no directive set) AND the state after an explicit
+#     `PerSourcePenalties no`. The probe cannot distinguish the two
+#     cases, so it always matched and always appended. Appending
+#     `PerSourcePenalties no` to sshd_config on Win32-OpenSSH 10.0p2
+#     broke every test connection with os error 10054 (PR #14);
+#     PR #13 had no append and was green.
+#
+#     Corrected probe: run `sshd -T -f $SshdCfg` against the BASELINE
+#     config (no override directive) and inspect the default dump
+#     output.
+#       - OpenSSH 10.0+ dump emits a long stats line beginning with
+#         `persourcepenalties crash:` when enabled=1 (default ON).
+#       - OpenSSH 9.8 dump emits `persourcepenalties no` when
+#         enabled=0 (default OFF).
+#     We only append `PerSourcePenalties no` when we observe the
+#     default-ON line — i.e. when we genuinely need to override.
+#     When the default already says `persourcepenalties no`, the
+#     directive is a no-op and writing it triggered the Win32-OpenSSH
+#     10.0p2 regression we just saw. We use the upgraded Win32-OpenSSH
+#     sshd.exe for the probe (it's what the service runs), not the
+#     inbox binary.
 $SshdProbeBin = Join-Path $SshdBinDir 'sshd.exe'
 if (-not (Test-Path $SshdProbeBin)) {
-    # Fall back to whatever `sshd` resolves to in $env:PATH (inbox binary).
-    # Worst case: probe below fails, we skip the patch, and the runner
-    # falls back to the unpatched default — same as the pre-fix state.
+    # Fall back to whatever `sshd` resolves to in $env:PATH (inbox
+    # binary). Worst case: probe below fails, we skip the patch, and
+    # the runner falls back to the unpatched default — same as the
+    # pre-fix state.
     $SshdProbeBin = 'sshd'
 }
-$ScratchCfg = Join-Path $env:TEMP ("sshd-persrc-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
+$defaultProbeOut = ''
+$defaultProbeRc = 1
 try {
-    Copy-Item -LiteralPath $SshdCfg -Destination $ScratchCfg -Force
-    Add-Content -LiteralPath $ScratchCfg -Value 'PerSourcePenalties no'
-    $persrcSupported = $false
-    $probeOut = ''
+    $defaultProbeOut = & $SshdProbeBin -T -f $SshdCfg 2>&1 | Out-String
+    $defaultProbeRc = $LASTEXITCODE
+} catch {
+    # Probe failed entirely; leave the directive alone (same as the
+    # pre-fix state). Better to keep the working config than to add
+    # a directive we cannot verify.
+}
+if ($defaultProbeRc -eq 0 -and $defaultProbeOut -match '(?m)^persourcepenalties\s+crash:') {
+    # Default-ON binary (OpenSSH 10.0+ dump format). The long stats
+    # line means the penalty is active. Validate the override by
+    # re-running sshd -T -f on a scratch config with the directive
+    # appended, and confirm the dump flips to `persourcepenalties no`
+    # AND the `crash:` line is gone. Belt-and-braces against a build
+    # where the directive parses but is silently ignored.
+    $ScratchCfg = Join-Path $env:TEMP ("sshd-persrc-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
+    $persrcApplied = $false
     try {
-        $probeOut = & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-String
-        if ($LASTEXITCODE -eq 0 `
-                -and $probeOut -match '(?m)^persourcepenalties[ \t]+no\b') {
-            $persrcSupported = $true
+        Copy-Item -LiteralPath $SshdCfg -Destination $ScratchCfg -Force
+        Add-Content -LiteralPath $ScratchCfg -Value 'PerSourcePenalties no'
+        try {
+            $overrideProbeOut = & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0 `
+                    -and $overrideProbeOut -match '(?m)^persourcepenalties[ \t]+no\b' `
+                    -and $overrideProbeOut -notmatch '(?m)^persourcepenalties\s+crash:') {
+                $persrcApplied = $true
+            }
+        } catch {
+            # sshd rejected the directive on the scratch config; skip.
         }
-    } catch {
-        # sshd rejected the directive; leave $persrcSupported as $false.
+    } finally {
+        Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue
     }
-    if ($persrcSupported) {
-        Write-Host "    sshd accepts and reports 'PerSourcePenalties no' -- appending"
+    if ($persrcApplied) {
+        Write-Host "    sshd default is ON, 'PerSourcePenalties no' applied as effective -- appending"
         Add-Content -LiteralPath $SshdCfg -Value 'PerSourcePenalties no'
     } else {
-        Write-Host "    sshd does not report 'PerSourcePenalties no' as effective -- keeping default penalty"
+        Write-Host "    sshd default is ON but 'PerSourcePenalties no' did not flip dump output -- keeping default (penalty stays ON; MaxStartups should cover)"
     }
-} finally {
-    Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue
+} elseif ($defaultProbeRc -eq 0 -and $defaultProbeOut -match '(?m)^persourcepenalties[ \t]+no\b') {
+    # Default-OFF binary (OpenSSH 9.8 dump format). The directive is
+    # a no-op; do NOT append. This is the case PR #13's setup
+    # effectively landed in (Win32-OpenSSH 10.0p2's default state
+    # matches 9.8's `enabled = 0` default), and PR #13 was green on
+    # windows-2022.
+    Write-Host "    sshd default is OFF ('persourcepenalties no') -- no override needed"
+} else {
+    # Either sshd rejected `sshd -T -f` on our config (unlikely after
+    # the `sshd -t` validation in step 8), or its dump output does
+    # not mention `persourcepenalties` at all (binary predates the
+    # feature; pre-9.8). Skip the patch -- same as the pre-fix state.
+    Write-Host "    sshd dump output has no persourcepenalties line -- pre-9.8 binary or probe failed, keeping default"
 }
 
 # 9. Start sshd via the Windows service that the OpenSSH capability
