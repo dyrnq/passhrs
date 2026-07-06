@@ -161,28 +161,24 @@ fn is_ident_cont(b: u8) -> bool {
 /// unconditional sequence operator — the closest equivalent to `;`
 /// in POSIX sh.
 ///
-/// Delayed-expansion prologue (cmd only): cmd.exe's `cmd /c "…"`
-/// expands `%X%` references at parse time of the WHOLE string,
-/// BEFORE any command runs — so even with `&` separating them,
-/// `set "X=1" & echo %X%` echoes literal `%X%` because X is still
-/// undefined when the parser looks at it. `setlocal
-/// enabledelayedexpansion` flips on the `!X!` syntax for the
-/// remainder of the cmd session; combined with
-/// `rewrite_percent_refs_for_cmd` (which turns `%KNOWN_VAR%` into
-/// `!KNOWN_VAR!`), the variable is expanded at execution time, AFTER
-/// the `set` has populated it. The prologue is only emitted when
-/// `parts` is non-empty (no point enabling delayed expansion if
-/// nothing is being set), and only in cmd mode.
+/// Delayed expansion is enabled at the call site (cmd mode with
+/// non-empty parts) by wrapping the full command in
+/// `cmd /v:on /c "…"`. Putting `setlocal enabledelayedexpansion`
+/// inside the prelude didn't work: cmd.exe `cmd /c "…"` expands
+/// `%X%` and `!X!` references at PARSE time of the WHOLE string,
+/// before any command runs — so the setlocal took effect AFTER the
+/// parser had already decided what to expand, and the `!X!` in the
+/// user command was left as literal. `/v:on` flips delayed
+/// expansion on BEFORE the inner `cmd` parses the string, which is
+/// what the rewrite (`%KNOWN%` → `!KNOWN!`) needs to expand at
+/// execution time. Combined with the rewrite, `!X!` is expanded
+/// AFTER the `set "X=v"` runs.
 fn build_exec_env_prefix(parts: &[String], shell: &str) -> String {
     if parts.is_empty() {
         return String::new();
     }
     if shell == "cmd" {
-        let setlines: Vec<String> = parts.to_vec();
-        format!(
-            "setlocal enabledelayedexpansion & {} & ",
-            setlines.join(" & ")
-        )
+        format!("{} & ", parts.join(" & "))
     } else {
         let separator = "; ";
         format!("{}{}", parts.join(separator), separator)
@@ -669,6 +665,26 @@ async fn main() -> Result<()> {
                     cmd
                 };
                 let full = format!("{}{}", prefix, cmd);
+                // For cmd mode with exec_env to set, wrap the full
+                // prelude+user-command in `cmd /v:on /c "…"`. The `/v:on`
+                // flag enables cmd.exe's delayed expansion BEFORE the
+                // inner `cmd` parses the string — which is what makes the
+                // `%KNOWN%` → `!KNOWN!` rewrite in the user command
+                // actually expand at execution time (after the `set "X=v"`
+                // runs), not at parse time. `setlocal
+                // enabledelayedexpansion` inside the prelude didn't work
+                // because the outer `cmd /c "…"` parses the whole string
+                // upfront, before the setlocal takes effect (CI windows-2022
+                // second attempt: stdout was literal `!PHR_TEST_VAR!`).
+                // Any `"` in the inner string is escaped as `\"` so the
+                // outer `cmd` sees the inner string as a single quoted
+                // arg of its own `cmd` invocation.
+                let full = if cli.shell == "cmd" && !parts.is_empty() {
+                    let escaped = full.replace('"', r#"\""#);
+                    format!(r#"cmd /v:on /c "{}""#, escaped)
+                } else {
+                    full
+                };
                 info!("Exec: {}", full);
                 channel.exec(true, full.as_bytes()).await?;
                 let code = run_session(channel, cli.redirect_stdin).await?;
@@ -810,27 +826,21 @@ mod exec_env_shell_tests {
     }
 
     #[test]
-    fn prefix_cmd_includes_setlocal_delayed_expansion() {
-        // The prologue is what makes the `%X%` → `!X!` rewrite in
-        // the user command actually expand at execution time
-        // instead of parse time. Drop it and the cmd.exe path
-        // silently breaks again on windows-2022.
+    fn prefix_cmd_uses_ampersand_separator() {
+        // The `cmd /v:on /c "…"` wrap (assembled in main, not here)
+        // is what enables delayed expansion for the inner cmd.
+        // The prefix's job is just to emit the set lines joined
+        // with cmd.exe's `&` sequence operator.
         let parts = vec![r#"set "PHR_TEST_VAR=hello_from_env""#.to_string()];
         let p = build_exec_env_prefix(&parts, "cmd");
-        assert_eq!(
-            p,
-            r#"setlocal enabledelayedexpansion & set "PHR_TEST_VAR=hello_from_env" & "#
-        );
+        assert_eq!(p, r#"set "PHR_TEST_VAR=hello_from_env" & "#);
     }
 
     #[test]
     fn prefix_cmd_multi_part_ampersand_join() {
         let parts = vec![r#"set "A=1""#.to_string(), r#"set "B=2""#.to_string()];
         let p = build_exec_env_prefix(&parts, "cmd");
-        assert_eq!(
-            p,
-            r#"setlocal enabledelayedexpansion & set "A=1" & set "B=2" & "#
-        );
+        assert_eq!(p, r#"set "A=1" & set "B=2" & "#);
     }
 
     #[test]
