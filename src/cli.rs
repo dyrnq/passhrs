@@ -256,16 +256,48 @@ pub(crate) fn parse_dynamic_spec(spec: &str) -> Result<DynamicForwardSpec> {
 // ======================================================================
 
 pub(crate) fn expand_path(path: &str) -> String {
-    if path == "~" {
+    let expanded = if path == "~" {
         if let Some(home) = dirs::home_dir() {
-            return home.display().to_string();
+            home.display().to_string()
+        } else {
+            path.to_string()
         }
     } else if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return format!("{}/{}", home.display(), rest);
+            format!("{}/{}", home.display(), rest)
+        } else {
+            path.to_string()
         }
-    }
-    path.to_string()
+    } else {
+        path.to_string()
+    };
+    // dirs::home_dir() on Windows returns a backslash-separated path
+    // (e.g. "C:\Users\foo"); the format!() join above then mixes it
+    // with a forward slash, producing "C:\Users\foo/rest". Pass the
+    // result through normalize_slashes so every downstream consumer
+    // (tokio::fs::*, sftp.*) sees a single separator convention.
+    normalize_slashes(&expanded)
+}
+
+/// Replace backslashes with forward slashes. No-op for Unix paths
+/// (which contain no backslash) and for already-normalized Windows
+/// paths. Used at parse-time in `parse_file_spec` so that the local
+/// half of a `--push`/`--pull`/`--rsync` spec round-trips cleanly
+/// through the SFTP layer (which forwards the path string literally
+/// to sshd) and through tokio::fs on Windows (which accepts either
+/// separator but is sloppy with mixed forms).
+fn normalize_slashes(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+/// True if `s` starts with a Windows drive-letter absolute prefix
+/// `[A-Za-z]:[\\/]` (e.g. `C:\…`, `D:/…`). UNC paths (`\\…` or
+/// `//…`) intentionally return false here: they don't carry a
+/// drive-letter colon, so their first `:` (if any) is correctly the
+/// local/remote separator that `parse_file_spec` looks for.
+fn starts_with_drive_letter(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 pub(crate) fn read_value_from_file(s: &str) -> Result<String> {
@@ -289,14 +321,25 @@ pub(crate) fn read_value_from_file(s: &str) -> Result<String> {
 }
 
 pub(crate) fn parse_file_spec(spec: &str) -> Result<(String, String)> {
-    if let Some(colon_idx) = spec.find(':') {
-        Ok((
-            spec[..colon_idx].to_string(),
-            spec[colon_idx + 1..].to_string(),
-        ))
+    // Windows drive-letter local paths (e.g. `C:\Users\foo:/remote/bar`)
+    // carry their own colon in byte position 1, so a naive first-`:` split
+    // breaks them. Detect the drive-letter prefix and skip past that colon,
+    // finding the *next* `:` as the local/remote separator. UNC paths
+    // (`\\server\share\file:/remote/bar`) have no drive-letter colon, so
+    // they fall through to the naive first-`:` split naturally — which is
+    // correct, since UNC's first `:` (if any) is the local/remote divider.
+    let colon_idx = if starts_with_drive_letter(spec) {
+        spec[3..]
+            .find(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid file spec: {}, expected local:remote", spec))
+            .map(|i| 3 + i)?
     } else {
-        bail!("invalid file spec: {}, expected local:remote", spec)
-    }
+        spec.find(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid file spec: {}, expected local:remote", spec))?
+    };
+    let local = normalize_slashes(&spec[..colon_idx]);
+    let remote = normalize_slashes(&spec[colon_idx + 1..]);
+    Ok((local, remote))
 }
 // =======================================================
 // SOCKS5 proxy
@@ -413,5 +456,164 @@ mod forward_spec_tests {
         assert!(parse_forward_spec("9090:localhost").is_err());
         // Non-numeric bind port with no bind address.
         assert!(parse_forward_spec("9090:localhost:notaport").is_err());
+    }
+}
+
+#[cfg(test)]
+mod file_spec_tests {
+    //! Unit tests for `parse_file_spec` and `expand_path`. Most of
+    //! these cover the Windows drive-letter colon collision fix
+    //! (Issue #4) — without the fix, `parse_file_spec("C:\foo:/r")`
+    //! returns local="C" / remote="\foo:/r" because the parser split
+    //! on the first `:` (the drive-letter colon) instead of the
+    //! second.
+
+    use super::{expand_path, parse_file_spec};
+
+    // ---- Drive-letter colon collision (Issue #4) ----
+
+    #[test]
+    fn drive_letter_backslash_split() {
+        let (l, r) = parse_file_spec(r"C:\Users\foo:/remote/bar").unwrap();
+        assert_eq!(l, "C:/Users/foo");
+        assert_eq!(r, "/remote/bar");
+    }
+
+    #[test]
+    fn drive_letter_forward_slash_split() {
+        let (l, r) = parse_file_spec("C:/Users/foo:/remote/bar").unwrap();
+        assert_eq!(l, "C:/Users/foo");
+        assert_eq!(r, "/remote/bar");
+    }
+
+    #[test]
+    fn drive_letter_lowercase() {
+        let (l, r) = parse_file_spec(r"c:\users\foo:/remote/bar").unwrap();
+        assert_eq!(l, "c:/users/foo");
+        assert_eq!(r, "/remote/bar");
+    }
+
+    #[test]
+    fn unc_backslash_split() {
+        // UNC paths have no drive-letter colon, so they fall through
+        // to the naive first-`:` split — the single `:` in the spec
+        // is the local/remote separator, which is correct.
+        let (l, r) = parse_file_spec(r"\\server\share\file:/remote/bar").unwrap();
+        assert_eq!(l, "//server/share/file");
+        assert_eq!(r, "/remote/bar");
+    }
+
+    #[test]
+    fn unc_forward_slash_split() {
+        let (l, r) = parse_file_spec("//server/share/file:/remote/bar").unwrap();
+        assert_eq!(l, "//server/share/file");
+        assert_eq!(r, "/remote/bar");
+    }
+
+    #[test]
+    fn ntfs_stream_first_post_drive_colon_wins() {
+        // With `C:\file:stream:/remote/bar`, the first `:` after the
+        // drive-letter prefix is the NTFS alternate-data-stream
+        // separator. The parser can't tell it apart from the
+        // local/remote separator, so the documented behavior is
+        // "first `:` after the drive letter wins" — i.e. the stream
+        // colon is treated as the spec divider. Result: local="C:/file",
+        // remote="stream:/remote/bar". This means NTFS streams in a
+        // `--push` local arg are not unambiguously supported; users
+        // with NTFS-stream requirements need a different escape
+        // mechanism (a future feature, not handled here).
+        let (l, r) = parse_file_spec(r"C:\file:stream:/remote/bar").unwrap();
+        assert_eq!(l, "C:/file");
+        assert_eq!(r, "stream:/remote/bar");
+    }
+
+    #[test]
+    fn drive_relative_falls_through_naively() {
+        // `C:foo` has no separator after the colon, so
+        // `starts_with_drive_letter` returns false (it requires the byte
+        // at position 2 to be `\` or `/`). The naive first-`:` split then
+        // applies: local="C", remote="foo". Documented as not-supported.
+        let (l, r) = parse_file_spec("C:foo").unwrap();
+        assert_eq!(l, "C");
+        assert_eq!(r, "foo");
+    }
+
+    // ---- Unix regression cases (must still pass) ----
+
+    #[test]
+    fn unix_paths_unchanged() {
+        let (l, r) = parse_file_spec("/local/path:/remote/path").unwrap();
+        assert_eq!(l, "/local/path");
+        assert_eq!(r, "/remote/path");
+    }
+
+    #[test]
+    fn unix_relative_local_unchanged() {
+        let (l, r) = parse_file_spec("relative/file:/remote").unwrap();
+        assert_eq!(l, "relative/file");
+        assert_eq!(r, "/remote");
+    }
+
+    #[test]
+    fn tilde_user_split_regression() {
+        // Issue #3 regression case: `~user@host:/path:/extra` must still
+        // split on the first `:`. The local half `~user@host` doesn't
+        // match `starts_with_drive_letter` (the leading `~` isn't an
+        // ASCII alphabetic), so the naive split applies.
+        let (l, r) = parse_file_spec("~user@host:/path:/extra").unwrap();
+        assert_eq!(l, "~user@host");
+        assert_eq!(r, "/path:/extra");
+    }
+
+    // ---- Invalid specs ----
+
+    #[test]
+    fn no_colon_is_error() {
+        assert!(parse_file_spec("nodivider").is_err());
+    }
+
+    #[test]
+    fn drive_letter_with_no_remote_colon_is_error() {
+        // `C:\foo` has a drive-letter colon but no further `:` to serve
+        // as the local/remote separator.
+        assert!(parse_file_spec(r"C:\foo").is_err());
+    }
+
+    #[test]
+    fn empty_remote_preserved() {
+        let (l, r) = parse_file_spec("/local/foo:").unwrap();
+        assert_eq!(l, "/local/foo");
+        assert_eq!(r, "");
+    }
+
+    // ---- expand_path normalization ----
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn expand_path_normalizes_windows_home() {
+        // dirs::home_dir() returns something like `C:\Users\foo`. After
+        // the fix, expand_path returns the home dir with forward slashes
+        // so downstream SFTP calls receive clean paths.
+        let p = expand_path("~/file");
+        assert!(!p.contains('\\'), "backslash leaked: {}", p);
+        assert!(
+            p.starts_with("C:/Users/") || p.contains(":/"),
+            "expected forward-slash absolute path, got {:?}",
+            p
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expand_path_unix_unchanged() {
+        // dirs::home_dir() returns an absolute path under the user's home
+        // — /home/<user> on most Linuxes, /Users/<user> on macOS, etc.
+        // Rather than hardcoding either prefix, just confirm the join
+        // produced an absolute path that ends with "/file" and contains
+        // no backslashes (the normalization invariant).
+        let p = expand_path("~/file");
+        assert!(p.starts_with('/'), "expected absolute path, got {:?}", p);
+        assert!(p.ends_with("/file"), "expected trailing /file, got {:?}", p);
+        assert!(!p.contains('\\'), "backslash leaked: {}", p);
     }
 }

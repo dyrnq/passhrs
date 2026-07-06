@@ -382,14 +382,6 @@ fn test_basic_command_exec() {
 // SFTP push / pull 集成测试
 // ======================================================================
 
-// Windows-only known issue: passhrs's `parse_file_spec` splits on the
-// first `:`. On Windows the local path is `C:\Users\...\foo.txt` which
-// contains a `:` after the drive letter, so the spec parses as
-// local="C", remote="\Users\...\foo.txt:/remote/...". Tracked as a
-// separate issue — see TODO follow-up. These tests are gated to
-// `cfg(unix)` until passhrs grows an escape mechanism (e.g. `\:` or
-// scheme-aware parsing) for drive letters.
-#[cfg(not(target_os = "windows"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_push_pull_file() {
@@ -448,7 +440,6 @@ fn test_push_pull_file() {
     let _ = std::fs::remove_file(&remote);
 }
 
-#[cfg(not(target_os = "windows"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_push_dir() {
@@ -534,7 +525,6 @@ fn setup_rsync_remote(remote_dir: &str) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_rsync_upload_basic() {
@@ -577,7 +567,6 @@ fn test_rsync_upload_basic() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
-#[cfg(not(target_os = "windows"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_rsync_delta() {
@@ -621,7 +610,6 @@ fn test_rsync_delta() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
-#[cfg(not(target_os = "windows"))]
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_rsync_with_exclude() {

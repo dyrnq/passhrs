@@ -24,6 +24,19 @@ use crate::proxy::*;
 use crate::sftp::*;
 use crate::ssh::*;
 use crate::types::{DynamicForwardSpec, ForwardSpec};
+
+/// True if `s` is an absolute filesystem path. Accepts both Unix
+/// (`/…`) and Windows drive-letter (`[A-Za-z]:[\\/]…`) forms.
+/// Strict superset of the previous `starts_with('/')` check — every
+/// input it used to accept still returns true here.
+fn is_absolute_path(s: &str) -> bool {
+    if s.starts_with('/') {
+        return true;
+    }
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -351,7 +364,7 @@ async fn main() -> Result<()> {
                 let (left, right) = parse_file_spec(s)?;
                 let left = expand_path(&left);
                 let right = expand_path(&right);
-                if !right.starts_with('/') || !left.starts_with('/') {
+                if !is_absolute_path(&right) || !is_absolute_path(&left) {
                     bail!("--rsync: both paths must be absolute. Format: --rsync /local/path:/remote/path");
                 }
                 info!("rsync upload: {} -> {}", left, right);
