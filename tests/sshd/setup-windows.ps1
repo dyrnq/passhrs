@@ -278,84 +278,30 @@ if ($LASTEXITCODE -ne 0) {
 #     ignores it on lenient ones — either way, the per-source penalty
 #     stays ON because nothing disables it.
 #
-#     Probe strategy (revised after PR #14 windows-2022 failure): the
-#     earlier single-probe approach (write `PerSourcePenalties no` to a
-#     scratch config and grep sshd -T -f output for
-#     `^persourcepenalties no\b`) has a false-positive bug on binaries
-#     whose dump function emits `persourcepenalties no` for the
-#     default-OFF state. Upstream OpenSSH 9.8's
-#     `dump_config_func` emits that exact line whenever
-#     `per_source_penalty.enabled == 0`, which is BOTH the default
-#     state (no directive set) AND the state after an explicit
-#     `PerSourcePenalties no`. The probe cannot distinguish the two
-#     cases, so it always matched and always appended. Appending
-#     `PerSourcePenalties no` to sshd_config on Win32-OpenSSH 10.0p2
-#     broke every test connection with os error 10054 (PR #14);
-#     PR #13 had no append and was green.
+#     PR #14 windows-2022 history (commits 88314a0 → 63a2a82 → 244c0f0):
+#     all three attempts failed with `os error 10054` on every
+#     connection. 88314a0 and 63a2a82 wrote `PerSourcePenalties no`
+#     to sshd_config (the latter via a validated override); 244c0f0
+#     stopped appending. All three failed. PR #13 — which on this
+#     same runner ships the same effective sshd_config (no override
+#     directive) — is GREEN on windows-2022. The only diff between
+#     PR #13 and PR #14's setup is this step 8a block.
 #
-#     Corrected probe: run `sshd -T -f $SshdCfg` against the BASELINE
-#     config (no override directive) and inspect the default dump
-#     output.
-#       - OpenSSH 10.0+ dump emits a long stats line beginning with
-#         `persourcepenalties crash:` when enabled=1 (default ON).
-#       - OpenSSH 9.8 dump emits `persourcepenalties no` when
-#         enabled=0 (default OFF).
-#     We only append `PerSourcePenalties no` when we observe the
-#     default-ON line — i.e. when we genuinely need to override.
-#     When the default already says `persourcepenalties no`, the
-#     directive is a no-op and writing it triggered the Win32-OpenSSH
-#     10.0p2 regression we just saw. We use the upgraded Win32-OpenSSH
-#     sshd.exe for the probe (it's what the service runs), not the
-#     inbox binary.
-$SshdProbeBin = Join-Path $SshdBinDir 'sshd.exe'
-if (-not (Test-Path $SshdProbeBin)) {
-    # Fall back to whatever `sshd` resolves to in $env:PATH (inbox
-    # binary). Worst case: probe below fails, we skip the patch, and
-    # the runner falls back to the unpatched default — same as the
-    # pre-fix state.
-    $SshdProbeBin = 'sshd'
-}
-$defaultProbeOut = ''
-$defaultProbeRc = 1
-try {
-    $defaultProbeOut = & $SshdProbeBin -T -f $SshdCfg 2>&1 | Out-String
-    $defaultProbeRc = $LASTEXITCODE
-} catch {
-    # Probe failed entirely; leave the directive alone (same as the
-    # pre-fix state). Better to keep the working config than to add
-    # a directive we cannot verify.
-}
-if ($defaultProbeRc -eq 0 -and $defaultProbeOut -match '(?m)^persourcepenalties\s+crash:') {
-    # Default-ON binary (OpenSSH 10.0+ dump format, observed on
-    # Win32-OpenSSH 10.0p2 which the upgrade step installs above).
-    # The directive parses and the override validates (sshd -T -f
-    # flips the dump output to `persourcepenalties no` and drops the
-    # `crash:` line), but writing `PerSourcePenalties no` to the
-    # REAL sshd_config causes every test connection to fail with os
-    # error 10054 (Winsock ECONNRESET) on the windows-2022 runner.
-    # Observed end-to-end on PR #14 commit 63a2a82: the directive
-    # correctly disabled the penalty in -T dump but broke the
-    # daemon-mode connection path. We do NOT know whether this is a
-    # Win32-OpenSSH 10.0p2 bug or a known limitation of the directive
-    # on this binary, but PR #13 (no append) was green on the same
-    # runner so we follow the same conservative approach here.
-    # MaxStartups 50:100:200 already gives the test suite plenty of
-    # headroom for the 30+ back-to-back connections from 127.0.0.1.
-    Write-Host "    sshd default is ON (PerSourcePenalties active) -- NOT appending 'PerSourcePenalties no' to avoid Win32-OpenSSH 10.0p2 ECONNRESET regression (PR #14 commit 63a2a82); MaxStartups should cover"
-} elseif ($defaultProbeRc -eq 0 -and $defaultProbeOut -match '(?m)^persourcepenalties[ \t]+no\b') {
-    # Default-OFF binary (OpenSSH 9.8 dump format). The directive is
-    # a no-op; do NOT append. This is the case PR #13's setup
-    # effectively landed in (Win32-OpenSSH 10.0p2's default state
-    # matches 9.8's `enabled = 0` default), and PR #13 was green on
-    # windows-2022.
-    Write-Host "    sshd default is OFF ('persourcepenalties no') -- no override needed"
-} else {
-    # Either sshd rejected `sshd -T -f` on our config (unlikely after
-    # the `sshd -t` validation in step 8), or its dump output does
-    # not mention `persourcepenalties` at all (binary predates the
-    # feature; pre-9.8). Skip the patch -- same as the pre-fix state.
-    Write-Host "    sshd dump output has no persourcepenalties line -- pre-9.8 binary or probe failed, keeping default"
-}
+#     We do not yet know the exact root cause (working hypothesis:
+#     running `sshd -T -f $SshdCfg` against the real config has a
+#     side effect on the sshd Windows service that breaks later
+#     connection-mode behaviour). Until the cause is understood and
+#     fixed at the source, do not run any `sshd -T -f` probe here:
+#     just print the diagnostic and trust the override-disable
+#     strategy. The probe's sole job is to decide whether to append
+#     the override, and on Win32-OpenSSH 10.0p2 we know the answer
+#     is "no, do not append" — there is nothing to detect.
+#
+#     MaxStartups 50:100:200 above already gives the test suite
+#     plenty of headroom for the 30+ back-to-back connections from
+#     127.0.0.1, and PR #13's 33-test green run on this same
+#     windows-2022 runner confirms the no-append path is viable.
+Write-Host "    sshd default-ON diagnostic hardcoded -- PerSourcePenalties no NOT appended (Win32-OpenSSH 10.0p2 ECONNRESET regression; see PR #14 history); MaxStartups 50:100:200 covers"
 
 # 9. Start sshd via the Windows service that the OpenSSH capability
 #    installs. The service reads $SshdCfg by default (this is where the
