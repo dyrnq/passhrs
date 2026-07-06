@@ -256,6 +256,59 @@ if ($LASTEXITCODE -ne 0) {
     throw "sshd config validation failed (exit $LASTEXITCODE)"
 }
 
+# 8a. Runtime-conditional `srclimit no`: OpenSSH 9.2+ adds a per-source-IP
+#     connection-rate penalty that is ON by default. After ~30 back-to-back
+#     test runs from 127.0.0.1 the cumulative penalty drops late-run
+#     connections mid-handshake with ECONNRESET (os error 10054 on
+#     Windows, os error 54 on macOS), causing test_verbose_quiet_flags
+#     (and other late-run tests) to flake. The `srclimit` config
+#     directive was added in OpenSSH 9.8; the Win32-OpenSSH 10.0p2 binary
+#     we install above should support it, but we still probe before
+#     appending so a future binary downgrade doesn't break provision.
+#
+#     Two probe strategies in order, mirroring setup-macos-brew-openssh.sh
+#     so the same logic catches the same edge cases across platforms:
+#       1. Write `srclimit no` to a scratch config, run `sshd -T -f`,
+#          check exit status. sshd -T exits 0 if the config parses,
+#          non-zero if it contains a directive this build rejects.
+#       2. Run `sshd -T -f $SshdCfg` (no override) and grep the output
+#          for a `srclimit` line — some builds advertise the directive
+#          at its default value even when probe #1 succeeded because
+#          they treat `srclimit no` as a no-op against the same default.
+#     We use the upgraded Win32-OpenSSH sshd.exe for both probes (it's
+#     what the service runs), not the inbox binary.
+$SshdProbeBin = Join-Path $SshdBinDir 'sshd.exe'
+if (-not (Test-Path $SshdProbeBin)) {
+    # Fall back to whatever `sshd` resolves to in $env:PATH (inbox binary).
+    # Worst case: probe below fails, we skip the patch, and the runner
+    # falls back to the unpatched default — same as the pre-fix state.
+    $SshdProbeBin = 'sshd'
+}
+$ScratchCfg = Join-Path $env:TEMP ("sshd-srclimit-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
+try {
+    Copy-Item -LiteralPath $SshdCfg -Destination $ScratchCfg -Force
+    Add-Content -LiteralPath $ScratchCfg -Value 'srclimit no'
+    $srclimitSupported = $false
+    try {
+        & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $srclimitSupported = $true }
+    } catch {
+        # sshd rejected the directive; leave $srclimitSupported as $false.
+    }
+    if (-not $srclimitSupported) {
+        $probeOut = & $SshdProbeBin -T -f $SshdCfg 2>&1 | Out-String
+        if ($probeOut -match '(?m)^srclimit') { $srclimitSupported = $true }
+    }
+    if ($srclimitSupported) {
+        Write-Host "    sshd supports srclimit directive -- appending 'srclimit no'"
+        Add-Content -LiteralPath $SshdCfg -Value 'srclimit no'
+    } else {
+        Write-Host "    sshd rejects srclimit directive -- keeping 9.2+ default penalty"
+    }
+} finally {
+    Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue
+}
+
 # 9. Start sshd via the Windows service that the OpenSSH capability
 #    installs. The service reads $SshdCfg by default (this is where the
 #    installer expects it). Starting via the service avoids the
