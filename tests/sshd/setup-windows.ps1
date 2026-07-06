@@ -256,27 +256,34 @@ if ($LASTEXITCODE -ne 0) {
     throw "sshd config validation failed (exit $LASTEXITCODE)"
 }
 
-# 8a. Runtime-conditional `srclimit no`: OpenSSH 9.2+ adds a per-source-IP
-#     connection-rate penalty that is ON by default. After ~30 back-to-back
-#     test runs from 127.0.0.1 the cumulative penalty drops late-run
-#     connections mid-handshake with ECONNRESET (os error 10054 on
-#     Windows, os error 54 on macOS), causing test_verbose_quiet_flags
-#     (and other late-run tests) to flake. The `srclimit` config
-#     directive was added in OpenSSH 9.8; the Win32-OpenSSH 10.0p2 binary
-#     we install above should support it, but we still probe before
-#     appending so a future binary downgrade doesn't break provision.
+# 8a. Runtime-conditional `PerSourcePenalties no`: OpenSSH 9.8+ adds a
+#     per-source-IP connection-rate penalty that is ON by default.
+#     After ~30 back-to-back test runs from 127.0.0.1 the cumulative
+#     penalty drops late-run connections mid-handshake with
+#     ECONNRESET (os error 10054 on Windows, os error 54 on macOS),
+#     causing test_verbose_quiet_flags (and other late-run tests) to
+#     flake.
 #
-#     Two probe strategies in order, mirroring setup-macos-brew-openssh.sh
-#     so the same logic catches the same edge cases across platforms:
-#       1. Write `srclimit no` to a scratch config, run `sshd -T -f`,
-#          check exit status. sshd -T exits 0 if the config parses,
-#          non-zero if it contains a directive this build rejects.
-#       2. Run `sshd -T -f $SshdCfg` (no override) and grep the output
-#          for a `srclimit` line — some builds advertise the directive
-#          at its default value even when probe #1 succeeded because
-#          they treat `srclimit no` as a no-op against the same default.
-#     We use the upgraded Win32-OpenSSH sshd.exe for both probes (it's
-#     what the service runs), not the inbox binary.
+#     IMPORTANT: the directive name is `PerSourcePenalties` (not
+#     `srclimit` as the earlier comment claimed). OpenSSH has used
+#     `persourcepenalties` since the feature was introduced in 9.8 —
+#     the `srclimit` keyword never existed. Confirmed by reading
+#     openssh-portable/servconf.c keyword table for V_9_8 / V_10_0 /
+#     V_10_3p1: only `persourcepenalties` and `persourcepenaltyexemptlist`
+#     are registered. Writing `srclimit no` is treated as an unknown
+#     directive; sshd fatals at parse time on strict builds or silently
+#     ignores it on lenient ones — either way, the per-source penalty
+#     stays ON because nothing disables it.
+#
+#     Probe strategy: write `PerSourcePenalties no` to a scratch
+#     config, run `sshd -T -f`, DEFINITIVELY grep the output for a
+#     line matching `^persourcepenalties no\b`. Exit-code-only probing
+#     is not reliable — some sshd builds parse the directive without
+#     error but report it as the default value (i.e. they print
+#     `persourcepenalties yes` even when the config says `no`); the
+#     grep catches that. We use the upgraded Win32-OpenSSH sshd.exe
+#     for both probes (it's what the service runs), not the inbox
+#     binary.
 $SshdProbeBin = Join-Path $SshdBinDir 'sshd.exe'
 if (-not (Test-Path $SshdProbeBin)) {
     # Fall back to whatever `sshd` resolves to in $env:PATH (inbox binary).
@@ -284,26 +291,26 @@ if (-not (Test-Path $SshdProbeBin)) {
     # falls back to the unpatched default — same as the pre-fix state.
     $SshdProbeBin = 'sshd'
 }
-$ScratchCfg = Join-Path $env:TEMP ("sshd-srclimit-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
+$ScratchCfg = Join-Path $env:TEMP ("sshd-persrc-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
 try {
     Copy-Item -LiteralPath $SshdCfg -Destination $ScratchCfg -Force
-    Add-Content -LiteralPath $ScratchCfg -Value 'srclimit no'
-    $srclimitSupported = $false
+    Add-Content -LiteralPath $ScratchCfg -Value 'PerSourcePenalties no'
+    $persrcSupported = $false
+    $probeOut = ''
     try {
-        & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) { $srclimitSupported = $true }
+        $probeOut = & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-String
+        if ($LASTEXITCODE -eq 0 `
+                -and $probeOut -match '(?m)^persourcepenalties[ \t]+no\b') {
+            $persrcSupported = $true
+        }
     } catch {
-        # sshd rejected the directive; leave $srclimitSupported as $false.
+        # sshd rejected the directive; leave $persrcSupported as $false.
     }
-    if (-not $srclimitSupported) {
-        $probeOut = & $SshdProbeBin -T -f $SshdCfg 2>&1 | Out-String
-        if ($probeOut -match '(?m)^srclimit') { $srclimitSupported = $true }
-    }
-    if ($srclimitSupported) {
-        Write-Host "    sshd supports srclimit directive -- appending 'srclimit no'"
-        Add-Content -LiteralPath $SshdCfg -Value 'srclimit no'
+    if ($persrcSupported) {
+        Write-Host "    sshd accepts and reports 'PerSourcePenalties no' -- appending"
+        Add-Content -LiteralPath $SshdCfg -Value 'PerSourcePenalties no'
     } else {
-        Write-Host "    sshd rejects srclimit directive -- keeping 9.2+ default penalty"
+        Write-Host "    sshd does not report 'PerSourcePenalties no' as effective -- keeping default penalty"
     }
 } finally {
     Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue

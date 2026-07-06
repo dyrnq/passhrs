@@ -204,34 +204,59 @@ sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
 #     there authenticate via the runner account which has fully-formed
 #     PAM records and UsePAM no would break the password path.
 sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
-# Runtime-conditional `srclimit no`: OpenSSH 9.2+ adds a per-source-IP
-# connection-rate penalty that is ON by default. After 30+ back-to-back
-# test runs from 127.0.0.1 the cumulative penalty drops late-run
-# connections mid-handshake with ECONNRESET, breaking the last 2
-# integration tests. The `srclimit` config directive was added in
-# OpenSSH 9.8; the 9.6p1/10.3p1 binaries shipping on the runners
-# historically rejected it as "Bad configuration option", which is why
-# the template keeps it commented out.
+# Runtime-conditional `PerSourcePenalties no`: OpenSSH 9.8+ adds a
+# per-source-IP connection-rate penalty that is ON by default. After
+# ~30 back-to-back test runs from 127.0.0.1 the cumulative penalty
+# drops late-run connections mid-handshake with ECONNRESET, breaking
+# the last 2 integration tests (Issue #9 — sshd log literally shows
+# `srclimit_penalise: ipv4: new 127.0.0.1/32 deferred penalty of N
+# seconds` and `drop connection #0 from [127.0.0.1]:N on [127.0.0.1]:
+# 22222 penalty: ...`).
 #
-# Two probe strategies in order:
-#   1. `sshd -T` line-level probe (cheap; works when sshd prints the
-#      effective srclimit value even at default)
-#   2. Write `srclimit no` to a scratch config, run `sshd -T -f`, check
-#      exit status. sshd -T exits 0 if the config parses, non-zero
-#      if it contains a directive this build does not recognise.
-# This dual-probe catches builds that DO accept the directive but do
-# NOT advertise it in -T output at default value.
-SCRATCH_CFG="$(mktemp -t sshd-srclimit-probe.XXXXXX)"
+# IMPORTANT: the directive name is `PerSourcePenalties` (not
+# `srclimit` as the earlier comment claimed). OpenSSH has used
+# `persourcepenalties` since the feature was introduced in 9.8 — the
+# `srclimit` keyword never existed. Confirmed by reading
+# openssh-portable/servconf.c keyword table for V_9_8 / V_10_0 /
+# V_10_3p1: only `persourcepenalties` and `persourcepenaltyexemptlist`
+# are registered. Writing `srclimit no` is treated as an unknown
+# directive; sshd fatals at parse time on strict builds or silently
+# ignores it on lenient ones — either way, the per-source penalty
+# stays ON because nothing disables it.
+#
+# Two probe strategies in order (the original 7388b7a pattern is
+# kept so a future binary downgrade or rename still degrades
+# gracefully to "no override"):
+#   1. Write `PerSourcePenalties no` to a scratch config, run
+#      `sshd -T -f`, and DEFINITIVELY grep the output for a line
+#      matching `^persourcepenalties no\b`. Exit-code-only probing
+#      is not reliable — some sshd builds parse the directive
+#      without error but report it as the default value (i.e. they
+#      print `persourcepenalties yes` even when the config says
+#      `no`); the grep catches that.
+#   2. Fallback for binaries that don't advertise per-source
+#      penalties in -T output at all: rely on probe 1's exit code
+#      alone (sshd -T exits non-zero on parse error).
+SCRATCH_CFG="$(mktemp -t sshd-persrc-probe.XXXXXX)"
 cp "${SSHD_CFG}" "${SCRATCH_CFG}"
-printf '\nsrclimit no\n' >> "${SCRATCH_CFG}"
-if "${SSHD_BIN}" -T -f "${SCRATCH_CFG}" >/dev/null 2>&1 \
-    || "${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1 | grep -qi '^srclimit'; then
-    echo "    sshd supports srclimit directive — appending 'srclimit no'"
-    cat >> "${SSHD_CFG}" <<EOF
-srclimit no
+printf '\nPerSourcePenalties no\n' >> "${SCRATCH_CFG}"
+PROBE_OUT="$("${SSHD_BIN}" -T -f "${SCRATCH_CFG}" 2>&1)"
+PROBE_RC=$?
+if [ "${PROBE_RC}" -eq 0 ] \
+    && printf '%s\n' "${PROBE_OUT}" | grep -qiE '^persourcepenalties[[:space:]]+no\b'; then
+    echo "    sshd accepts and reports 'PerSourcePenalties no' — appending"
+    cat >> "${SSHD_CFG}" <<'EOF'
+
+# Disable per-source-IP connection penalty (Issue #9). OpenSSH 9.8+
+# enables this by default; the test suite hammers 127.0.0.1 with
+# ~30+ connections during one job, so without this override the
+# last ~2 integration tests get mid-handshake ECONNRESET drops.
+PerSourcePenalties no
 EOF
+elif [ "${PROBE_RC}" -eq 0 ]; then
+    echo "    sshd parses 'PerSourcePenalties no' but does not report it as effective — skipping (penalty will stay ON)"
 else
-    echo "    sshd rejects srclimit directive — keeping 9.2+ default penalty"
+    echo "    sshd rejects 'PerSourcePenalties no' (rc=${PROBE_RC}) — keeping 9.8+ default penalty"
 fi
 rm -f "${SCRATCH_CFG}"
 cat >> "${SSHD_CFG}" <<EOF
