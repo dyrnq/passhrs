@@ -380,6 +380,13 @@ jobs:
           # connections produces ~50-200KB at DEBUG3; tailing the full
           # file would flood the live log view. The full file is
           # uploaded as an artifact (see "Upload sshd log (Windows)").
+          #
+          # We also write the same data to sshd-dump.txt in the workspace
+          # so a follow-up step can upload it as a downloadable artifact
+          # — useful when the live log view is hard to share (the dump
+          # can run to several hundred KB on a red run, which gets
+          # clipped in the GitHub UI). The on-screen output is unchanged.
+          $dumpFile = Join-Path $GITHUB_WORKSPACE 'sshd-dump.txt'
           $logs = @(
               "$env:ProgramData\ssh\logs\sshd-debug.log",
               "$env:ProgramData\ssh\logs\sshd.log",
@@ -387,14 +394,28 @@ jobs:
               "$env:ProgramData\ssh\logs\sshd",
               "$env:ProgramData\ssh\OpenSSH_ConfigDiag.log"
           )
+          $dump = New-Object System.Text.StringBuilder
+          [void]$dump.AppendLine("=== sshd dump at $(Get-Date -Format o) ===")
           foreach ($log in $logs) {
               if (Test-Path -LiteralPath $log) {
                   # sshd-debug.log is the protocol trace; tail 500
                   # lines. The other logs are short operational
                   # summaries; tail 200 like before.
                   $tailLines = if ($log -like '*sshd-debug.log*') { 500 } else { 200 }
-                  Write-Host "=== sshd log (tail $tailLines): $log ==="
-                  Get-Content -LiteralPath $log -Tail $tailLines -ErrorAction SilentlyContinue
+                  $header = "=== sshd log (tail $tailLines): $log ==="
+                  Write-Host $header
+                  [void]$dump.AppendLine($header)
+                  $content = Get-Content -LiteralPath $log -Tail $tailLines -ErrorAction SilentlyContinue
+                  if ($null -ne $content) {
+                      foreach ($line in $content) {
+                          Write-Host $line
+                          [void]$dump.AppendLine($line)
+                      }
+                  }
+              } else {
+                  $missing = "  (no $log)"
+                  Write-Host $missing
+                  [void]$dump.AppendLine($missing)
               }
           }
           $cfgs = @(
@@ -403,8 +424,16 @@ jobs:
           )
           foreach ($cfg in $cfgs) {
               if (Test-Path -LiteralPath $cfg) {
-                  Write-Host "=== sshd config: $cfg ==="
-                  Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+                  $header = "=== sshd config: $cfg ==="
+                  Write-Host $header
+                  [void]$dump.AppendLine($header)
+                  $content = Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+                  if ($null -ne $content) {
+                      foreach ($line in $content) {
+                          Write-Host $line
+                          [void]$dump.AppendLine($line)
+                      }
+                  }
               }
           }
           # Surface the OpenSSH-Server-Ini registry values too: a
@@ -412,9 +441,60 @@ jobs:
           # override silently inactive, and the -ddd log will be
           # empty. Showing the actual values in the failure log
           # tells us at-a-glance whether the override took effect.
-          Write-Host "=== OpenSSH-Server-Ini registry ==="
-          Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH-Server-Ini' -ErrorAction SilentlyContinue |
-              Format-List | Out-String | Write-Host
+          $regHeader = "=== OpenSSH-Server-Ini registry ==="
+          Write-Host $regHeader
+          [void]$dump.AppendLine($regHeader)
+          $reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH-Server-Ini' -ErrorAction SilentlyContinue
+          if ($null -eq $reg) {
+              $none = "  (HKLM:\SOFTWARE\OpenSSH-Server-Ini not present)"
+              Write-Host $none
+              [void]$dump.AppendLine($none)
+          } else {
+              $regStr = $reg | Format-List | Out-String
+              Write-Host $regStr
+              [void]$dump.AppendLine($regStr)
+          }
+          # Event Log queries. Bumped from 20 to 500 in PR #14
+          # diagnostic: a 33-test connection storm covers more than 20
+          # events on the OpenSSH/Operational channel, and the
+          # Authentication-failure events we want to see are at the
+          # END of the window (latest events), not the start. Always
+          # run these even if sshd-debug.log is empty: on Win32-OpenSSH
+          # builds that ignore LogFile/LogLevel, the Event Log is the
+          # only per-connection trace we have.
+          $evHeader = "=== OpenSSH/Operational Event Log (last 500) ==="
+          Write-Host $evHeader
+          [void]$dump.AppendLine($evHeader)
+          $ev = Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue
+          if ($null -eq $ev) {
+              $none = "  (no OpenSSH/Operational events)"
+              Write-Host $none
+              [void]$dump.AppendLine($none)
+          } else {
+              foreach ($e in $ev) {
+                  $line = "{0:O} {1}" -f $e.TimeCreated, $e.Message
+                  Write-Host $line
+                  [void]$dump.AppendLine($line)
+              }
+          }
+          Set-Content -LiteralPath $dumpFile -Value $dump.ToString() -Encoding utf8
+          Write-Host "Wrote dump to $dumpFile ($((Get-Item $dumpFile).Length) bytes)"
+
+      - name: Upload sshd dump on failure (Windows)
+        # Companion to "Dump sshd log on failure (Windows)": uploads
+        # the same data as a downloadable artifact so it can be diffed
+        # against a future green run, or fetched when the live log
+        # view is too large to read in the GitHub UI. The dump captures
+        # sshd-debug.log (the -ddd trace forced by setup-windows.ps1),
+        # sshd.log, sshd_config, the OpenSSH-Server-Ini registry
+        # values, and the OpenSSH/Operational Event Log. Remove this
+        # step once windows-2022 is green again.
+        if: failure() && matrix.os == 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-dump-windows-2022
+          path: sshd-dump.txt
+          if-no-files-found: warn
 
       - name: Dump integration-test.log on failure
         # cargo test writes stdout+stderr to integration-test.log via
