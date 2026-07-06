@@ -81,6 +81,67 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
+/// Rewrite `%NAME%` references in `cmd` to `!NAME!` for cmd.exe
+/// delayed expansion, where `NAME` is drawn from `env_names` — the
+/// names that were just declared via `--exec-env`. This is the
+/// second pass of the cmd-mode rewrite (the first pass is
+/// `rewrite_dollar_refs_for_cmd` which handles the sh-style `$NAME`
+/// → cmd-style `%NAME%` conversion for users who wrote sh syntax in
+/// their command).
+///
+/// Why this is needed: cmd.exe `cmd /c "…"` expands `%NAME%`
+/// references at PARSE time of the whole string, BEFORE any
+/// command runs. So `set "X=1" & echo %X%` always echoes literal
+/// `%X%` (X is undefined at parse time) even though `set` runs
+/// before `echo` in the sequence. The fix is to enable delayed
+/// expansion (`setlocal enabledelayedexpansion` in
+/// `build_exec_env_prefix`) and rewrite `%KNOWN%` to `!KNOWN!` so
+/// the expansion fires at execution time, AFTER the `set` has run.
+///
+/// Built-in cmd vars (PATH, COMPUTERNAME, USERPROFILE, …) are left
+/// as `%X%` because they're always defined and the user expects
+/// immediate expansion for them. `%%` is left as `%%` (literal `%`
+/// in cmd.exe's escape form). `%X` (unclosed) is left untouched
+/// since it's not a valid reference and the user clearly meant
+/// something else by it.
+fn rewrite_percent_refs_for_cmd(cmd: &str, env_names: &[String]) -> String {
+    if env_names.is_empty() {
+        return cmd.to_string();
+    }
+    let mut out = String::with_capacity(cmd.len());
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
+            // Read identifier
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && is_ident_cont(bytes[end]) {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end] == b'%' {
+                // Closing `%` present — it's a `%NAME%` reference.
+                let name = &cmd[start..end];
+                if env_names.iter().any(|n| n == name) {
+                    out.push('!');
+                    out.push_str(name);
+                    out.push('!');
+                    i = end + 1;
+                    continue;
+                }
+                // Known-looking reference but not in env_names
+                // (e.g. `%PATH%`): leave as-is so cmd.exe does its
+                // normal immediate expansion on it.
+            }
+            // Not a valid `%NAME%` reference (no closing `%` or
+            // name not in env_names). Pass through unchanged.
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn is_ident_cont(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -96,14 +157,36 @@ fn is_ident_cont(b: u8) -> bool {
 /// char, so `set "X=1"; echo Y` parses as ONE command line where
 /// `set` receives `"X=1";`, `echo`, `Y` as args, the `echo` never
 /// runs, and stdout comes out empty (this was the Issue #5 CI
-/// failure on Windows). `&` is cmd.exe's unconditional sequence
-/// operator — the closest equivalent to `;` in POSIX sh.
+/// failure on windows-2022 first attempt). `&` is cmd.exe's
+/// unconditional sequence operator — the closest equivalent to `;`
+/// in POSIX sh.
+///
+/// Delayed-expansion prologue (cmd only): cmd.exe's `cmd /c "…"`
+/// expands `%X%` references at parse time of the WHOLE string,
+/// BEFORE any command runs — so even with `&` separating them,
+/// `set "X=1" & echo %X%` echoes literal `%X%` because X is still
+/// undefined when the parser looks at it. `setlocal
+/// enabledelayedexpansion` flips on the `!X!` syntax for the
+/// remainder of the cmd session; combined with
+/// `rewrite_percent_refs_for_cmd` (which turns `%KNOWN_VAR%` into
+/// `!KNOWN_VAR!`), the variable is expanded at execution time, AFTER
+/// the `set` has populated it. The prologue is only emitted when
+/// `parts` is non-empty (no point enabling delayed expansion if
+/// nothing is being set), and only in cmd mode.
 fn build_exec_env_prefix(parts: &[String], shell: &str) -> String {
     if parts.is_empty() {
         return String::new();
     }
-    let separator = if shell == "cmd" { " & " } else { "; " };
-    format!("{}{}", parts.join(separator), separator)
+    if shell == "cmd" {
+        let setlines: Vec<String> = parts.to_vec();
+        format!(
+            "setlocal enabledelayedexpansion & {} & ",
+            setlines.join(" & ")
+        )
+    } else {
+        let separator = "; ";
+        format!("{}{}", parts.join(separator), separator)
+    }
 }
 
 #[tokio::main]
@@ -565,9 +648,23 @@ async fn main() -> Result<()> {
                 // substrings untouched so we don't accidentally rewrite
                 // arguments that happen to contain `$`. sh-mode skips the
                 // rewrite entirely (its `$VAR` syntax is the existing path).
+                //
+                // After the `$`→`%` rewrite, we still hit cmd.exe's
+                // `cmd /c "…"` parse-time-expansion bug: cmd.exe expands
+                // `%VAR%` references in the entire command string BEFORE
+                // any command runs, so `set "X=1" & echo %X%` always
+                // echoes empty / literal `%X%` because X is undefined at
+                // parse time. The second rewrite turns `%KNOWN_VAR%` into
+                // `!KNOWN_VAR!`, and `build_exec_env_prefix` (cmd branch)
+                // prepends `setlocal enabledelayedexpansion` so the
+                // expansion fires at execution time — AFTER the `set` has
+                // populated the variable. Built-in cmd vars (PATH,
+                // COMPUTERNAME, …) are left as `%X%` because they're
+                // always defined and the user expects immediate expansion.
                 let cmd = cli.command.join(" ");
                 let cmd = if cli.shell == "cmd" {
-                    rewrite_dollar_refs_for_cmd(&cmd, &exec_env_names)
+                    let step1 = rewrite_dollar_refs_for_cmd(&cmd, &exec_env_names);
+                    rewrite_percent_refs_for_cmd(&step1, &exec_env_names)
                 } else {
                     cmd
                 };
@@ -610,6 +707,7 @@ mod exec_env_shell_tests {
 
     use super::{
         build_exec_env_prefix, is_ident_cont, is_ident_start, rewrite_dollar_refs_for_cmd,
+        rewrite_percent_refs_for_cmd,
     };
 
     #[test]
@@ -686,14 +784,20 @@ mod exec_env_shell_tests {
         assert_eq!(out, "%A%%B%");
     }
 
-    // ---- build_exec_env_prefix: separator regression (Issue #5 CI) ----
+    // ---- build_exec_env_prefix: separator + delayed expansion (Issue #5) ----
     //
-    // On windows-2022 the unfixed code emitted `set "X=1"; echo Y`.
-    // cmd.exe has no concept of `;` as a separator — `;` is a literal
-    // char, so cmd parsed the whole thing as one command line where
-    // `set` got `"X=1";`, `echo`, `Y` as args, the echo never ran, and
-    // stdout came out empty. The fix is to use `&` as the separator in
-    // cmd mode (cmd.exe's unconditional sequence operator).
+    // Two related bugs were caught on windows-2022:
+    //   1. `;` is not a separator in cmd.exe — the original `;` join
+    //      parsed the whole prelude as one command and the echo
+    //      never ran. Fix: use `&` (cmd.exe's unconditional-sequence
+    //      operator).
+    //   2. Even with `&`, cmd.exe `cmd /c "…"` expands `%X%` at
+    //      PARSE time of the whole string, BEFORE any command runs.
+    //      So `set "X=1" & echo %X%` echoes literal `%X%` (X
+    //      undefined at parse time). Fix: prepend `setlocal
+    //      enabledelayedexpansion` and rewrite `%KNOWN_VAR%` →
+    //      `!KNOWN_VAR!` in the user command (see
+    //      `rewrite_percent_refs_for_cmd`).
 
     #[test]
     fn prefix_sh_uses_semicolon_separator() {
@@ -706,28 +810,98 @@ mod exec_env_shell_tests {
     }
 
     #[test]
-    fn prefix_cmd_uses_ampersand_separator() {
-        // This is the exact prelude that was failing on windows-2022.
-        // `;` is not a separator in cmd.exe, so `set "X=1"; echo Y`
-        // was parsed as one command and the echo never ran.
+    fn prefix_cmd_includes_setlocal_delayed_expansion() {
+        // The prologue is what makes the `%X%` → `!X!` rewrite in
+        // the user command actually expand at execution time
+        // instead of parse time. Drop it and the cmd.exe path
+        // silently breaks again on windows-2022.
         let parts = vec![r#"set "PHR_TEST_VAR=hello_from_env""#.to_string()];
         let p = build_exec_env_prefix(&parts, "cmd");
-        assert_eq!(p, r#"set "PHR_TEST_VAR=hello_from_env" & "#);
+        assert_eq!(
+            p,
+            r#"setlocal enabledelayedexpansion & set "PHR_TEST_VAR=hello_from_env" & "#
+        );
     }
 
     #[test]
     fn prefix_cmd_multi_part_ampersand_join() {
         let parts = vec![r#"set "A=1""#.to_string(), r#"set "B=2""#.to_string()];
         let p = build_exec_env_prefix(&parts, "cmd");
-        assert_eq!(p, r#"set "A=1" & set "B=2" & "#);
+        assert_eq!(
+            p,
+            r#"setlocal enabledelayedexpansion & set "A=1" & set "B=2" & "#
+        );
     }
 
     #[test]
     fn prefix_empty_parts_returns_empty_string() {
-        // No --exec-env supplied — no prefix, no leading separator.
+        // No --exec-env supplied — no prefix, no leading separator,
+        // and no `setlocal enabledelayedexpansion` (no point
+        // enabling delayed expansion if nothing is being set).
         let p = build_exec_env_prefix(&[], "sh");
         assert_eq!(p, "");
         let p = build_exec_env_prefix(&[], "cmd");
         assert_eq!(p, "");
+    }
+
+    // ---- rewrite_percent_refs_for_cmd: delayed-expansion rewrite ----
+    //
+    // Companion to the `setlocal enabledelayedexpansion` prologue.
+    // Without this rewrite, cmd.exe expands `%X%` at parse time of
+    // the whole `cmd /c "…"` string — BEFORE the `set "X=v"` runs
+    // — and the user command sees the undefined value. The rewrite
+    // turns known `%X%` references into `!X!` so delayed expansion
+    // fires at execution time, after `set`.
+
+    #[test]
+    fn percent_rewrite_substitutes_known_names() {
+        let out = rewrite_percent_refs_for_cmd(
+            "echo %FOO% and %BAR_BAZ% then %UNRELATED%",
+            &["FOO".into(), "BAR_BAZ".into()],
+        );
+        assert_eq!(out, "echo !FOO! and !BAR_BAZ! then %UNRELATED%");
+    }
+
+    #[test]
+    fn percent_rewrite_passthrough_when_no_env_names() {
+        // No --exec-env was passed; nothing should be rewritten —
+        // leaves built-in cmd vars like %PATH% to their normal
+        // immediate expansion.
+        let out = rewrite_percent_refs_for_cmd("echo %PATH% stays as-is", &[]);
+        assert_eq!(out, "echo %PATH% stays as-is");
+    }
+
+    #[test]
+    fn percent_rewrite_preserves_builtin_known_looking_vars() {
+        // `%PATH%` looks like a candidate but PATH isn't in
+        // env_names, so it must NOT be rewritten — users rely on
+        // immediate expansion for built-in cmd vars.
+        let out = rewrite_percent_refs_for_cmd("echo %PATH% vs %FOO%", &["FOO".into()]);
+        assert_eq!(out, "echo %PATH% vs !FOO!");
+    }
+
+    #[test]
+    fn percent_rewrite_leaves_unclosed_percent_alone() {
+        // `%X` (no closing `%`) is not a valid reference. Leave
+        // untouched so cmd.exe's own parser decides what to do.
+        let out = rewrite_percent_refs_for_cmd("price: 5% then %FOO%", &["FOO".into()]);
+        assert_eq!(out, "price: 5% then !FOO!");
+    }
+
+    #[test]
+    fn percent_rewrite_preserves_double_percent_literal() {
+        // `%%` is cmd.exe's escape for a literal `%` (e.g. in a
+        // `for` loop). Don't treat it as a reference.
+        let out = rewrite_percent_refs_for_cmd("100%%done then %FOO%", &["FOO".into()]);
+        assert_eq!(out, "100%%done then !FOO!");
+    }
+
+    #[test]
+    fn percent_rewrite_handles_alphanumeric_and_underscore() {
+        let out = rewrite_percent_refs_for_cmd(
+            "x=%FOO123% y=%_UNDERSCORE%",
+            &["FOO123".into(), "_UNDERSCORE".into()],
+        );
+        assert_eq!(out, "x=!FOO123! y=!_UNDERSCORE!");
     }
 }
