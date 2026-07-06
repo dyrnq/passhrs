@@ -270,12 +270,21 @@ jobs:
         # version of that script moves it, this step should warn
         # rather than fail the job, and the dump-on-failure step
         # below still tries a list of candidate paths.
+        #
+        # PR #14 root-cause investigation: setup-windows.ps1 also
+        # forces the service to emit a -ddd trace to sshd-debug.log
+        # via the HKLM\SOFTWARE\OpenSSH-Server-Ini\LogFile /
+        # LogLevel registry values. We upload it as a separate
+        # artifact so a future red run can diff the protocol trace
+        # against a green baseline. Remove the sshd-debug.log line
+        # once windows-2022 is green again.
         if: always() && matrix.os == 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
           name: sshd-log-${{ matrix.os }}
           path: |
             C:\ProgramData\ssh\logs\sshd.log
+            C:\ProgramData\ssh\logs\sshd-debug.log
             C:\ProgramData\ssh\OpenSSH_ConfigDiag.log
           if-no-files-found: warn
 
@@ -363,7 +372,16 @@ jobs:
           # Mirror of the unix step above. Windows sshd logs under
           # %ProgramData%\ssh\logs by default (or wherever the
           # setup-windows.ps1 put it).
+          #
+          # PR #14 root-cause investigation: the sshd-debug.log path is
+          # the -ddd trace forced by setup-windows.ps1 via the
+          # OpenSSH-Server-Ini\LogFile / LogLevel registry values. We
+          # tail 500 lines because a 5-min test run with 33 ssh
+          # connections produces ~50-200KB at DEBUG3; tailing the full
+          # file would flood the live log view. The full file is
+          # uploaded as an artifact (see "Upload sshd log (Windows)").
           $logs = @(
+              "$env:ProgramData\ssh\logs\sshd-debug.log",
               "$env:ProgramData\ssh\logs\sshd.log",
               "$env:ProgramData\ssh\sshd.log",
               "$env:ProgramData\ssh\logs\sshd",
@@ -371,8 +389,12 @@ jobs:
           )
           foreach ($log in $logs) {
               if (Test-Path -LiteralPath $log) {
-                  Write-Host "=== sshd log: $log ==="
-                  Get-Content -LiteralPath $log -Tail 200 -ErrorAction SilentlyContinue
+                  # sshd-debug.log is the protocol trace; tail 500
+                  # lines. The other logs are short operational
+                  # summaries; tail 200 like before.
+                  $tailLines = if ($log -like '*sshd-debug.log*') { 500 } else { 200 }
+                  Write-Host "=== sshd log (tail $tailLines): $log ==="
+                  Get-Content -LiteralPath $log -Tail $tailLines -ErrorAction SilentlyContinue
               }
           }
           $cfgs = @(
@@ -385,6 +407,14 @@ jobs:
                   Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
               }
           }
+          # Surface the OpenSSH-Server-Ini registry values too: a
+          # future sshd build that renames the keys will leave the
+          # override silently inactive, and the -ddd log will be
+          # empty. Showing the actual values in the failure log
+          # tells us at-a-glance whether the override took effect.
+          Write-Host "=== OpenSSH-Server-Ini registry ==="
+          Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH-Server-Ini' -ErrorAction SilentlyContinue |
+              Format-List | Out-String | Write-Host
 
       - name: Dump integration-test.log on failure
         # cargo test writes stdout+stderr to integration-test.log via

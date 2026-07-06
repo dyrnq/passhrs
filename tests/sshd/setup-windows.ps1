@@ -34,6 +34,15 @@ $SshdCfg    = Join-Path $SshRoot 'sshd_config'
 $HostKey    = Join-Path $SshRoot 'ssh_host_ed25519_key'
 $SftpServer = Join-Path $env:SystemRoot 'System32\OpenSSH\sftp-server.exe'
 $SshdLog    = Join-Path $SshRoot 'logs\sshd.log'
+# Diagnostic-only debug log path. The Win32-OpenSSH service wrapper
+# reads HKLM\SOFTWARE\OpenSSH-Server-Ini\LogFile / LogLevel and passes
+# them to sshd.exe on start, so writing these registry values before
+# `Start-Service sshd` makes the service emit a -ddd trace to a fixed
+# file. dump-on-failure then prints it inline so a future windows-2022
+# red run has a raw protocol trace to diff against a green run. See
+# PR #14 root-cause investigation. Remove this block once windows-2022
+# is green again.
+$SshdDebugLog = Join-Path $SshRoot 'logs\sshd-debug.log'
 
 # 1. The inbox Windows OpenSSH capability ships OpenSSH 8.1p1 (LibreSSL
 #    3.8.2) on windows-2022 runners and that build has a known
@@ -318,6 +327,24 @@ $svc = Get-Service -Name sshd -ErrorAction Stop
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 Set-Service -Name sshd -StartupType Manual
+
+# DIAGNOSTIC (PR #14 root-cause): make the sshd service emit a -ddd
+# trace to $SshdDebugLog. The Win32-OpenSSH service wrapper reads
+# HKLM\SOFTWARE\OpenSSH-Server-Ini\LogFile / LogLevel and forwards
+# them to sshd.exe on the next start. -Force overwrites the prior
+# values. We -ErrorAction SilentlyContinue the property writes
+# because future OpenSSH builds may rename/move the key; the test
+# should still run at the default (LogLevel ERROR) if the override
+# silently no-ops, and dump-on-failure will fall back to the Event
+# Log query at the bottom of this script.
+$svcRegKey = 'HKLM:\SOFTWARE\OpenSSH-Server-Ini'
+if (-not (Test-Path -LiteralPath $svcRegKey)) {
+    New-Item -Path $svcRegKey -Force | Out-Null
+}
+New-ItemProperty -LiteralPath $svcRegKey -Name 'LogFile'  -Value $SshdDebugLog -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -LiteralPath $svcRegKey -Name 'LogLevel' -Value 'DEBUG3'    -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+Write-Host "    sshd service registry: LogFile=$SshdDebugLog LogLevel=DEBUG3 (PR #14 diagnostic)"
+
 # Start-Service under `$ErrorActionPreference = 'Stop'` raises a
 # terminating error on failure, which would otherwise exit the script
 # before the readiness / diagnostic paths below fire. Wrap explicitly
@@ -383,15 +410,31 @@ if (-not $sshdStartupOk -or -not $ready) {
     Write-Host "Recent sshd log entries:"
     if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Host }
 
-    Write-Host "Windows Event Log (sshd):"
-    Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
+    # DIAGNOSTIC (PR #14 root-cause): surface the -ddd trace we forced
+    # the service to emit. Tail 500 because a 5-min run with 33 ssh
+    # connections produces ~50-200KB at DEBUG3; the per-connection
+    # banner + kex + auth trace is ~5-10KB so 500 lines catches every
+    # test in test_15 plus most of test_14's key-auth runs. The full
+    # file is also uploaded as an artifact (Upload sshd log step).
+    Write-Host "Recent sshd -ddd log entries (tail 500):"
+    if (Test-Path $SshdDebugLog) { Get-Content $SshdDebugLog -Tail 500 | Write-Host }
+    else { Write-Host "  (no $SshdDebugLog — registry override not honoured by this build)" }
+
+    # Bumped from 20 to 500 in PR #14 diagnostic: the OpenSSH/Operational
+    # channel is the canonical log on Windows builds where the service
+    # wrapper ignores LogFile/LogLevel registry values. Even with the
+    # override, Event Log entries are the audit trail the wrapper
+    # always emits, so a green run's first 20 events are insufficient
+    # to cover a 33-test connection storm.
+    Write-Host "Windows Event Log (sshd, last 500):"
+    Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host $_.Message }
-    Write-Host "Windows Event Log (System, sshd-related):"
-    Get-WinEvent -LogName System -MaxEvents 50 -ErrorAction SilentlyContinue |
+    Write-Host "Windows Event Log (System, sshd-related, last 200):"
+    Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue |
         Where-Object { $_.ProviderName -match 'sshd' -or $_.Message -match 'sshd' } |
         ForEach-Object { Write-Host $_.Message }
-    Write-Host "Windows Event Log (Application, last 20):"
-    Get-WinEvent -LogName Application -MaxEvents 20 -ErrorAction SilentlyContinue |
+    Write-Host "Windows Event Log (Application, last 200):"
+    Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host $_.Message }
     exit 1
 }
