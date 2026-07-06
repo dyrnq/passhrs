@@ -85,6 +85,27 @@ fn is_ident_cont(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Build the env-var prefix that's prepended to the user-supplied
+/// command. For each `--exec-env` spec we generated either
+/// `set "NAME=val"` (cmd) or `export NAME=val` (sh) in `parts`; this
+/// joins them with the right shell-specific separator and appends
+/// the same separator before the command itself.
+///
+/// Separator choice: sh uses `;` (POSIX); cmd.exe uses `&`. cmd.exe
+/// has no concept of `;` as a command separator — `;` is a literal
+/// char, so `set "X=1"; echo Y` parses as ONE command line where
+/// `set` receives `"X=1";`, `echo`, `Y` as args, the `echo` never
+/// runs, and stdout comes out empty (this was the Issue #5 CI
+/// failure on Windows). `&` is cmd.exe's unconditional sequence
+/// operator — the closest equivalent to `;` in POSIX sh.
+fn build_exec_env_prefix(parts: &[String], shell: &str) -> String {
+    if parts.is_empty() {
+        return String::new();
+    }
+    let separator = if shell == "cmd" { " & " } else { "; " };
+    format!("{}{}", parts.join(separator), separator)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -536,11 +557,7 @@ async fn main() -> Result<()> {
                         exec_env_names.push(spec.clone());
                     }
                 }
-                let prefix = if parts.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}; ", parts.join("; "))
-                };
+                let prefix = build_exec_env_prefix(&parts, &cli.shell);
                 // For the cmd.exe shell, rewrite `$VAR` references in the
                 // user-supplied command to `%VAR%` (cmd.exe has no concept
                 // of `$VAR`). Only the names we just declared via
@@ -591,7 +608,9 @@ mod exec_env_shell_tests {
     //! refactor doesn't accidentally break the Windows OpenSSH
     //! cmd.exe integration.
 
-    use super::{is_ident_cont, is_ident_start, rewrite_dollar_refs_for_cmd};
+    use super::{
+        build_exec_env_prefix, is_ident_cont, is_ident_start, rewrite_dollar_refs_for_cmd,
+    };
 
     #[test]
     fn dollar_rewrite_substitutes_known_names() {
@@ -665,5 +684,50 @@ mod exec_env_shell_tests {
         // Two refs next to each other with no separator.
         let out = rewrite_dollar_refs_for_cmd("$A$B", &["A".into(), "B".into()]);
         assert_eq!(out, "%A%%B%");
+    }
+
+    // ---- build_exec_env_prefix: separator regression (Issue #5 CI) ----
+    //
+    // On windows-2022 the unfixed code emitted `set "X=1"; echo Y`.
+    // cmd.exe has no concept of `;` as a separator — `;` is a literal
+    // char, so cmd parsed the whole thing as one command line where
+    // `set` got `"X=1";`, `echo`, `Y` as args, the echo never ran, and
+    // stdout came out empty. The fix is to use `&` as the separator in
+    // cmd mode (cmd.exe's unconditional sequence operator).
+
+    #[test]
+    fn prefix_sh_uses_semicolon_separator() {
+        let parts = vec![
+            r#"export FOO=bar"#.to_string(),
+            r#"export BAZ=qux"#.to_string(),
+        ];
+        let p = build_exec_env_prefix(&parts, "sh");
+        assert_eq!(p, r#"export FOO=bar; export BAZ=qux; "#);
+    }
+
+    #[test]
+    fn prefix_cmd_uses_ampersand_separator() {
+        // This is the exact prelude that was failing on windows-2022.
+        // `;` is not a separator in cmd.exe, so `set "X=1"; echo Y`
+        // was parsed as one command and the echo never ran.
+        let parts = vec![r#"set "PHR_TEST_VAR=hello_from_env""#.to_string()];
+        let p = build_exec_env_prefix(&parts, "cmd");
+        assert_eq!(p, r#"set "PHR_TEST_VAR=hello_from_env" & "#);
+    }
+
+    #[test]
+    fn prefix_cmd_multi_part_ampersand_join() {
+        let parts = vec![r#"set "A=1""#.to_string(), r#"set "B=2""#.to_string()];
+        let p = build_exec_env_prefix(&parts, "cmd");
+        assert_eq!(p, r#"set "A=1" & set "B=2" & "#);
+    }
+
+    #[test]
+    fn prefix_empty_parts_returns_empty_string() {
+        // No --exec-env supplied — no prefix, no leading separator.
+        let p = build_exec_env_prefix(&[], "sh");
+        assert_eq!(p, "");
+        let p = build_exec_env_prefix(&[], "cmd");
+        assert_eq!(p, "");
     }
 }
