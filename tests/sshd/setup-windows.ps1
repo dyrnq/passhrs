@@ -326,36 +326,22 @@ try {
     # a directive we cannot verify.
 }
 if ($defaultProbeRc -eq 0 -and $defaultProbeOut -match '(?m)^persourcepenalties\s+crash:') {
-    # Default-ON binary (OpenSSH 10.0+ dump format). The long stats
-    # line means the penalty is active. Validate the override by
-    # re-running sshd -T -f on a scratch config with the directive
-    # appended, and confirm the dump flips to `persourcepenalties no`
-    # AND the `crash:` line is gone. Belt-and-braces against a build
-    # where the directive parses but is silently ignored.
-    $ScratchCfg = Join-Path $env:TEMP ("sshd-persrc-probe-{0}.cfg" -f ([guid]::NewGuid().ToString('N')))
-    $persrcApplied = $false
-    try {
-        Copy-Item -LiteralPath $SshdCfg -Destination $ScratchCfg -Force
-        Add-Content -LiteralPath $ScratchCfg -Value 'PerSourcePenalties no'
-        try {
-            $overrideProbeOut = & $SshdProbeBin -T -f $ScratchCfg 2>&1 | Out-String
-            if ($LASTEXITCODE -eq 0 `
-                    -and $overrideProbeOut -match '(?m)^persourcepenalties[ \t]+no\b' `
-                    -and $overrideProbeOut -notmatch '(?m)^persourcepenalties\s+crash:') {
-                $persrcApplied = $true
-            }
-        } catch {
-            # sshd rejected the directive on the scratch config; skip.
-        }
-    } finally {
-        Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue
-    }
-    if ($persrcApplied) {
-        Write-Host "    sshd default is ON, 'PerSourcePenalties no' applied as effective -- appending"
-        Add-Content -LiteralPath $SshdCfg -Value 'PerSourcePenalties no'
-    } else {
-        Write-Host "    sshd default is ON but 'PerSourcePenalties no' did not flip dump output -- keeping default (penalty stays ON; MaxStartups should cover)"
-    }
+    # Default-ON binary (OpenSSH 10.0+ dump format, observed on
+    # Win32-OpenSSH 10.0p2 which the upgrade step installs above).
+    # The directive parses and the override validates (sshd -T -f
+    # flips the dump output to `persourcepenalties no` and drops the
+    # `crash:` line), but writing `PerSourcePenalties no` to the
+    # REAL sshd_config causes every test connection to fail with os
+    # error 10054 (Winsock ECONNRESET) on the windows-2022 runner.
+    # Observed end-to-end on PR #14 commit 63a2a82: the directive
+    # correctly disabled the penalty in -T dump but broke the
+    # daemon-mode connection path. We do NOT know whether this is a
+    # Win32-OpenSSH 10.0p2 bug or a known limitation of the directive
+    # on this binary, but PR #13 (no append) was green on the same
+    # runner so we follow the same conservative approach here.
+    # MaxStartups 50:100:200 already gives the test suite plenty of
+    # headroom for the 30+ back-to-back connections from 127.0.0.1.
+    Write-Host "    sshd default is ON (PerSourcePenalties active) -- NOT appending 'PerSourcePenalties no' to avoid Win32-OpenSSH 10.0p2 ECONNRESET regression (PR #14 commit 63a2a82); MaxStartups should cover"
 } elseif ($defaultProbeRc -eq 0 -and $defaultProbeOut -match '(?m)^persourcepenalties[ \t]+no\b') {
     # Default-OFF binary (OpenSSH 9.8 dump format). The directive is
     # a no-op; do NOT append. This is the case PR #13's setup
