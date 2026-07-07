@@ -100,6 +100,51 @@ fn pick_unused_port() -> u16 {
         .port()
 }
 
+/// Capture a spawned child's stderr into a String on a background thread.
+/// On Drop (i.e. test panic before `finish()` is called), the captured
+/// stderr is printed so a CI failure shows what passhrs did during the
+/// failure window instead of just the assertion panic. The data-plane
+/// round-trip tests use this to diagnose the recurring Linux/macOS -R
+/// timeout: if the test panics with EAGAIN, the Drop dump tells us
+/// whether passhrs got past handshake, whether `tcpip_forward` returned
+/// Ok, whether the channel-open for forwarded-tcpip ever arrived, etc.
+struct StderrCapture(Option<thread::JoinHandle<String>>);
+
+impl StderrCapture {
+    fn new(child: &mut std::process::Child) -> Self {
+        let pipe = child.stderr.take().expect("stderr pipe");
+        let handle = thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(pipe);
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        });
+        Self(Some(handle))
+    }
+
+    /// Consume self and return the captured stderr. Use this on the
+    /// happy path to suppress the Drop dump.
+    fn finish(mut self) -> String {
+        self.0
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let captured = handle.join().unwrap_or_default();
+            if !captured.trim().is_empty() {
+                eprintln!("--- passhrs stderr (captured during failed test) ---");
+                eprintln!("{}", captured);
+                eprintln!("--- end passhrs stderr ---");
+            }
+        }
+    }
+}
+
 /// Authentication arguments prepended to every `run_phr` call.
 ///
 /// Linux + Windows keep the original `--password PASS` shape — the
@@ -1322,13 +1367,22 @@ fn test_remote_forward_data_plane_round_trip() {
         std::net::TcpListener::bind(("127.0.0.1", origin_port)).expect("bind origin listener");
     let echoed: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let echoed_w = echoed.clone();
+    // Data-plane timeouts: 15 s each (vs the 5 s used in the -L test).
+    // The -R path has one extra hop — passhrs must receive the
+    // forwarded-tcpip channel-open from sshd and then dial the origin
+    // listener — and on a CI-loaded Linux/macOS runner the cumulative
+    // handshake+channel-open+dial time occasionally blows past 5 s.
+    // 15 s leaves ample headroom; the test still fails fast (well under
+    // cargo's default 60 s per-test timeout) when the data path is
+    // genuinely broken.
+    const FWD_IO_TIMEOUT: Duration = Duration::from_secs(15);
     let origin_thread = thread::spawn(move || {
         let (mut stream, _) = origin_listener.accept().expect("origin accept");
         stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(FWD_IO_TIMEOUT))
             .expect("set_read_timeout");
         stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
+            .set_write_timeout(Some(FWD_IO_TIMEOUT))
             .expect("set_write_timeout");
         let mut buf = vec![0u8; 16];
         stream.read_exact(&mut buf).expect("echo read");
@@ -1354,9 +1408,16 @@ fn test_remote_forward_data_plane_round_trip() {
     let mut phr = Command::new(BIN)
         .args(&args)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // stderr piped → StderrCapture. On a panic during the data
+        // plane (the most common failure shape on Linux/macOS), the
+        // Drop impl dumps whatever passhrs printed before the timeout
+        // — handshake state, `tcpip_forward` reply, channel-open log
+        // lines — alongside the assertion panic so the CI log carries
+        // enough information to root-cause without a re-run.
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn passhrs -R");
+    let stderr_cap = StderrCapture::new(&mut phr);
 
     let client = (|| -> Option<std::net::TcpStream> {
         for _ in 0..20 {
@@ -1370,7 +1431,7 @@ fn test_remote_forward_data_plane_round_trip() {
     .expect("-R listener never came up");
     let mut client = client;
     client
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(FWD_IO_TIMEOUT))
         .expect("client set_read_timeout");
 
     let payload: [u8; 16] = *b"hello-R-test-oke";
@@ -1389,6 +1450,9 @@ fn test_remote_forward_data_plane_round_trip() {
     drop(client);
     let _ = phr.kill();
     let _ = phr.wait();
+    // finish() consumes the capture so the Drop impl does not also
+    // dump stderr on the happy path.
+    let _ = stderr_cap.finish();
 }
 
 #[test]
