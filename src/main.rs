@@ -178,7 +178,19 @@ async fn main() -> Result<()> {
         && cli.remote_forward.is_empty()
         && cli.dynamic_forward.is_empty()
     {
-        bail!("no destination specified");
+        // No destination and no forward flags means the user typed
+        // `passhrs` with no args at all. Clap happily accepts that
+        // (the destination field is `Option<String>`, not required),
+        // but a bare "Error: no destination specified" leaves a
+        // first-time user with no idea what to type next. Print the
+        // same help text `--help` shows and exit 0 — i.e. behave
+        // equivalently to `passhrs --help`. This matches the
+        // convention most Unix tools follow (e.g. `git` with no
+        // subcommand prints usage to stdout and exits 0) and lets
+        // users who tab-complete `passhrs<Enter>` see the full
+        // option list immediately.
+        print_help();
+        return Ok(());
     }
 
     let (host, user_from_dest, port_from_dest) = if dest_str.is_empty() {
