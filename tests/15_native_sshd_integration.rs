@@ -17,8 +17,10 @@
 //! the test process's local filesystem — tests can read/clean up
 //! remote artifacts with `std::fs` directly instead of shelling out
 //! to the server.
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -84,6 +86,18 @@ fn sshd_ok() -> bool {
         Err(_) => return false,
     };
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
+}
+
+/// Bind to port 0, read back what the kernel picked, drop. Tests use
+/// this for both ends of a -L / -R round-trip — the local listener
+/// passhrs will sit at, and the "remote" target it forwards to. Both
+/// are on the same loopback because the native sshd runs here too.
+fn pick_unused_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind port 0")
+        .local_addr()
+        .expect("read local_addr")
+        .port()
 }
 
 /// Authentication arguments prepended to every `run_phr` call.
@@ -1180,6 +1194,201 @@ fn test_local_forward_spawn() {
         .expect("spawn -L");
     thread::sleep(Duration::from_secs(2));
     let _ = child.kill();
+}
+
+// Data-plane round-trip for `-L`. `test_local_forward_spawn` above
+// only proves passhrs accepts `-L ... -N` and stays up — it never
+// connects to the forward and never proves bytes flow. This test:
+//
+//   1. Binds a real TCP listener on 127.0.0.1:<remote_port> that
+//      reads 16 bytes and writes them back (an "echo" service).
+//   2. Spawns passhrs -L <local>:127.0.0.1:<remote_port> -N.
+//   3. Opens a fresh socket to localhost:<local>, sends a known
+//      16-byte payload, expects the same 16 bytes back.
+//   4. Joins the echo thread and asserts its `read_exact` saw the
+//      exact same payload.
+//
+// Both ends are loopback — the "remote" listener runs in the test
+// process; native sshd (port 22222) and passhrs share the same
+// loopback, so 127.0.0.1:<remote_port> is reachable from sshd's
+// channel-handling child too. No docker, no Python.
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_local_forward_data_plane_round_trip() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let remote_port = pick_unused_port();
+    let remote_listener =
+        std::net::TcpListener::bind(("127.0.0.1", remote_port)).expect("bind remote listener");
+    let echoed: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let echoed_w = echoed.clone();
+    let remote_thread = thread::spawn(move || {
+        let (mut stream, _) = remote_listener.accept().expect("remote accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set_write_timeout");
+        let mut buf = vec![0u8; 16];
+        stream.read_exact(&mut buf).expect("echo read");
+        stream.write_all(&buf).expect("echo write");
+        *echoed_w.lock().unwrap() = Some(buf);
+    });
+
+    let local_port = pick_unused_port();
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-L".to_string(),
+        format!("{}:127.0.0.1:{}", local_port, remote_port),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut args);
+    let mut phr = Command::new(BIN)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn passhrs -L");
+
+    // Bounded retry: -L listeners come up after SSH handshake + auth
+    // + channel-open, ~50-200 ms on a quiet runner but a CI spike
+    // can push it past that. 20 × 100 ms = 2 s of slack.
+    let client = (|| -> Option<std::net::TcpStream> {
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", local_port)) {
+                return Some(s);
+            }
+        }
+        None
+    })()
+    .expect("-L listener never came up");
+    let mut client = client;
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("client set_read_timeout");
+
+    let payload: [u8; 16] = *b"hello-L-test-oke";
+    client.write_all(&payload).expect("client write");
+    let mut rx = [0u8; 16];
+    client.read_exact(&mut rx).expect("client read");
+    assert_eq!(rx, payload, "-L did not echo back the same bytes");
+
+    remote_thread.join().expect("remote thread join");
+    assert_eq!(
+        echoed.lock().unwrap().as_deref(),
+        Some(&payload[..]),
+        "remote listener received wrong bytes"
+    );
+
+    drop(client);
+    let _ = phr.kill();
+    let _ = phr.wait();
+}
+
+// Data-plane round-trip for `-R`. Mirror of the -L test. Native sshd
+// accepts the listener on 127.0.0.1:<remote_port> on the remote side
+// (which is also loopback — sshd runs here too), tunnels connection
+// attempts back through passhrs to a local listener at
+// 127.0.0.1:<origin_port> which echoes back through the same channel.
+//
+//   1. Bind a TCP listener on 127.0.0.1:<origin_port> (the -R
+//      "origin"). Reads 16 bytes, writes them back.
+//   2. Spawn passhrs -R <remote_port>:127.0.0.1:<origin_port> -N.
+//   3. Open a fresh socket to 127.0.0.1:<remote_port>, send 16
+//      bytes, expect the same back.
+//   4. Join the origin thread and confirm it saw the same payload.
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_remote_forward_data_plane_round_trip() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let origin_port = pick_unused_port();
+    let origin_listener =
+        std::net::TcpListener::bind(("127.0.0.1", origin_port)).expect("bind origin listener");
+    let echoed: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let echoed_w = echoed.clone();
+    let origin_thread = thread::spawn(move || {
+        let (mut stream, _) = origin_listener.accept().expect("origin accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set_write_timeout");
+        let mut buf = vec![0u8; 16];
+        stream.read_exact(&mut buf).expect("echo read");
+        stream.write_all(&buf).expect("echo write");
+        *echoed_w.lock().unwrap() = Some(buf);
+    });
+
+    let remote_port = pick_unused_port();
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-R".to_string(),
+        format!("{}:127.0.0.1:{}", remote_port, origin_port),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut args);
+    let mut phr = Command::new(BIN)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn passhrs -R");
+
+    let client = (|| -> Option<std::net::TcpStream> {
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", remote_port)) {
+                return Some(s);
+            }
+        }
+        None
+    })()
+    .expect("-R listener never came up");
+    let mut client = client;
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("client set_read_timeout");
+
+    let payload: [u8; 16] = *b"hello-R-test-oke";
+    client.write_all(&payload).expect("client write");
+    let mut rx = [0u8; 16];
+    client.read_exact(&mut rx).expect("client read");
+    assert_eq!(rx, payload, "-R did not echo back the same bytes");
+
+    origin_thread.join().expect("origin thread join");
+    assert_eq!(
+        echoed.lock().unwrap().as_deref(),
+        Some(&payload[..]),
+        "origin listener received wrong bytes"
+    );
+
+    drop(client);
+    let _ = phr.kill();
+    let _ = phr.wait();
 }
 
 #[test]
