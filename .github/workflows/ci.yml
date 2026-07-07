@@ -259,24 +259,28 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload sshd log (Windows)
-        # Mirror of the unix step. setup-windows.ps1 sets the log
-        # path via `sshd.exe -E ...` — that argument is respected
-        # by OpenSSH 8.1p1 (inbox) and 10.0 (upgraded), and the
-        # destination is %ProgramData%\ssh\logs\sshd.log. We
-        # upload even on green runs so a future flake has a
-        # baseline to diff against (same rationale as the unix
-        # step). `if-no-files-found: warn` because the exact log
-        # path is setup-windows.ps1's choice — if a future
-        # version of that script moves it, this step should warn
-        # rather than fail the job, and the dump-on-failure step
-        # below still tries a list of candidate paths.
+        # Mirror of the unix step. setup-windows.ps1 starts sshd
+        # in the foreground (not as a Windows service) and writes
+        # its -ddd trace to C:\ProgramData\ssh\logs\sshd.log via
+        # the `sshd.exe -E $SshdLog -ddd` invocation. The -ddd
+        # level is the same one the old service-mode registry
+        # override (HKLM\SOFTWARE\OpenSSH-Server-Ini\LogFile /
+        # LogLevel) was *supposed* to produce but silently didn't
+        # on the Win32-OpenSSH 10.0p2 service wrapper — see
+        # the dump artifact from 28780534625. Foreground mode
+        # bypasses the wrapper entirely so -E is honoured. We
+        # upload on green AND red runs so a future flake has a
+        # baseline protocol trace to diff against. Remove the
+        # second path (sshd-debug.log) once windows-2022 is green
+        # again — it was a stale reference from the
+        # registry-override diagnostic that's no longer used.
         if: always() && matrix.os == 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
           name: sshd-log-${{ matrix.os }}
           path: |
             C:\ProgramData\ssh\logs\sshd.log
-            C:\ProgramData\ssh\OpenSSH_ConfigDiag.log
+            C:\ProgramData\ssh\logs\sshd.log.err
           if-no-files-found: warn
 
       - name: Upload sshd log (unix)
@@ -360,19 +364,89 @@ jobs:
         if: failure() && matrix.os == 'windows-2022'
         shell: pwsh
         run: |
-          # Mirror of the unix step above. Windows sshd logs under
-          # %ProgramData%\ssh\logs by default (or wherever the
-          # setup-windows.ps1 put it).
+          # Mirror of the unix step above. setup-windows.ps1 starts
+          # sshd in the foreground (Start-Process -D -E $SshdLog -ddd)
+          # and writes the full DEBUG3 protocol trace to
+          # C:\ProgramData\ssh\logs\sshd.log. This replaced the
+          # service-mode + OpenSSH-Server-Ini\LogFile registry
+          # override, which the dump on 28780534625 confirmed the
+          # Win32-OpenSSH 10.0p2 service wrapper silently ignores
+          # (the file was never created, OpenSSH/Operational events
+          # were never written, and every connection got RST'd with
+          # os error 10054). Foreground mode honours -E, so the
+          # trace actually lands where we point.
+          #
+          # We tail 500 lines because a 5-min test run with 33 ssh
+          # connections produces ~50-200KB at DEBUG3; tailing the
+          # full file would flood the live log view. The full file
+          # is also uploaded as an artifact (see "Upload sshd log
+          # (Windows)"). We also dump sshd.log.err (captured by
+          # Start-Process -RedirectStandardError) because a startup
+          # failure shows up there but not in the regular log.
+          #
+          # The same data is written to sshd-dump.txt in the workspace
+          # so a follow-up step can upload it as a downloadable
+          # artifact — useful when the live log view is hard to
+          # share (the dump can run to several hundred KB on a red
+          # run, which gets clipped in the GitHub UI). The on-screen
+          # output is unchanged.
+          #
+          # Implementation note: every individual read is wrapped in
+          # try/catch and the catch writes a "[error: ...]" marker
+          # into the dump. The whole script is also wrapped in an
+          # outer try/catch so even a path-resolution failure (e.g.
+          # GITHUB_WORKSPACE unset) ends with a stub file on disk
+          # that the upload step can still pick up — empty is
+          # better than missing, because "missing" leaves us blind
+          # to whether the problem is the diagnostic path or the
+          # diagnostic data.
+          $workspaceRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { $env:TEMP }
+          $dumpFile = Join-Path $workspaceRoot 'sshd-dump.txt'
+          try {
+          $dump = New-Object System.Text.StringBuilder
+          function Append-Line([string]$s) {
+              [void]$dump.AppendLine($s)
+              Write-Host $s
+          }
+          function Try-Append([string]$label, [scriptblock]$block) {
+              try {
+                  & $block
+              } catch {
+                  Append-Line "  [error: $label : $($_.Exception.Message)]"
+              }
+          }
+          Append-Line "=== sshd dump at $(Get-Date -Format o) ==="
+          Append-Line "GITHUB_WORKSPACE=$env:GITHUB_WORKSPACE"
+          Append-Line "env:ProgramData=$env:ProgramData"
+          Append-Line "Get-Process sshd,sshd-session:"
+          Get-Process -Name sshd,sshd-session -ErrorAction SilentlyContinue |
+              ForEach-Object { Append-Line ("  pid={0} name={1} start={2:o}" -f $_.Id, $_.ProcessName, $_.StartTime) }
           $logs = @(
               "$env:ProgramData\ssh\logs\sshd.log",
-              "$env:ProgramData\ssh\sshd.log",
+              "$env:ProgramData\ssh\logs\sshd.log.err",
               "$env:ProgramData\ssh\logs\sshd",
               "$env:ProgramData\ssh\OpenSSH_ConfigDiag.log"
           )
           foreach ($log in $logs) {
               if (Test-Path -LiteralPath $log) {
-                  Write-Host "=== sshd log: $log ==="
-                  Get-Content -LiteralPath $log -Tail 200 -ErrorAction SilentlyContinue
+                  # sshd-debug.log is the protocol trace; tail 500
+                  # lines. The other logs are short operational
+                  # summaries; tail 200 like before.
+                  # sshd.log is the -ddd trace (foreground mode); tail
+                  # 500 lines (~50-200KB on a 33-test run, enough
+                  # context for the last few handshakes). sshd.log.err
+                  # and any future raw trace files are short operational
+                  # summaries; tail 200.
+                  $tailLines = if ($log -like '*sshd.log') { 500 } else { 200 }
+                  Append-Line "=== sshd log (tail $tailLines): $log ==="
+                  Try-Append "Get-Content $log" {
+                      $content = Get-Content -LiteralPath $log -Tail $tailLines -ErrorAction Stop
+                      if ($null -ne $content) {
+                          foreach ($line in $content) { Append-Line $line }
+                      }
+                  }
+              } else {
+                  Append-Line "  (no $log)"
               }
           }
           $cfgs = @(
@@ -381,10 +455,92 @@ jobs:
           )
           foreach ($cfg in $cfgs) {
               if (Test-Path -LiteralPath $cfg) {
-                  Write-Host "=== sshd config: $cfg ==="
-                  Get-Content -LiteralPath $cfg -ErrorAction SilentlyContinue
+                  Append-Line "=== sshd config: $cfg ==="
+                  Try-Append "Get-Content $cfg" {
+                      $content = Get-Content -LiteralPath $cfg -ErrorAction Stop
+                      if ($null -ne $content) {
+                          foreach ($line in $content) { Append-Line $line }
+                      }
+                  }
               }
           }
+          # Surface the OpenSSH-Server-Ini registry values too. We
+          # no longer rely on the registry override (foreground
+          # mode writes via -E directly), but a future debug that
+          # re-introduces the service wrapper can compare the dump
+          # to confirm the override is still being honoured; the
+          # values are essentially free to read.
+          Append-Line "=== OpenSSH-Server-Ini registry ==="
+          Try-Append "Get-ItemProperty OpenSSH-Server-Ini" {
+              $reg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH-Server-Ini' -ErrorAction Stop
+              $regStr = $reg | Format-List | Out-String
+              foreach ($line in ($regStr -split "`n")) { Append-Line $line.TrimEnd() }
+          }
+          # Event Log queries. Bumped from 20 to 500 in PR #14
+          # diagnostic: a 33-test connection storm covers more than 20
+          # events on the OpenSSH/Operational channel, and the
+          # Authentication-failure events we want to see are at the
+          # END of the window (latest events), not the start. Always
+          # run these even if sshd-debug.log is empty: on Win32-OpenSSH
+          # builds that ignore LogFile/LogLevel, the Event Log is the
+          # only per-connection trace we have.
+          Append-Line "=== OpenSSH/Operational Event Log (last 500) ==="
+          Try-Append "Get-WinEvent OpenSSH/Operational" {
+              $ev = @(Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 500 -ErrorAction Stop)
+              if ($ev.Count -eq 0) {
+                  Append-Line "  (no OpenSSH/Operational events)"
+              } else {
+                  foreach ($e in $ev) {
+                      $line = "{0:o} {1}" -f $e.TimeCreated, $e.Message
+                      Append-Line $line
+                  }
+              }
+          }
+          # Always write the file, even if everything above errored —
+          # the file's existence is what the upload step looks for.
+          # -NoNewline is implicit because we built the string with
+          # AppendLine (which adds CRLF). [System.IO.File]::WriteAllText
+          # avoids any BOM issues that plague Set-Content -Encoding
+          # utf8 across PS 5.1 / PS 7+ boundaries.
+          [System.IO.File]::WriteAllText($dumpFile, $dump.ToString())
+          Write-Host "Wrote dump to $dumpFile ($((Get-Item $dumpFile).Length) bytes)"
+          } catch {
+              # Outer catch: if anything before the inner try/catches
+              # throws (e.g. Join-Path on a null workspace, a typo in
+              # $dumpFile), we still want a stub file on disk so the
+              # upload step has something to pick up. Write a minimal
+              # "[dump step crashed: ...]" marker to the file, then
+              # exit 0 so the step is marked success.
+              $err = $_.Exception.Message
+              try {
+                  [System.IO.File]::WriteAllText(
+                      $dumpFile,
+                      "=== sshd dump crashed at $(Get-Date -Format o) ===`r`nOuter: $err`r`n"
+                  )
+              } catch {
+                  Write-Host "Could not even write $dumpFile : $($_.Exception.Message)"
+              }
+          }
+          # The job-step exit code is the LAST command's exit code —
+          # explicitly exit 0 so a transient WriteAllText quirk or
+          # trailing pipeline element doesn't mark the step failed.
+          exit 0
+
+      - name: Upload sshd dump on failure (Windows)
+        # Companion to "Dump sshd log on failure (Windows)": uploads
+        # the same data as a downloadable artifact so it can be diffed
+        # against a future green run, or fetched when the live log
+        # view is too large to read in the GitHub UI. The dump captures
+        # sshd-debug.log (the -ddd trace forced by setup-windows.ps1),
+        # sshd.log, sshd_config, the OpenSSH-Server-Ini registry
+        # values, and the OpenSSH/Operational Event Log. Remove this
+        # step once windows-2022 is green again.
+        if: failure() && matrix.os == 'windows-2022'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sshd-dump-windows-2022
+          path: sshd-dump.txt
+          if-no-files-found: warn
 
       - name: Dump integration-test.log on failure
         # cargo test writes stdout+stderr to integration-test.log via

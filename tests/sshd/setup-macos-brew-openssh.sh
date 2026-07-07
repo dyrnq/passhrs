@@ -204,34 +204,89 @@ sed "s|__SFTP_SERVER_PATH__|${SFTP_SERVER}|g" \
 #     there authenticate via the runner account which has fully-formed
 #     PAM records and UsePAM no would break the password path.
 sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
-# Runtime-conditional `srclimit no`: OpenSSH 9.2+ adds a per-source-IP
-# connection-rate penalty that is ON by default. After 30+ back-to-back
-# test runs from 127.0.0.1 the cumulative penalty drops late-run
-# connections mid-handshake with ECONNRESET, breaking the last 2
-# integration tests. The `srclimit` config directive was added in
-# OpenSSH 9.8; the 9.6p1/10.3p1 binaries shipping on the runners
-# historically rejected it as "Bad configuration option", which is why
-# the template keeps it commented out.
+# Runtime-conditional `PerSourcePenalties no`: OpenSSH 9.8+ adds a
+# per-source-IP connection-rate penalty that is ON by default. After
+# ~30 back-to-back test runs from 127.0.0.1 the cumulative penalty
+# drops late-run connections mid-handshake with ECONNRESET, breaking
+# the last 2 integration tests (Issue #9 — sshd log literally shows
+# `srclimit_penalise: ipv4: new 127.0.0.1/32 deferred penalty of N
+# seconds` and `drop connection #0 from [127.0.0.1]:N on [127.0.0.1]:
+# 22222 penalty: ...`).
 #
-# Two probe strategies in order:
-#   1. `sshd -T` line-level probe (cheap; works when sshd prints the
-#      effective srclimit value even at default)
-#   2. Write `srclimit no` to a scratch config, run `sshd -T -f`, check
-#      exit status. sshd -T exits 0 if the config parses, non-zero
-#      if it contains a directive this build does not recognise.
-# This dual-probe catches builds that DO accept the directive but do
-# NOT advertise it in -T output at default value.
-SCRATCH_CFG="$(mktemp -t sshd-srclimit-probe.XXXXXX)"
-cp "${SSHD_CFG}" "${SCRATCH_CFG}"
-printf '\nsrclimit no\n' >> "${SCRATCH_CFG}"
-if "${SSHD_BIN}" -T -f "${SCRATCH_CFG}" >/dev/null 2>&1 \
-    || "${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1 | grep -qi '^srclimit'; then
-    echo "    sshd supports srclimit directive — appending 'srclimit no'"
-    cat >> "${SSHD_CFG}" <<EOF
-srclimit no
+# IMPORTANT: the directive name is `PerSourcePenalties` (not
+# `srclimit` as the earlier comment claimed). OpenSSH has used
+# `persourcepenalties` since the feature was introduced in 9.8 — the
+# `srclimit` keyword never existed. Confirmed by reading
+# openssh-portable/servconf.c keyword table for V_9_8 / V_10_0 /
+# V_10_3p1: only `persourcepenalties` and `persourcepenaltyexemptlist`
+# are registered. Writing `srclimit no` is treated as an unknown
+# directive; sshd fatals at parse time on strict builds or silently
+# ignores it on lenient ones — either way, the per-source penalty
+# stays ON because nothing disables it.
+#
+# Two probe strategies in order (revised after PR #14 windows-2022
+# failure exposed a false-positive in the original single-probe
+# approach):
+#   1. Run `sshd -T -f` against the BASELINE config (no override
+#      directive) and inspect the dump output:
+#        - OpenSSH 10.0+ (default ON): prints a long stats line
+#          beginning with `persourcepenalties crash:` — penalty is
+#          ACTIVE, we need to override.
+#        - OpenSSH 9.8 (default OFF): prints `persourcepenalties no`
+#          — penalty is ALREADY off, the directive is a no-op, do
+#          NOT append.
+#   2. If (and only if) the baseline says default-ON, write
+#      `PerSourcePenalties no` to a scratch config, re-run `sshd -T
+#      -f`, and confirm the dump output FLIPS to
+#      `persourcepenalties no` AND the `crash:` line is gone.
+#      Belt-and-braces against a build where the directive parses
+#      but is silently ignored (uncommon, cheap to detect).
+#
+# Why the original single-probe pattern was wrong: OpenSSH 9.8's
+# dump function emits `persourcepenalties no` whenever
+# `per_source_penalty.enabled == 0`, regardless of whether the
+# directive was explicitly set or just defaulted. So matching that
+# line in the scratch config (where we wrote the directive) was
+# meaningless — the same line would have appeared without it. The
+# probe always matched on default-OFF binaries, and appending the
+# directive to sshd_config on Win32-OpenSSH 10.0p2 broke every
+# Windows integration test connection with os error 10054.
+SCRATCH_CFG="$(mktemp -t sshd-persrc-probe.XXXXXX)"
+DEFAULT_OUT="$("${SSHD_BIN}" -T -f "${SSHD_CFG}" 2>&1)"
+DEFAULT_RC=$?
+if [ "${DEFAULT_RC}" -ne 0 ]; then
+    echo "    sshd -T baseline probe failed (rc=${DEFAULT_RC}); skipping PerSourcePenalties override"
+elif printf '%s\n' "${DEFAULT_OUT}" | grep -qE '^persourcepenalties[[:space:]]+crash:'; then
+    # Default-ON binary (OpenSSH 10.0+ dump format). Validate the
+    # override flips the dump to `persourcepenalties no` before
+    # committing to it.
+    cp "${SSHD_CFG}" "${SCRATCH_CFG}"
+    printf '\nPerSourcePenalties no\n' >> "${SCRATCH_CFG}"
+    OVERRIDE_OUT="$("${SSHD_BIN}" -T -f "${SCRATCH_CFG}" 2>&1)"
+    OVERRIDE_RC=$?
+    if [ "${OVERRIDE_RC}" -eq 0 ] \
+        && printf '%s\n' "${OVERRIDE_OUT}" | grep -qiE '^persourcepenalties[[:space:]]+no\b' \
+        && ! printf '%s\n' "${OVERRIDE_OUT}" | grep -qE '^persourcepenalties[[:space:]]+crash:'; then
+        echo "    sshd default is ON, 'PerSourcePenalties no' applied as effective — appending"
+        cat >> "${SSHD_CFG}" <<'EOF'
+
+# Disable per-source-IP connection penalty (Issue #9). OpenSSH 10.0+
+# enables this by default; the test suite hammers 127.0.0.1 with
+# ~30+ connections during one job, so without this override the
+# last ~2 integration tests get mid-handshake ECONNRESET drops.
+PerSourcePenalties no
 EOF
+    else
+        echo "    sshd default is ON but 'PerSourcePenalties no' did not flip dump output (rc=${OVERRIDE_RC}); keeping default (penalty stays ON; MaxStartups should cover)"
+    fi
+elif printf '%s\n' "${DEFAULT_OUT}" | grep -qiE '^persourcepenalties[[:space:]]+no\b'; then
+    # Default-OFF binary (OpenSSH 9.8 dump format). The directive is
+    # a no-op; do NOT append.
+    echo "    sshd default is OFF ('persourcepenalties no') — no override needed"
 else
-    echo "    sshd rejects srclimit directive — keeping 9.2+ default penalty"
+    # Either binary predates PerSourcePenalties (pre-9.8) or its
+    # dump output is unexpected. Skip — same as the pre-fix state.
+    echo "    sshd dump output has no persourcepenalties line — pre-9.8 binary or unexpected, keeping default"
 fi
 rm -f "${SCRATCH_CFG}"
 cat >> "${SSHD_CFG}" <<EOF

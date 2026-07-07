@@ -1398,8 +1398,31 @@ fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, Stri
     // fresh explicit env from an empty base. Calling `envs(...)`
     // once with all key=value pairs in a single iterator then
     // installs them all atomically without clearing between calls.
+    //
+    // Windows caveat: `env_clear` strips `USERPROFILE`/`SYSTEMROOT`,
+    // which Winsock LSPs need to load during `WSAStartup`. Without
+    // them the SSH handshake panics with
+    // `WSAEPROVIDERFAILEDINIT` (os error 10106) BEFORE auth
+    // completes — see Issue #7. Linux is more forgiving (it just
+    // defaults HOME=/ if missing), so this only matters on Windows.
+    // Build a merged (test envs ∪ Windows essentials) list and install
+    // it via a single `envs(...)` call so we don't lose the
+    // essentials between atomic updates.
+    #[allow(unused_mut)] // mutated only in the Windows branch below
+    let mut merged: Vec<(String, String)> = envs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    #[cfg(target_os = "windows")]
+    for k in ["USERPROFILE", "SYSTEMROOT", "WINDIR"] {
+        if !merged.iter().any(|(ek, _)| ek == k) {
+            if let Ok(v) = std::env::var(k) {
+                merged.push((k.to_string(), v));
+            }
+        }
+    }
     cmd.env_clear();
-    cmd.envs(envs.iter().map(|(k, v)| (*k, *v)));
+    cmd.envs(merged.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     let output = cmd.output().expect("run passhrs");
     (
         output.status.success(),
@@ -1408,14 +1431,14 @@ fn run_phr_with_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, Stri
     )
 }
 
-// Windows-only known issue: this test sets `LANG=...` and uses
-// `passhrs -t` to force TTY allocation; Win32-OpenSSH 10.0p2's
-// `-t` channel fails with WSAEPROVIDERFAILEDINIT (os error 10106)
-// before the auth completes. The non-Windows skip is the simple
-// mitigation. The proper fix is teaching passhrs (or the test) to
-// skip `-t` on Windows or use sshd `-T` to opt out of PTY, but
-// that's Windows-sshd-specific and not on this PR's critical path.
-#[cfg(not(target_os = "windows"))]
+// Issue #7 history: this test sets `LANG=...` and was originally
+// `#[cfg(not(target_os = "windows"))]` because on windows-2022 the
+// SSH handshake raised `WSAEPROVIDERFAILEDINIT` (os error 10106)
+// before auth completed. Root cause: `run_phr_with_env` calls
+// `cmd.env_clear()`, which strips `USERPROFILE`/`SYSTEMROOT`/
+// `WINDIR` — Winsock LSPs need those to initialize. The helper now
+// preserves them on Windows (see the merge step above), and the
+// gate is removed so the test exercises the Windows path too.
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_locale_env_forwarded() {
@@ -1456,11 +1479,9 @@ fn test_locale_env_forwarded() {
     );
 }
 
-// Windows-only known issue: WSAEPROVIDERFAILEDINIT (os error 10106)
-// from Win32-OpenSSH's -t channel allocation. Same root cause as
-// `test_locale_env_forwarded`. Skip until passhrs/Windows-sshd
-// gate the TTY-on path.
-#[cfg(not(target_os = "windows"))]
+// Issue #7 history: same WSAEPROVIDERFAILEDINIT root cause as
+// `test_locale_env_forwarded` — see that test's comment for the
+// full story. Un-cfg-gated alongside it.
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_unrelated_env_not_forwarded() {

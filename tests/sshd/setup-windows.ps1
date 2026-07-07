@@ -34,6 +34,15 @@ $SshdCfg    = Join-Path $SshRoot 'sshd_config'
 $HostKey    = Join-Path $SshRoot 'ssh_host_ed25519_key'
 $SftpServer = Join-Path $env:SystemRoot 'System32\OpenSSH\sftp-server.exe'
 $SshdLog    = Join-Path $SshRoot 'logs\sshd.log'
+# Diagnostic-only debug log path. The Win32-OpenSSH service wrapper
+# reads HKLM\SOFTWARE\OpenSSH-Server-Ini\LogFile / LogLevel and passes
+# them to sshd.exe on start, so writing these registry values before
+# `Start-Service sshd` makes the service emit a -ddd trace to a fixed
+# file. dump-on-failure then prints it inline so a future windows-2022
+# red run has a raw protocol trace to diff against a green run. See
+# PR #14 root-cause investigation. Remove this block once windows-2022
+# is green again.
+$SshdDebugLog = Join-Path $SshRoot 'logs\sshd-debug.log'
 
 # 1. The inbox Windows OpenSSH capability ships OpenSSH 8.1p1 (LibreSSL
 #    3.8.2) on windows-2022 runners and that build has a known
@@ -309,28 +318,104 @@ try {
     Remove-Item -LiteralPath $ScratchCfg -Force -ErrorAction SilentlyContinue
 }
 
-# 9. Start sshd via the Windows service that the OpenSSH capability
-#    installs. The service reads $SshdCfg by default (this is where the
-#    installer expects it). Starting via the service avoids the
-#    process-lifecycle quirks of `Start-Process` with -D (the daemon
-#    mode the Windows sshd build does not reliably support).
-$svc = Get-Service -Name sshd -ErrorAction Stop
+# 9. Start sshd as a foreground process via Start-Process, NOT as a
+#    Windows service. The PR #14 root-cause dump on 28780534625
+#    showed that the Win32-OpenSSH 10.0p2 service wrapper (the
+#    sshd.exe shipped as the service entry point) does NOT honour
+#    HKLM\SOFTWARE\OpenSSH-Server-Ini\LogFile/LogLevel — the file
+#    was never created even though the registry values were set
+#    correctly — and that the OpenSSH/Operational Event Log is
+#    empty even after a 33-test connection storm. Symptom: port
+#    22222 accepts TCP connections but every SSH handshake is RST'd
+#    with os error 10054. The service's per-connection sshd-session.exe
+#    fork is silently failing.
+#
+#    Running sshd.exe directly with `-D -E $SshdLog` (foreground
+#    daemon mode + explicit log path) bypasses the service wrapper
+#    entirely: the parent sshd.exe writes its -ddd trace to
+#    $SshdLog, sshd-session.exe forks per-connection under our
+#    runner user (not as NT SERVICE\sshd), and connection failures
+#    show up in the log instead of being silently swallowed. The
+#    process is started with Start-Process -PassThru so the PID
+#    is captured for the dump-on-failure path; the GitHub Actions
+#    runner's job-object teardown kills it when the integration
+#    step ends, so no manual cleanup is required.
+#
+#    The earlier comment in this step claimed "Start-Process with
+#    -D ... does not reliably support" daemon mode; that was
+#    wrong. The Windows sshd build supports -D (verified by the
+#    Win32-OpenSSH 10.0.0.0p2 release notes: -D is the canonical
+#    non-service mode and is what the service wrapper itself
+#    internally invokes). The reason that path wasn't taken
+#    before is that "Run as a service" matched the OpenSSH
+#    capability installer's recommended setup, but the
+#    recommendation doesn't apply to a CI-runner sshd whose
+#    lifetime is exactly one step.
 Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
-Set-Service -Name sshd -StartupType Manual
-# Start-Service under `$ErrorActionPreference = 'Stop'` raises a
-# terminating error on failure, which would otherwise exit the script
-# before the readiness / diagnostic paths below fire. Wrap explicitly
-# to capture success/failure and emit the dump on failure.
+
+# Force the wrapper to also not be holding the port. `sc.exe delete`
+# would be too aggressive (it removes the registration entirely);
+# `sc.exe config` to manual startup is enough to ensure it doesn't
+# auto-restart on our Start-Process.
+$svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+if ($null -ne $svc) {
+    try { Set-Service -Name sshd -StartupType Disabled -ErrorAction SilentlyContinue } catch {}
+    Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+}
+Start-Sleep -Seconds 1
+
+# Confirm no other process is still bound to 22222 — if the service
+# had a stuck sshd.exe child, this would block our Start-Process.
+$portBusy = $false
+try {
+    $probe = New-Object System.Net.Sockets.TcpClient
+    $probe.Connect($ListenHost, $Port)
+    $probe.Close()
+    $portBusy = $true
+} catch {}
+if ($portBusy) {
+    # Port still busy: an existing sshd (probably the service's
+    # sshd.exe) is bound. Find and stop it. This is rare — Stop-Service
+    # + the sleep above is usually enough — but on a flaky runner
+    # the service can leave a zombie sshd.exe holding the port.
+    Get-Process -Name sshd,sshd-session -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            Write-Host "    killing lingering sshd pid=$($_.Id)"
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    Start-Sleep -Seconds 2
+}
+
+# Wipe any stale log file from a previous run so the dump-on-failure
+# path's "is the file present?" check has a clean baseline.
+Remove-Item -LiteralPath $SshdLog       -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $SshdDebugLog  -Force -ErrorAction SilentlyContinue
+
+# Start sshd.exe directly. -D = "do not daemonize" (foreground,
+# required for our Start-Process model), -E $SshdLog = explicit
+# log file (so the service wrapper's failure-to-honour-LogFile
+# is moot), -f $SshdCfg = explicit config path. -ddd = full debug3
+# trace for the PR #14 root-cause investigation; this is the same
+# level the registry override was supposed to produce, but now
+# actually delivered because we're not going through the wrapper.
+# We do NOT pass -o (override) for the password / forwarding
+# directives — those live in the rendered $SshdCfg, and a future
+# debug that adds an -o override should be a one-line change.
+$sshdProc = $null
 $sshdStartupOk = $false
 try {
-    Start-Service -Name sshd -ErrorAction Stop
+    $sshdProc = Start-Process `
+        -FilePath (Join-Path $SshdBinDir 'sshd.exe') `
+        -ArgumentList @('-D', '-E', $SshdLog, '-ddd', '-f', $SshdCfg) `
+        -NoNewWindow `
+        -PassThru `
+        -RedirectStandardError "$SshdLog.err" `
+        -ErrorAction Stop
     $sshdStartupOk = $true
+    Write-Host "    sshd started pid=$($sshdProc.Id) (foreground, log=$SshdLog)"
 } catch {
-    # Use Write-Host (not Write-Error) because $ErrorActionPreference =
-    # 'Stop' elsewhere turns Write-Error into a terminating error,
-    # which would re-exit the script before the diagnostic dump runs.
-    Write-Host "Start-Service sshd threw: $_"
+    Write-Host "Start-Process sshd threw: $_"
 }
 Start-Sleep -Seconds 1
 
@@ -352,48 +437,51 @@ if ($sshdStartupOk) {
 }
 
 if (-not $sshdStartupOk) {
-    Write-Host "Start-Service sshd failed; emitting diagnostic dump:"
+    Write-Host "Start-Process sshd failed; emitting diagnostic dump:"
 } elseif (-not $ready) {
     Write-Host "sshd did not accept connections within 10s; emitting diagnostic dump:"
 }
 
 if (-not $sshdStartupOk -or -not $ready) {
     Write-Host "sshd did not accept connections within 10s."
-    Write-Host "Service status:"
-    Get-Service -Name sshd | Format-List | Out-String | Write-Host
 
-    # Confirm the service really points to our upgraded binary. After
-    # overwriting inbox binaries in-place the path stays the same, but
-    # surface it so we know which sshd.exe was attempted.
-    $svcPath = (Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue).PathName
-    Write-Host "Service BinaryPathName: $svcPath"
-
-    Write-Host "sc.exe qc sshd:"
-    sc.exe qc sshd 2>&1 | ForEach-Object { Write-Host $_ }
-
+    # Confirm the sshd.exe we tried to launch is the upgraded one.
     Write-Host "sshd.exe on disk reports version:"
     & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | ForEach-Object { Write-Host $_ }
 
     Write-Host "sshd -t -f ${SshdCfg}:"
-    & sshd -t -f $SshdCfg 2>&1 | ForEach-Object { Write-Host $_ }
+    & (Join-Path $SshdBinDir 'sshd.exe') -t -f $SshdCfg 2>&1 | ForEach-Object { Write-Host $_ }
 
-    Write-Host "sshd -ddd (debug):"
-    & sshd -ddd 2>&1 | Out-String | Write-Host
-
+    # The sshd log file is the canonical post-mortem for the foreground
+    # mode introduced in PR #14. If it's empty or missing, the sshd
+    # binary couldn't even open the port -- check for a stderr file
+    # (Start-Process -RedirectStandardError redirected it for us).
     Write-Host "Recent sshd log entries:"
-    if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Host }
+    if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 100 | Write-Host }
+    else { Write-Host "  (no $SshdLog)" }
 
-    Write-Host "Windows Event Log (sshd):"
-    Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 20 -ErrorAction SilentlyContinue |
+    if (Test-Path "$SshdLog.err") {
+        Write-Host "sshd stderr (from Start-Process -RedirectStandardError):"
+        Get-Content "$SshdLog.err" -Tail 50 | Write-Host
+    }
+
+    # Bumped from 20 to 500 in PR #14 diagnostic: the OpenSSH/Operational
+    # channel is the canonical log on Windows builds where the service
+    # wrapper ignores LogFile/LogLevel registry values. Even with the
+    # override, Event Log entries are the audit trail the wrapper
+    # always emits, so a green run's first 20 events are insufficient
+    # to cover a 33-test connection storm.
+    Write-Host "Windows Event Log (sshd, last 500):"
+    Get-WinEvent -LogName 'OpenSSH/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host $_.Message }
-    Write-Host "Windows Event Log (System, sshd-related):"
-    Get-WinEvent -LogName System -MaxEvents 50 -ErrorAction SilentlyContinue |
+    Write-Host "Windows Event Log (System, sshd-related, last 200):"
+    Get-WinEvent -LogName System -MaxEvents 200 -ErrorAction SilentlyContinue |
         Where-Object { $_.ProviderName -match 'sshd' -or $_.Message -match 'sshd' } |
         ForEach-Object { Write-Host $_.Message }
-    Write-Host "Windows Event Log (Application, last 20):"
-    Get-WinEvent -LogName Application -MaxEvents 20 -ErrorAction SilentlyContinue |
+    Write-Host "Windows Event Log (Application, last 200):"
+    Get-WinEvent -LogName Application -MaxEvents 200 -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host $_.Message }
     exit 1
 }
 
-Write-Host "test sshd ready at ${ListenHost}:${Port} (service: sshd)"
+Write-Host "test sshd ready at ${ListenHost}:${Port} (foreground sshd.exe pid=$($sshdProc.Id), log=$SshdLog)"
