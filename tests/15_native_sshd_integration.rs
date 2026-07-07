@@ -1305,13 +1305,15 @@ fn test_multiple_ssh_options() {
     assert_eq!(stdout.trim(), "multi_opts_ok", "stdout: {}", stdout);
 }
 
-// Windows-only known issue: this test runs many sshd sessions back
-// to back, and the `-q` arm on the second run reliably gets
-// `os error 10054` (ECONNRESET) from Win32-OpenSSH. Same srclimit
-// hypothesis that the macOS dual-probe fixed — needs the equivalent
-// runtime-conditional `srclimit no` in setup-windows.ps1. Until that
-// change lands, skip on Windows.
-#[cfg(not(target_os = "windows"))]
+// Historically Windows-gated: back-to-back `-vv` + `-q` runs raised
+// `os error 10054` (WSAECONNRESET) on windows-2022. That root cause
+// was the same one PR #14 fixed for `-t` tests: the Win32-OpenSSH
+// 10.0p2 service wrapper's per-connection sshd-session.exe fork was
+// failing. setup-windows.ps1 now starts sshd.exe in foreground,
+// bypassing the wrapper, and PR #14 went 33/33 green on windows-2022.
+// This test was never re-armed after that — re-enabling here on the
+// same hypothesis. If it regresses, re-gate with an issue link rather
+// than keep the stale `srclimit no` comment.
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_verbose_quiet_flags() {
