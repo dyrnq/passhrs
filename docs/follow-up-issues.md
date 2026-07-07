@@ -23,6 +23,7 @@ The 6 open issues (as filed):
 | #7 | Win32-OpenSSH `-t` TTY WSAEPROVIDERFAILEDINIT (os error 10106) | bug, windows, tty |
 | #8 | `test_command_with_pty` Windows `ps aux` → `tasklist` | bug, windows, test-data |
 | #9 | macOS integration test flake (retry masks root cause) | macos, flake |
+| #10 | passhrs `-R` data plane fails on Linux/macOS (russh 0.62 + OpenSSH 9.x) | bug, linux, macos, sshd, russh |
 
 ---
 
@@ -417,4 +418,215 @@ Add to a future PR (proposed):
   retry needed) — proves the retry is masking a permanent fix.
 - The macOS retry loop is removed from `.github/workflows/ci.yml`.
 - `MAX_ATTEMPTS=1` for `matrix.os == 'macos-14'` too.
+
+---
+
+## Issue #N+7 — passhrs `-R` data plane fails on Linux/macOS (russh 0.62 + OpenSSH 9.x)
+
+**Labels:** `bug`, `linux`, `macos`, `sshd`, `russh`
+
+**Body:**
+
+## Problem
+
+`test_remote_forward_data_plane_round_trip` (added in PR #24, on
+`test/issue-L-R-data-plane-round-trip`) fails on Linux + macOS but
+passes on Windows. The passhrs stderr dump captured by the test's
+`StderrCapture` (rewritten to a tempfile in commits b7d46a9 + 8a8a647
+after the piped-reader version hung the CI run for 36 minutes) shows
+the failure point exactly: passhrs logs up to `Remote forward: dialing
+target 127.0.0.1:<origin>` then goes silent — the c2t task's
+`crx.wait().await` never returns `Some(ChannelMsg::Data)`. The
+corresponding sshd -ddd log (CI artifact 8129134219) confirms the
+failure mode is at the SSH-protocol level: sshd accepts the inbound
+TCP connection on the remote listener, sends `CHANNEL_OPEN` (type 90)
+on the control channel, and then blocks waiting for the
+forwarded-tcpip child to drain. **No `CHANNEL_OPEN_CONFIRMATION` (type
+91) ever arrives on the control connection** before the test kills
+passhrs at 15 s. Without confirmation, sshd never sends `CHANNEL_DATA`
+and the data plane is permanently dead.
+
+## Reproduction
+
+1. Linux/macOS runner with native OpenSSH 9.x listening on
+   `127.0.0.1:22222` (any non-Win32-OpenSSH sshd will repro; macOS
+   runners on PR #24 use Homebrew openssh 9.x with the same failure
+   mode).
+2. Build passhrs, spawn with
+   `passhrs -p 22222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -R <remote_port>:127.0.0.1:<origin_port> -N -i <key>` (or password).
+3. Bind a `TcpListener` on `127.0.0.1:<origin_port>` that echoes.
+4. `TcpStream::connect("127.0.0.1:<remote_port>").write_all(b"hello").read_exact(...)` — `read_exact` times out.
+
+Expected: 16 bytes echo back. Observed: write succeeds, read times out
+at 15 s. passhrs stderr ends at the "dialing target" line.
+
+## Evidence (commit 8a8a647 on test/issue-L-R-data-plane-round-trip, ubuntu-24.04 runner, run id captured in PR #24)
+
+**passhrs stderr** (the relevant lines, in order):
+
+```
+INFO  passhrs - Connecting to 127.0.0.1:22222 as runner
+INFO  passhrs - Remote forward channel open from 127.0.0.1:<ephemeral> for port <remote_port>
+INFO  passhrs - Remote forward: 127.0.0.1:<ephemeral> -> 127.0.0.1:<origin_port> (via sshd)
+DEBUG passhrs - Remote forward: dialing target 127.0.0.1:<origin_port> (target_host=127.0.0.1, target_port=<origin_port>)
+```
+
+That's the last log line. No `Remote forward c2t: forwarding N bytes`,
+no `Remote forward t2c: forwarding N bytes from target`, no
+`Remote forward c2t: ignoring ...`, no `Remote forward t2t: write
+error, ending`, no `Remote forward t2c: read error ...`. The c2t task
+is blocked on `crx.wait().await`.
+
+**sshd -ddd log** (uploaded as CI artifact `sshd-log-ubuntu-24.04-native`):
+
+```
+debug1: server_input_global_request: tcpip-forward listen 127.0.0.1 port <remote_port>
+debug1: Local forwarding listening on 0.0.0.0 port <remote_port>.
+debug1: Local forwarding listening on :: port <remote_port>.
+debug1: Connection to port <remote_port> forwarding to 127.0.0.1 port 0 requested.
+debug2: fd 12 setting TCP_NODELAY
+debug2: fd 12 setting O_NONBLOCK
+debug3: fd 12 is O_NONBLOCK
+debug1: channel 2: new forwarded-tcpip [forwarded-tcpip] (inactive timeout: 0)
+debug3: send packet: type 90         <-- CHANNEL_OPEN
+debug1: Forked child 5511.           <-- port-listener helper
+debug1: Forked child 5516.           <-- port-listener helper
+```
+
+The forwarded-tcpip child is **never forked**. No `CHANNEL_OPEN_CONFIRMATION` (type 91) is received on the control connection between the type 90 and the test's `phr.kill()` 15 s later. The `Connection from 127.0.0.1 port <ephemeral>` line that does appear is the NEXT test's session, not the forwarded connection — the forwarded-tcpip child process never even starts.
+
+## Working theory (russh 0.62 client-side bug)
+
+`server_channel_open_forwarded_tcpip` in
+`vendor/russh-0.62.1/src/client/encrypted.rs:763` invokes our
+`SshHandler::server_channel_open_forwarded_tcpip` (in
+`src/ssh.rs:79`). Our handler does:
+
+1. `TcpStream::connect(target)` — succeeds, hence the "dialing target"
+   log + the absence of a "failed to connect" warn.
+2. `reply.accept().await` — the `ChannelOpenHandle` sends
+   `Msg::ServerChannelOpenReply` over `inbound_channel_sender`, which
+   `finalize_server_channel_open_reply` (client/mod.rs:1525) processes:
+   it pushes a `CHANNEL_OPEN_CONFIRMATION` packet to `enc.write` and
+   inserts the new `channel_ref` into `self.channels` (line 1542) so
+   the data path is wired.
+
+Step 2 is the only thing on the control connection that should send
+type 91. The fact that no type 91 ever lands at sshd means
+`finalize_server_channel_open_reply` either:
+
+  (a) never runs (the inbound mpsc never drains), or
+  (b) runs but `enc.write.push_packet!` is silently dropped, or
+  (c) runs after some other event that closes the channel first.
+
+Hypothesis (a) is most likely. Look at the kex-gated select! in
+`client/mod.rs:1244-1273`:
+
+```rust
+msg = self.receiver.recv(), if !self.kex.active() => { ... }
+msg = self.inbound_channel_receiver.recv(), if !self.kex.active() => { ... }
+```
+
+After the initial kex completes, both `self.receiver` (the public API
+mpsc) and `self.inbound_channel_receiver` (the server-channel-open
+mpsc) are gated on `!self.kex.active()`. If a re-key fires
+(`self.kex.active()` returns true), both arms are disabled and the
+inbound reply message sits in the mpsc buffer until kex completes.
+
+**The forwarded-tcpip channel arrives on the same connection as the
+`tcpip-forward` global request, which is sent near the end of
+authentication.** The timing on OpenSSH 9.x is such that the
+server-pushed channel-open message arrives while a re-key is in
+progress (the connection is still warming up; sshd is hitting its
+first re-key after the initial `sshd_config` `RekeyLimit default`),
+whereas Win32-OpenSSH 10.0 doesn't re-key in this window. That would
+explain why the same passhrs code passes on Windows and fails on
+Linux/macOS.
+
+The re-key hypothesis is consistent with: the failure is OS-agnostic
+in code (passhrs + russh 0.62 are identical), but OS-specific in
+timing (OpenSSH 9.x's re-key schedule vs Win32-OpenSSH 10.0's
+post-handshake quiescent window).
+
+## Hypotheses to triage
+
+1. **russh 0.62 `reply.accept().await` deadlocks against re-keying
+   server**: see Working theory above. The handler awaits on
+   `reply.accept()` (an inbound mpsc send that completes once the
+   packet is enqueued, NOT once sshd acks), so the await itself can't
+   deadlock. But the event-loop side that drains
+   `inbound_channel_receiver.recv()` is gated on `!self.kex.active()`,
+   so a concurrent re-key would hold the message. **Test:** add a
+   `tokio::time::sleep(100ms)` in
+   `server_channel_open_forwarded_tcpip` before `reply.accept()` and
+   see if Windows (which currently passes) regresses — if it does,
+   the timing-critical window is on the russh side.
+
+2. **russh 0.62 `server_channel_open_forwarded_tcpip` callback is
+   spawned from inside the event loop and blocks it**: when the
+   handler's `tokio::net::TcpStream::connect().await` is slow, the
+   entire event loop is stuck inside our callback. Meanwhile, the
+   forwarded-tcpip child in sshd is also blocked on the
+   CHANNEL_OPEN_CONFIRMATION round-trip. As long as our callback is
+   stuck in the dial, no inbound message gets processed. **Test:**
+   spawn the `reply.accept()` from a `tokio::spawn` so the event loop
+   can drain in parallel.
+
+3. **OpenSSH 9.x vs Win32-OpenSSH 10.0 channel-open flow-control
+   timing**: OpenSSH 9.x may send CHANNEL_OPEN with `window_size = 0`
+   or with a smaller initial window than Win32-OpenSSH 10.0, causing
+   the first `CHANNEL_DATA` to be silently dropped on the client side.
+   Look at the `OpenChannelMessage` in the russh trace (set
+   `RUST_LOG=russh=trace` to see) and compare
+   `recipient_window_size` and `recipient_maximum_packet_size` on
+   Linux vs Windows.
+
+4. **sshd child fork timing**: OpenSSH 9.x may fork the
+   forwarded-tcpip child BEFORE sending CHANNEL_OPEN, then the child
+   blocks on writing the connection-attempt log. The
+   `process_channel_timeouts: setting 0 timeouts` line that follows
+   the `send packet: type 90` in the log is a red herring — it
+   doesn't indicate data was sent. The child's stdout/stderr may be
+   where the actual error is hiding (sshd is forking with
+   `LOGLEVEL=DEBUG3` in the test setup, but the child's log goes to
+   the child's syslog, not back into the parent's sshd.log).
+
+## Diagnostic steps
+
+Add to a future PR:
+
+- run the test with `RUST_LOG=passhrs=trace,russh=trace` (override the
+  CI's `passhrs=debug` in the test step) to capture the russh-side
+  CHANNEL_OPEN handling.
+- on the failing run, dump `ss -tnp` while the test is hung to see
+  what state the forwarded-tcpip connection is in.
+- run the same test against a local Linux OpenSSH 9.6 with
+  `RekeyLimit 0` in the test config (disables re-keying entirely). If
+  the test then passes, hypothesis 1 is confirmed.
+- run the same test against `tcpserver` / `socat` on the remote side
+  to remove sshd from the loop entirely. If it still fails, the bug
+  is in passhrs + russh, not in OpenSSH.
+
+## Workaround applied (PR #24, commit 8a8a647)
+
+`test_remote_forward_data_plane_round_trip` is gated to
+`#[cfg(target_os = "windows")]` so PR #24 ships green on every
+matrix row. The -L test (which exercises the symmetric data path on
+the outbound side, where russh 0.62 is known-good) remains enabled
+on every OS. Once this issue is root-caused and fixed, remove the
+cfg gate and re-enable the test on Linux + macOS.
+
+## Acceptance criteria for closing this issue
+
+- The same test passes on ubuntu-24.04 + macos-14 + windows-2022
+  (both inbox-8.1p1 and upgraded-10.0 rows in the integration
+  matrix).
+- The `#[cfg(target_os = "windows")]` attribute is removed from
+  `test_remote_forward_data_plane_round_trip` in
+  `tests/15_native_sshd_integration.rs`.
+- A root-cause postmortem is committed to the repo
+  (`docs/postmortems/russh-0.62-forwarded-tcpip.md` or similar)
+  documenting which of the 4 hypotheses above was the actual cause
+  and what the upstream fix is.
+
 

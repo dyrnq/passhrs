@@ -17,8 +17,11 @@
 //! the test process's local filesystem — tests can read/clean up
 //! remote artifacts with `std::fs` directly instead of shelling out
 //! to the server.
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -85,6 +88,109 @@ fn sshd_ok() -> bool {
     };
     std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
+
+/// Bind to port 0, read back what the kernel picked, drop. Tests use
+/// this for both ends of a -L / -R round-trip — the local listener
+/// passhrs will sit at, and the "remote" target it forwards to. Both
+/// are on the same loopback because the native sshd runs here too.
+fn pick_unused_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind port 0")
+        .local_addr()
+        .expect("read local_addr")
+        .port()
+}
+
+/// Capture a spawned child's stderr to a tempfile on disk, then dump it on
+/// test failure. Why tempfile instead of a piped reader: passhrs spawns
+/// the SSH session as a worker that, in the failure case, can outlive the
+/// parent's `kill()`+`wait()`. A piped `read_to_string` then blocks
+/// waiting for EOF that never arrives — which hangs the test binary
+/// indefinitely and the CI runner times out after 6 hours. With a
+/// tempfile, the file persists independent of process state, so Drop
+/// can always read whatever passhrs wrote before death (or before being
+/// leaked). The tempfile is unlinked in Drop.
+struct StderrCapture {
+    path: PathBuf,
+}
+
+impl StderrCapture {
+    /// Build the unique path each invocation uses. Namespaced by PID
+    /// plus a nanosecond timestamp so two concurrent invocations on the
+    /// same process (cargo runs each test in its own process so this
+    /// is belt-and-suspenders) cannot collide.
+    fn make_path() -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("passhrs-stderr-{pid}-{nanos}.log"))
+    }
+
+    /// Convenience wrapper that opens the file, dups the fd for the
+    /// child's stderr, and spawns the command. The returned capture
+    /// owns the tempfile path; the caller still owns the `Child`.
+    fn spawn(bin: &str, args: &[String]) -> (std::process::Child, Self) {
+        let path = Self::make_path();
+        let file = File::create(&path).expect("create stderr tempfile");
+        let dup = file.try_clone().expect("dup stderr fd");
+        // Drop the original handle — the dup is what the child holds,
+        // and dropping `file` here does not close the dup. The dup is
+        // moved into `Stdio::from`, which the child takes ownership of.
+        drop(file);
+        let child = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(dup))
+            .spawn()
+            .expect("spawn with stderr capture");
+        (child, Self { path })
+    }
+
+    /// Read the captured stderr from disk. Safe to call any time —
+    /// whether the child is alive, dead, or leaked.
+    fn dump(&self) {
+        match std::fs::read_to_string(&self.path) {
+            Ok(s) if !s.trim().is_empty() => {
+                eprintln!("--- passhrs stderr (captured during failed test) ---");
+                eprintln!("{}", s);
+                eprintln!("--- end passhrs stderr ---");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "--- passhrs stderr: could not read {}: {} ---",
+                self.path.display(),
+                e
+            ),
+        }
+    }
+
+    /// Consume self and dump the captured stderr. Use on the happy
+    /// path when you still want to see passhrs stderr for debugging,
+    /// or rely on the Drop impl (which suppresses when finish is
+    /// called) by calling `capture.finish()`.
+    #[allow(dead_code)]
+    fn finish(self) {
+        self.dump();
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        // Print whatever passhrs wrote, even on panic. Safe: the
+        // file is on disk, never blocked on a pipe.
+        self.dump();
+        // Best-effort cleanup; ignore errors (file may already be gone
+        // or held open by a leaked worker — both fine).
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Suppress unused-import warnings for `Path` when no capture is taken
+/// (keeps the import set self-documenting across the file).
+#[allow(dead_code)]
+fn _path_anchor(_: &Path) {}
 
 /// Authentication arguments prepended to every `run_phr` call.
 ///
@@ -1180,6 +1286,238 @@ fn test_local_forward_spawn() {
         .expect("spawn -L");
     thread::sleep(Duration::from_secs(2));
     let _ = child.kill();
+}
+
+// Data-plane round-trip for `-L`. `test_local_forward_spawn` above
+// only proves passhrs accepts `-L ... -N` and stays up — it never
+// connects to the forward and never proves bytes flow. This test:
+//
+//   1. Binds a real TCP listener on 127.0.0.1:<remote_port> that
+//      reads 16 bytes and writes them back (an "echo" service).
+//   2. Spawns passhrs -L <local>:127.0.0.1:<remote_port> -N.
+//   3. Opens a fresh socket to localhost:<local>, sends a known
+//      16-byte payload, expects the same 16 bytes back.
+//   4. Joins the echo thread and asserts its `read_exact` saw the
+//      exact same payload.
+//
+// Both ends are loopback — the "remote" listener runs in the test
+// process; native sshd (port 22222) and passhrs share the same
+// loopback, so 127.0.0.1:<remote_port> is reachable from sshd's
+// channel-handling child too. No docker, no Python.
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_local_forward_data_plane_round_trip() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let remote_port = pick_unused_port();
+    let remote_listener =
+        std::net::TcpListener::bind(("127.0.0.1", remote_port)).expect("bind remote listener");
+    let echoed: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let echoed_w = echoed.clone();
+    let remote_thread = thread::spawn(move || {
+        let (mut stream, _) = remote_listener.accept().expect("remote accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set_write_timeout");
+        let mut buf = vec![0u8; 16];
+        stream.read_exact(&mut buf).expect("echo read");
+        stream.write_all(&buf).expect("echo write");
+        *echoed_w.lock().unwrap() = Some(buf);
+    });
+
+    let local_port = pick_unused_port();
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-L".to_string(),
+        format!("{}:127.0.0.1:{}", local_port, remote_port),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut args);
+    let mut phr = Command::new(BIN)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn passhrs -L");
+
+    // Bounded retry: -L listeners come up after SSH handshake + auth
+    // + channel-open, ~50-200 ms on a quiet runner but a CI spike
+    // can push it past that. 20 × 100 ms = 2 s of slack.
+    let client = (|| -> Option<std::net::TcpStream> {
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", local_port)) {
+                return Some(s);
+            }
+        }
+        None
+    })()
+    .expect("-L listener never came up");
+    let mut client = client;
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("client set_read_timeout");
+
+    let payload: [u8; 16] = *b"hello-L-test-oke";
+    client.write_all(&payload).expect("client write");
+    let mut rx = [0u8; 16];
+    client.read_exact(&mut rx).expect("client read");
+    assert_eq!(rx, payload, "-L did not echo back the same bytes");
+
+    remote_thread.join().expect("remote thread join");
+    assert_eq!(
+        echoed.lock().unwrap().as_deref(),
+        Some(&payload[..]),
+        "remote listener received wrong bytes"
+    );
+
+    drop(client);
+    let _ = phr.kill();
+    let _ = phr.wait();
+}
+
+// Data-plane round-trip for `-R`. Mirror of the -L test. Native sshd
+// accepts the listener on 127.0.0.1:<remote_port> on the remote side
+// (which is also loopback — sshd runs here too), tunnels connection
+// attempts back through passhrs to a local listener at
+// 127.0.0.1:<origin_port> which echoes back through the same channel.
+//
+//   1. Bind a TCP listener on 127.0.0.1:<origin_port> (the -R
+//      "origin"). Reads 16 bytes, writes them back.
+//   2. Spawn passhrs -R <remote_port>:127.0.0.1:<origin_port> -N.
+//   3. Open a fresh socket to 127.0.0.1:<remote_port>, send 16
+//      bytes, expect the same back.
+//   4. Join the origin thread and confirm it saw the same payload.
+//
+// Windows-only as of PR #24. The Linux/macOS path is gated to
+// `target_os = "windows"` because the data plane is broken under
+// russh 0.62 + native OpenSSH 9.x: passhrs logs up to "Remote
+// forward: dialing target" then the c2t task's `crx.wait()` never
+// receives `ChannelMsg::Data`. Cross-referencing the test's
+// passhrs stderr against the matching sshd -ddd log shows sshd
+// receives the inbound TCP connection at the remote listener and
+// sends `CHANNEL_OPEN` (type 90) — but passhrs never sends back
+// `CHANNEL_OPEN_CONFIRMATION` (type 91). The forwarded-tcpip child
+// therefore blocks indefinitely, no `CHANNEL_DATA` arrives, and the
+// test times out at 15 s. See the issue opened by PR #24 (link in
+// the follow-up-issues index) for full evidence and a workaround
+// plan. Windows passes because Win32-OpenSSH 10.0's CHANNEL_OPEN
+// flow-control timing lets the confirm round-trip complete before
+// the child blocks; the russh 0.62 client side is the common
+// factor, but the symptom only surfaces against OpenSSH 9.x.
+//
+// Fixed by detaching `reply.accept()` into its own tokio::spawn
+// and replacing `tokio::join!(c2t, t2c)` with detached JoinHandle
+// drops — see the inline comment in `server_channel_open_forwarded_tcpip`
+// for the full root cause. With the fix, the test passes against
+// OpenSSH 9.x and 10.x on Linux + macOS + Windows. Un-gated as
+// part of the Issue #25 fix.
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_remote_forward_data_plane_round_trip() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let origin_port = pick_unused_port();
+    let origin_listener =
+        std::net::TcpListener::bind(("127.0.0.1", origin_port)).expect("bind origin listener");
+    let echoed: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let echoed_w = echoed.clone();
+    // Data-plane timeouts: 15 s each (vs the 5 s used in the -L test).
+    // The -R path has one extra hop — passhrs must receive the
+    // forwarded-tcpip channel-open from sshd and then dial the origin
+    // listener — and on a CI-loaded Linux/macOS runner the cumulative
+    // handshake+channel-open+dial time occasionally blows past 5 s.
+    // 15 s leaves ample headroom; the test still fails fast (well under
+    // cargo's default 60 s per-test timeout) when the data path is
+    // genuinely broken.
+    const FWD_IO_TIMEOUT: Duration = Duration::from_secs(15);
+    let origin_thread = thread::spawn(move || {
+        let (mut stream, _) = origin_listener.accept().expect("origin accept");
+        stream
+            .set_read_timeout(Some(FWD_IO_TIMEOUT))
+            .expect("set_read_timeout");
+        stream
+            .set_write_timeout(Some(FWD_IO_TIMEOUT))
+            .expect("set_write_timeout");
+        let mut buf = vec![0u8; 16];
+        stream.read_exact(&mut buf).expect("echo read");
+        stream.write_all(&buf).expect("echo write");
+        *echoed_w.lock().unwrap() = Some(buf);
+    });
+
+    let remote_port = pick_unused_port();
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-R".to_string(),
+        format!("{}:127.0.0.1:{}", remote_port, origin_port),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut args);
+    // stderr → tempfile via StderrCapture::spawn. On a panic during
+    // the data plane (the most common failure shape on Linux/macOS),
+    // the Drop impl reads passhrs's stderr from the tempfile on disk
+    // and prints it alongside the assertion panic. The tempfile
+    // approach is hang-safe (no pipe that a leaked worker can keep
+    // open forever, which the previous piped-reader version hit).
+    let (mut phr, stderr_cap) = StderrCapture::spawn(BIN, &args);
+
+    let client = (|| -> Option<std::net::TcpStream> {
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", remote_port)) {
+                return Some(s);
+            }
+        }
+        None
+    })()
+    .expect("-R listener never came up");
+    let mut client = client;
+    client
+        .set_read_timeout(Some(FWD_IO_TIMEOUT))
+        .expect("client set_read_timeout");
+
+    let payload: [u8; 16] = *b"hello-R-test-oke";
+    client.write_all(&payload).expect("client write");
+    let mut rx = [0u8; 16];
+    client.read_exact(&mut rx).expect("client read");
+    assert_eq!(rx, payload, "-R did not echo back the same bytes");
+
+    origin_thread.join().expect("origin thread join");
+    assert_eq!(
+        echoed.lock().unwrap().as_deref(),
+        Some(&payload[..]),
+        "origin listener received wrong bytes"
+    );
+
+    drop(client);
+    let _ = phr.kill();
+    let _ = phr.wait();
+    // finish() consumes the capture so the Drop impl does not also
+    // dump stderr on the happy path.
+    stderr_cap.finish();
 }
 
 #[test]
