@@ -620,11 +620,29 @@ if ($env:GITHUB_ENV) {
 #     tests' first `-i` invocation. Uses the inbox ssh.exe if it's
 #     on PATH; falls back to skipping the probe (the test will
 #     surface the failure with a clearer context).
+#
+#     Probe verbosity: -v gives debug1 lines for the fatal errors
+#     (`banner exchange: ...`, `Connection to ... port N: ...`) so a
+#     future "UNKNOWN port -1" failure makes the actual destination
+#     parse visible (the previous PR #30 attempts shipped without -v
+#     and got an opaque `Connection to UNKNOWN port -1: Connection
+#     refused` with no way to tell if PowerShell mangled $User,
+#     $ListenHost, or $Port). -E is required to actually emit
+#     debug1 to stderr (without it Win32-OpenSSH's client emits
+#     nothing for fatal-level messages). For BatchMode probes ssh
+#     still runs the kex attempt before deciding to fail, so the
+#     debug lines from connect() / banner exchange / permission
+#     rejections all land in $probeOutput before any exit.
 $SshBin = Join-Path $SshdBinDir 'ssh.exe'
 if (-not (Test-Path $SshBin)) { $SshBin = 'ssh' }
 Write-Host "==> Smoke-testing ssh pubkey auth..."
+Write-Host "    probe: & ${SshBin} -i '$TestKey' -p $Port -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=10 -v '${User}@${ListenHost}' 'echo win_pubkey_ok'"
+Write-Host "    ACL check on $TestKey:"
+icacls $TestKey | Write-Host
+Write-Host "    ACL check on $AuthorizedKeysPath:"
+icacls $AuthorizedKeysPath | Write-Host
 try {
-    $probeOutput = & $SshBin -i $TestKey -p $Port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 "${User}@${ListenHost}" "echo win_pubkey_ok" 2>&1
+    $probeOutput = & $SshBin -i $TestKey -p $Port -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=10 -v "${User}@${ListenHost}" "echo win_pubkey_ok" 2>&1
     if ($LASTEXITCODE -ne 0 -or ($probeOutput -notmatch 'win_pubkey_ok')) {
         Write-Host "FATAL: ssh pubkey auth probe failed; check authorized_keys ACL + key perms" -ForegroundColor Red
         Write-Host "probe output: $probeOutput"
