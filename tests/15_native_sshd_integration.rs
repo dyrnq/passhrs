@@ -1418,8 +1418,14 @@ fn test_local_forward_data_plane_round_trip() {
 // flow-control timing lets the confirm round-trip complete before
 // the child blocks; the russh 0.62 client side is the common
 // factor, but the symptom only surfaces against OpenSSH 9.x.
+//
+// TEMPORARILY un-gated on the fix/issue-25-russh-rekey branch to
+// verify hypothesis 1 (kex-gated select! in russh 0.62). The test
+// sshd_config has RekeyLimit 0 to disable re-keying. If the test
+// passes on Linux + macOS, hypothesis 1 is confirmed; the cfg
+// gate will be re-applied in the same PR once the passhrs-side
+// workaround lands.
 #[test]
-#[cfg(target_os = "windows")]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_remote_forward_data_plane_round_trip() {
     if !sshd_ok() {

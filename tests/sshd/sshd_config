@@ -46,6 +46,23 @@ MaxSessions 100
 # auth path on shared CI networks and produce flakes.
 UseDNS no
 
+# RekeyLimit 0 disables re-keying entirely. This is a TEMPORARY
+# diagnostic for Issue #25: the -R data-plane test fails on Linux/
+# macOS because passhrs (via russh 0.62) never sends back
+# CHANNEL_OPEN_CONFIRMATION (type 91) after reply.accept() on
+# OpenSSH 9.x, but works on Win32-OpenSSH 10.0. Working theory
+# (see the full triage in
+# docs/postmortems/issue-25-russh-rekey-gate.md, when written) is
+# that russh 0.62's kex-gated select! at client/mod.rs:1244-1273
+# holds the inbound mpsc drain during a re-key, and OpenSSH 9.x
+# re-keys in the post-handshake window where Win32-OpenSSH 10.0
+# does not. RekeyLimit 0 is the cheapest possible test of that
+# hypothesis: if the test then passes on Linux/macOS, the timing
+# window is confirmed and the fix lives in passhrs (or upstream
+# russh). Revert this line once Issue #25 has a permanent fix.
+RekeyLimit 0
+
+
 # PerSourcePenalties disabled per Issue #9 investigation: OpenSSH 9.8+
 # turns on a per-source-IP connection-rate penalty by default; after
 # ~30 back-to-back test runs from 127.0.0.1 the cumulative penalty
