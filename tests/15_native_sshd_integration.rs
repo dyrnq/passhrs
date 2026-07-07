@@ -1004,12 +1004,17 @@ fn test_command_compress_flag() {
 // PTY / 输出格式测试
 // ======================================================================
 
-// Windows-only known issue: this asserts that `ps aux` output
-// contains `USER` and `PID` columns — that's the procps-ng layout on
-// Linux/macOS. Windows ships `tasklist` instead, with a different
-// header. Until the test either falls back to `tasklist` on Windows
-// or accepts a different column-name set, skip.
-#[cfg(not(target_os = "windows"))]
+// Windows + Unix share a single test body: on Unix we run
+// `ps aux` and assert on the procps-ng header (`USER`, `PID`); on
+// Windows we run `tasklist /FO TABLE` and assert on the
+// `tasklist` header (`Image Name`, `PID`, `Mem Usage`). The
+// test's intent is "exercises `-t` and produces sensible TTY
+// output with a real process listing", not "validates a specific
+// process-listing format" — so the column-name set is allowed to
+// differ. Both layouts have a `PID` column, which we assert on
+// as a minimal common check. The `lines.len() > 3` guard is the
+// same on both platforms: a real `ps aux` / `tasklist` output
+// always exceeds 3 lines on a runner.
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_command_with_pty() {
@@ -1018,7 +1023,21 @@ fn test_command_with_pty() {
         return;
     }
     let d = dest();
-    let a = [
+    // Build the trailing args. The base args are identical; only
+    // the command and its arguments differ.
+    let (cmd_args, expected_columns): (Vec<&str>, &[&str]) = if cfg!(target_os = "windows") {
+        // tasklist /FO TABLE — the default TABLE format prints
+        // columns: Image Name, PID, Session Name, Session#, Mem
+        // Usage. We assert on PID + Image Name as the Windows
+        // analogue of PID + USER. (cmd.exe ships tasklist in
+        // %SystemRoot%\System32 and resolves it without needing
+        // an explicit path on the default PATH.)
+        (vec!["tasklist", "/FO", "TABLE"], &["Image Name", "PID"])
+    } else {
+        // ps aux — procps-ng layout. Assert USER + PID.
+        (vec!["ps", "aux"], &["USER", "PID"])
+    };
+    let mut a: Vec<&str> = vec![
         "-p",
         PORT,
         "-o",
@@ -1026,13 +1045,23 @@ fn test_command_with_pty() {
         "-o",
         "UserKnownHostsFile=/dev/null",
         &d,
-        "ps",
-        "aux",
     ];
+    a.extend(cmd_args);
     let (ok, stdout, stderr) = run_phr(&a);
-    assert!(ok, "ps aux failed: {}", stderr);
-    assert!(stdout.contains("USER"), "missing USER column");
-    assert!(stdout.contains("PID"), "missing PID column");
+    let err_label = if cfg!(target_os = "windows") {
+        "tasklist /FO TABLE failed"
+    } else {
+        "ps aux failed"
+    };
+    assert!(ok, "{}: {}", err_label, stderr);
+    for col in expected_columns {
+        assert!(
+            stdout.contains(col),
+            "missing expected column {:?}; output:\n{}",
+            col,
+            stdout
+        );
+    }
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() > 3, "too few lines: {}", lines.len());
 }
