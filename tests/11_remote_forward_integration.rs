@@ -7,12 +7,17 @@ use std::process::Command;
 
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
-// Same platform split as tests/15_native_sshd_integration.rs: Linux +
-// macOS runners ship `runner`, windows-2022 (since runner 2.305.0)
-// ships `runneradmin`.
+// Same three-way platform split as tests/15_native_sshd_integration.rs:
+// Linux runs as the pre-existing `runner` user; macOS uses a
+// freshly-dscl'd `testuser` (Sonoma+ secure-token lockout blocks
+// every password-set API for the runner account, so the setup
+// script creates a dedicated testuser); windows-2022 (since runner
+// 2.305.0) ships `runneradmin`.
 #[cfg(target_os = "windows")]
 const USER: &str = "runneradmin";
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+const USER: &str = "testuser";
+#[cfg(target_os = "linux")]
 const USER: &str = "runner";
 const PASS: &str = "PassTest1234!";
 

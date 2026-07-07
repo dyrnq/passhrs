@@ -329,21 +329,23 @@ if (-not (Test-Path $TestKey)) {
 
 # 7b. Drop the public key into the runner's authorized_keys.
 #     sshd resolves authorized_keys to `%USERPROFILE%\.ssh\authorized_keys`
-#     for the authenticated user — NOT the runner's profile. On
-#     GitHub Windows runners $User (e.g. `runneradmin`) and the
-#     runner that executes this script are different accounts with
-#     different profile paths, so we resolve $User's profile via
-#     `Get-LocalUser ... .Profile` and write there.
+#     for the authenticated user — NOT the runner that executes this
+#     script. On GitHub Windows runners $User (e.g. `runneradmin`)
+#     and the runner that executes this script are different
+#     accounts with different profile paths.
 #
-#     ACL note: Win32-OpenSSH sshd rejects authorized_keys whose
-#     DACL has any ACE granting access to an SID that isn't the
-#     target user, Administrators, or SYSTEM — this is the same
-#     host-key check that step 5b-5c do for ssh_host_ed25519_key.
-#     We strip inheritance and grant only $User:R + Administrators:F
-#     + SYSTEM:F to match.
-$userProfile = (Get-LocalUser -Name $User).Profile
-if ([string]::IsNullOrEmpty($userProfile)) {
-    throw "FATAL: Get-LocalUser -Name $User returned empty Profile path"
+#     (Get-LocalUser $User).Profile is the natural API but returns
+#     an empty string for accounts that have never logged in
+#     interactively (which is the case for `runneradmin` on a fresh
+#     GitHub-hosted runner — the user is created by the image but
+#     the profile directory is lazily created on first logon).
+#     Construct the path directly from the canonical Windows layout
+#     (`C:\Users\<User>`) and verify it exists; throw if not so a
+#     future image layout change surfaces here instead of as a
+#     cryptic sshd auth failure later.
+$userProfile = Join-Path $env:SystemDrive ("Users\$User")
+if (-not (Test-Path $userProfile)) {
+    throw "FATAL: expected user profile dir not found at $userProfile — image layout changed?"
 }
 $AuthorizedKeysDir  = Join-Path $userProfile '.ssh'
 $AuthorizedKeysPath = Join-Path $AuthorizedKeysDir 'authorized_keys'
@@ -359,6 +361,11 @@ if (Test-Path $AuthorizedKeysPath) {
 if ($existingLines -notmatch [regex]::Escape($pubkeyLine)) {
     Add-Content -LiteralPath $AuthorizedKeysPath -Value $pubkeyLine
 }
+# ACL note: Win32-OpenSSH sshd rejects authorized_keys whose DACL
+# has any ACE granting access to an SID that isn't the target user,
+# Administrators, or SYSTEM — this is the same host-key check that
+# step 5b-5c do for ssh_host_ed25519_key. We strip inheritance
+# and grant only $User:R + Administrators:F + SYSTEM:F to match.
 icacls $AuthorizedKeysPath /inheritance:r /grant:r "${User}:(R)" /grant:r 'BUILTIN\Administrators:(F)' /grant:r 'NT AUTHORITY\SYSTEM:(F)' | Out-Null
 Write-Host "pubkey auth: appended $(Split-Path $TestKeyPub -Leaf) to $AuthorizedKeysPath"
 
