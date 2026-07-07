@@ -1419,12 +1419,12 @@ fn test_local_forward_data_plane_round_trip() {
 // the child blocks; the russh 0.62 client side is the common
 // factor, but the symptom only surfaces against OpenSSH 9.x.
 //
-// TEMPORARILY un-gated on the fix/issue-25-russh-rekey branch to
-// verify hypothesis 1 (kex-gated select! in russh 0.62). The test
-// sshd_config has RekeyLimit 0 to disable re-keying. If the test
-// passes on Linux + macOS, hypothesis 1 is confirmed; the cfg
-// gate will be re-applied in the same PR once the passhrs-side
-// workaround lands.
+// Fixed by detaching `reply.accept()` into its own tokio::spawn
+// and replacing `tokio::join!(c2t, t2c)` with detached JoinHandle
+// drops — see the inline comment in `server_channel_open_forwarded_tcpip`
+// for the full root cause. With the fix, the test passes against
+// OpenSSH 9.x and 10.x on Linux + macOS + Windows. Un-gated as
+// part of the Issue #25 fix.
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_remote_forward_data_plane_round_trip() {

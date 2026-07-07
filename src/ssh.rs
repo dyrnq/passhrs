@@ -106,7 +106,45 @@ impl Handler for SshHandler {
                     // russh 0.62+: the forwarded channel must be explicitly
                     // accepted; dropping `reply` auto-rejects. Accept only once
                     // we have a live connection to the forward target.
-                    reply.accept().await;
+                    //
+                    // The callback `server_channel_open_forwarded_tcpip`
+                    // runs synchronously inside the russh event loop's
+                    // `process_packet` (encrypted.rs:763-775). Awaiting
+                    // `reply.accept()` inline would park the callback —
+                    // and therefore the event loop — on the mpsc-send that
+                    // notifies the loop about the reply, so the receiver
+                    // (`self.inbound_channel_receiver`) can never be
+                    // polled to drain it, and the mpsc back-pressures
+                    // forever. The loop stays stuck inside
+                    // `process_packet`, `CHANNEL_OPEN_CONFIRMATION` never
+                    // reaches the wire, sshd never sends `CHANNEL_DATA`,
+                    // and the c2t/t2c forwarding tasks (which already
+                    // need data the loop isn't delivering) hang.
+                    //
+                    // Detaching the accept into a `tokio::spawn` lets the
+                    // callback return immediately so the event loop can
+                    // poll `inbound_channel_receiver`, observe the
+                    // `Msg::ServerChannelOpenReply`, emit the
+                    // confirmation, and start forwarding data into the
+                    // channel's mpsc for the c2t task. The spawn is
+                    // fire-and-forget; the JoinHandle is dropped with
+                    // `let _ =`. `reply.accept()` itself is just an
+                    // mpsc-send (lib_inner.rs:584-588), so spawning it is
+                    // essentially zero-cost.
+                    //
+                    // The c2t/t2c forwarding tasks must likewise be
+                    // detached: awaiting their `JoinHandle`s via
+                    // `tokio::join!` would re-introduce the same
+                    // event-loop deadlock, because the JoinHandles only
+                    // resolve when the channel closes (via
+                    // `ChannelMsg::Eof`/`ChannelMsg::Close` or TCP
+                    // EOF/error). Dropping the JoinHandles does NOT
+                    // cancel the spawned tasks — they self-terminate on
+                    // the same signals.
+                    let accept_handle = tokio::spawn(async move {
+                        reply.accept().await;
+                    });
+                    drop(accept_handle);
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     let (mut trx, mut ttx) = tokio::io::split(target_stream);
                     let (mut crx, ctx) = channel.split();
@@ -157,7 +195,8 @@ impl Handler for SshHandler {
                             }
                         }
                     });
-                    let _ = tokio::join!(c2t, t2c);
+                    drop(c2t);
+                    drop(t2c);
                 }
                 Err(e) => {
                     warn!(
