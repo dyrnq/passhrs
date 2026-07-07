@@ -23,7 +23,16 @@ param(
     # passhrs consistently across Linux, macOS and Windows runners.
     [string]$Pass = 'PassTest1234!',
     [int]$Port = 22222,
-    [string]$SshdConfigTemplate = "$PSScriptRoot\sshd_config"
+    [string]$SshdConfigTemplate = "$PSScriptRoot\sshd_config",
+    # Skip the Win32-OpenSSH 10.0 download/replace and keep the inbox
+    # 8.1p1 binaries + the 8.1p1-compatible single-ACE host-key ACL.
+    # CI matrix widens to exercise BOTH code paths: -NoUpgrade=false
+    # (default) is the previously-validated upgrade path that goes
+    # 33/33 green on windows-2022; -NoUpgrade=true exercises the
+    # inbox 8.1p1 capability as-shipped by Microsoft, which is the
+    # baseline most end-users will actually run. Issue #17 / PR
+    # ci:split-windows-matrix tracks the matrix widening.
+    [switch]$NoUpgrade = $false
 )
 $ErrorActionPreference = 'Stop'
 
@@ -70,6 +79,20 @@ if ($null -eq $sshdFeature -or $sshdFeature.State -ne 'Installed') {
     Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
 }
 
+if ($NoUpgrade) {
+    # Inbox 8.1p1 path: keep the binaries shipped by the OpenSSH
+    # capability. Sanity-check sshd.exe is present (8.1p1 has no
+    # sshd-session.exe — that split was introduced in Win32-OpenSSH
+    # 10.0). Record the version so the post-lockdown summary line
+    # shows which path actually ran.
+    $sshdInbox = Join-Path $SshdBinDir 'sshd.exe'
+    if (-not (Test-Path $sshdInbox)) {
+        throw "FATAL: $sshdInbox missing; OpenSSH.Server capability install did not produce sshd.exe"
+    }
+    $sshdAfterUpgrade = & $sshdInbox -V 2>&1 | Select-Object -First 1
+    Write-Host "-NoUpgrade set: keeping inbox OpenSSH capability binaries"
+    Write-Host "sshd -V (inbox): $sshdAfterUpgrade"
+} else {
 Write-Host "Upgrading OpenSSH binaries to Win32-OpenSSH 10.0.0.0..."
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 Invoke-WebRequest -Uri $Win32OpenSshUrl -OutFile $ZipPath -UseBasicParsing
@@ -130,6 +153,9 @@ foreach ($required in @('sshd.exe','sshd-session.exe')) {
 
 $sshdAfterUpgrade = & (Join-Path $SshdBinDir 'sshd.exe') -V 2>&1 | Select-Object -First 1
 Write-Host "sshd -V after upgrade: $sshdAfterUpgrade"
+}
+
+
 
 # 2. Ensure sshd directories exist.
 New-Item -ItemType Directory -Force -Path $SshRoot | Out-Null
@@ -162,22 +188,41 @@ Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*' -Force |
 #     is known to reject keys whose SD contains metadata `icacls`
 #     cannot fully display — so we now drive everything via the
 #     directory and let the keys inherit from it.
-$dirAcl = Get-Acl -Path $SshRoot
-$dirAcl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($dirAcl.Access)) {
-    $dirAcl.RemoveAccessRuleSpecific($rule)
-}
+#
+#     SKIP under -NoUpgrade: 8.1p1 sshd refuses to load a host key
+#     whose DACL contains a non-owner ACE (the canonical "Bad
+#     permissions. Try removing permissions for user: <SID>" check).
+#     The two-ACE SYSTEM:F + Administrators:F pattern below is a
+#     non-owner ACE by Administrators' SID, which 8.1p1 rejects.
+#     The Win32-OpenSSH 10.0 upgrade removes that historical
+#     check, which is why this is the right layout for the
+#     upgrade path. For -NoUpgrade, skip the lockdown entirely
+#     and let the inbox ssh-keygen create keys with the default
+#     ACL (owner=runner user, DACL has just the runner user's
+#     ACE) — that layout satisfies 8.1p1's check because every
+#     ACE matches the owner, and sshd started via Start-Process
+#     inherits the runner user's identity and so can read the
+#     key as the file's owner.
 $systemSid = New-Object System.Security.Principal.SecurityIdentifier(
     [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
 $adminsSid = New-Object System.Security.Principal.SecurityIdentifier(
     [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
-foreach ($sid in @($systemSid, $adminsSid)) {
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-    $dirAcl.AddAccessRule($rule)
+if (-not $NoUpgrade) {
+    $dirAcl = Get-Acl -Path $SshRoot
+    $dirAcl.SetAccessRuleProtection($true, $false)
+    foreach ($rule in @($dirAcl.Access)) {
+        $dirAcl.RemoveAccessRuleSpecific($rule)
+    }
+    foreach ($sid in @($systemSid, $adminsSid)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $dirAcl.AddAccessRule($rule)
+    }
+    $dirAcl.SetOwner($systemSid)
+    Set-Acl -Path $SshRoot -AclObject $dirAcl
+} else {
+    Write-Host "-NoUpgrade set: skipping 5a parent-dir ACL lockdown (inbox 8.1p1 ssh-keygen will set the canonical ACL itself)"
 }
-$dirAcl.SetOwner($systemSid)
-Set-Acl -Path $SshRoot -AclObject $dirAcl
 
 # 5b. Generate host keys via ssh-keygen -A, the canonical Windows
 #     OpenSSH way that knows the right ACL for host keys. ssh-keygen
@@ -199,21 +244,31 @@ if ($LASTEXITCODE -ne 0) {
 #     guide recommends: SYSTEM and Administrators, both FullControl.
 #     We do still strip inherited ACEs to make sure nothing loose
 #     leaks in from the parent directory.
-Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*_key' -Force | ForEach-Object {
-    $keyFile = $_.FullName
-    takeown /F $keyFile /A | Out-Null
-    $keyAcl = Get-Acl -Path $keyFile
-    $keyAcl.SetAccessRuleProtection($true, $false)
-    foreach ($rule in @($keyAcl.Access)) {
-        $keyAcl.RemoveAccessRuleSpecific($rule)
+#
+#     SKIP under -NoUpgrade for the same reason 5a is skipped: the
+#     two-ACE pattern is a non-owner ACE that 8.1p1 sshd rejects.
+#     Inbox ssh-keygen created the keys with the canonical 8.1p1
+#     layout (owner=runner user, DACL has the runner user's ACE)
+#     in step 5b; leave them alone.
+if (-not $NoUpgrade) {
+    Get-ChildItem -Path $SshRoot -Filter 'ssh_host_*_key' -Force | ForEach-Object {
+        $keyFile = $_.FullName
+        takeown /F $keyFile /A | Out-Null
+        $keyAcl = Get-Acl -Path $keyFile
+        $keyAcl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($keyAcl.Access)) {
+            $keyAcl.RemoveAccessRuleSpecific($rule)
+        }
+        foreach ($sid in @($systemSid, $adminsSid)) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, 'FullControl', 'Allow')
+            $keyAcl.AddAccessRule($rule)
+        }
+        $keyAcl.SetOwner($systemSid)
+        Set-Acl -Path $keyFile -AclObject $keyAcl
     }
-    foreach ($sid in @($systemSid, $adminsSid)) {
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $sid, 'FullControl', 'Allow')
-        $keyAcl.AddAccessRule($rule)
-    }
-    $keyAcl.SetOwner($systemSid)
-    Set-Acl -Path $keyFile -AclObject $keyAcl
+} else {
+    Write-Host "-NoUpgrade set: skipping 5c per-key ACL lockdown (keys retain the inbox 8.1p1 default ACL)"
 }
 
 # 5d. The sshd_config file is not secret — grant NT SERVICE\sshd read

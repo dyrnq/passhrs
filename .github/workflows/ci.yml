@@ -101,12 +101,20 @@ jobs:
           if-no-files-found: warn
 
   integration-tests:
-    name: Integration tests (${{ matrix.os }})
+    name: Integration tests (${{ matrix.os }} / ${{ matrix.openssh }})
     needs: unit-tests
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14, windows-2022]
+        include:
+          - os: ubuntu-24.04
+            openssh: native
+          - os: macos-14
+            openssh: native
+          - os: windows-2022
+            openssh: inbox-8.1p1
+          - os: windows-2022
+            openssh: upgraded-10.0
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +127,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: integration-cargo-${{ hashFiles('Cargo.lock') }}
+          key: integration-cargo-${{ matrix.os }}-${{ matrix.openssh }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Provision native sshd (Linux)
         if: matrix.os == 'ubuntu-24.04'
@@ -153,8 +161,31 @@ jobs:
         if: matrix.os == 'macos-14'
         run: sudo GITHUB_ENV="${GITHUB_ENV}" ./tests/sshd/setup-macos-brew-openssh.sh
 
-      - name: Provision native sshd (Windows)
-        if: matrix.os == 'windows-2022'
+      - name: Provision native sshd (Windows, inbox 8.1p1)
+        # The windows-2022 runner ships Microsoft's OpenSSH
+        # capability (OpenSSH 8.1p1, LibreSSL 3.8.2). This matrix
+        # row exercises that as-is: no Win32-OpenSSH download, no
+        # binary replacement, no host-key ACL lockdown. The 8.1p1
+        # DACL layout (owner=runner user, DACL has just the
+        # runner user's ACE) is the only one 8.1p1's "Bad
+        # permissions" check accepts, and the inbox
+        # `ssh-keygen -A` already produces it. This is the
+        # baseline end-users will see if they install passhrs on
+        # a stock Windows box and use the inbox sshd. Issue #17
+        # / PR ci:split-windows-matrix tracks the matrix widening.
+        if: matrix.os == 'windows-2022' && matrix.openssh == 'inbox-8.1p1'
+        shell: pwsh
+        run: ./tests/sshd/setup-windows.ps1 -NoUpgrade
+
+      - name: Provision native sshd (Windows, upgraded 10.0)
+        # Replaces the inbox 8.1p1 binaries with Win32-OpenSSH
+        # 10.0.0.0p2, which removes 8.1p1's "Bad permissions" host-
+        # key SD check (the regression that bit us in 2024) and
+        # adds sshd-session.exe. This is the path that goes
+        # 33/33 green on windows-2022 today and is the default
+        # for new passhrs users. Issue #17 / PR
+        # ci:split-windows-matrix tracks the matrix widening.
+        if: matrix.os == 'windows-2022' && matrix.openssh == 'upgraded-10.0'
         shell: pwsh
         run: ./tests/sshd/setup-windows.ps1
 
@@ -254,7 +285,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: integration-test-log-${{ matrix.os }}
+          name: integration-test-log-${{ matrix.os }}-${{ matrix.openssh }}
           path: integration-test.log
           if-no-files-found: warn
 
@@ -277,7 +308,7 @@ jobs:
         if: always() && matrix.os == 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
-          name: sshd-log-${{ matrix.os }}
+          name: sshd-log-${{ matrix.os }}-${{ matrix.openssh }}
           path: |
             C:\ProgramData\ssh\logs\sshd.log
             C:\ProgramData\ssh\logs\sshd.log.err
@@ -305,7 +336,7 @@ jobs:
         if: always() && matrix.os != 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
-          name: sshd-log-${{ matrix.os }}
+          name: sshd-log-${{ matrix.os }}-${{ matrix.openssh }}
           path: /tmp/passhrs-test-sshd/sshd.log
           if-no-files-found: warn
 
@@ -538,7 +569,7 @@ jobs:
         if: failure() && matrix.os == 'windows-2022'
         uses: actions/upload-artifact@v4
         with:
-          name: sshd-dump-windows-2022
+          name: sshd-dump-windows-2022-${{ matrix.openssh }}
           path: sshd-dump.txt
           if-no-files-found: warn
 
