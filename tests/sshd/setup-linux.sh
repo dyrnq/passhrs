@@ -27,6 +27,13 @@ SSHD_CFG_TEMPLATE="${SSHD_CFG_DIR}/sshd_config"
 RUNTIME_DIR="${TMPDIR:-/tmp}/passhrs-test-sshd"
 SSHD_CFG="${RUNTIME_DIR}/sshd_config"
 HOST_KEY="${RUNTIME_DIR}/ssh_host_ed25519_key"
+# Test-user ed25519 keypair for pubkey auth. Mirrors the macOS
+# setup so tests/12 (and any future key-auth test) can drive
+# `passhrs -i ${TEST_KEY}` against this sshd without dealing with
+# password auth at all. The private key path is exported as
+# PHR_TEST_KEY for the integration-tests step to consume.
+TEST_KEY="${RUNTIME_DIR}/runner_id_ed25519"
+TEST_KEY_PUB="${TEST_KEY}.pub"
 SSHD_LOG="${RUNTIME_DIR}/sshd.log"
 SSHD_PID_FILE="${RUNTIME_DIR}/sshd.pid"
 
@@ -111,6 +118,38 @@ if ! sudo getent shadow "${USER}" | cut -d: -f2 | grep -qE '^[^!*]'; then
 fi
 echo "    chpasswd verified: /etc/shadow has non-empty password for ${USER}"
 
+# 5a. Generate the test-user ed25519 keypair used by tests/12 (and
+#     any future key-auth test). Idempotent: only generate on first
+#     run so the file persists across re-runs (and so the public-key
+#     line in authorized_keys doesn't get duplicated by a re-run).
+if [ ! -f "${TEST_KEY}" ]; then
+    ssh-keygen -t ed25519 -f "${TEST_KEY}" -N "" -q
+fi
+# Key needs to be readable by the runner user (it owns the test
+# process), not root-only. Same chown story as macOS — see
+# setup-macos-brew-openssh.sh lines 318-341 for the full reasoning
+# (ssh rejects a 600 key owned by a different uid even with the
+# right bits; russh can't read root-owned 600 either).
+chown "${USER}:${USER}" "${TEST_KEY}" "${TEST_KEY_PUB}"
+chmod 600 "${TEST_KEY}"
+chmod 644 "${TEST_KEY_PUB}"
+
+# 5b. Drop the public key into runner's authorized_keys. sshd_config
+#     already has PubkeyAuthentication yes + PasswordAuthentication
+#     yes, so this adds key auth on top of the password path that
+#     step 5 set up. Idempotent: check first so re-runs don't
+#     duplicate the line.
+sudo -u "${USER}" mkdir -p "/home/${USER}/.ssh"
+sudo -u "${USER}" touch "/home/${USER}/.ssh/authorized_keys"
+if ! sudo -u "${USER}" grep -qF "$(cat "${TEST_KEY_PUB}")" \
+        "/home/${USER}/.ssh/authorized_keys"; then
+    sudo -u "${USER}" tee -a "/home/${USER}/.ssh/authorized_keys" \
+        >/dev/null < "${TEST_KEY_PUB}"
+fi
+sudo chmod 600 "/home/${USER}/.ssh/authorized_keys"
+sudo chown "${USER}:${USER}" "/home/${USER}/.ssh/authorized_keys"
+echo "    pubkey auth: TEST_KEY_PUB appended to ~${USER}/.ssh/authorized_keys"
+
 # 5b. Ubuntu's OpenSSH package does not create the privilege-separation
 #     directory on install; sshd refuses to start without it.
 sudo mkdir -p /run/sshd
@@ -180,6 +219,39 @@ if ! sshpass -p "${PASS}" ssh \
     echo "FATAL: ssh password auth probe failed; check sshd log + chpasswd output" >&2
     tail -n 80 "${SSHD_LOG}" >&2 || true
     exit 1
+fi
+
+# 8b. End-to-end smoke probe for pubkey auth: drive the same
+# `passhrs -i` shape that tests/12 will use, against the same key
+# we just authorized. Catches chown/chmod/authorized_keys mistakes
+# before the integration-tests step inherits a misconfigured sshd.
+echo "==> Smoke-testing ssh pubkey auth..."
+if ! ssh -i "${TEST_KEY}" \
+        -p "${PORT}" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes \
+        -o ConnectTimeout=5 \
+        "${USER}@${HOST}" \
+        "echo linux_pubkey_ok" 2>&1; then
+    echo "FATAL: ssh pubkey auth probe failed; check authorized_keys + key perms" >&2
+    tail -n 80 "${SSHD_LOG}" >&2 || true
+    exit 1
+fi
+
+# 9. Export PHR_TEST_KEY so the integration-tests step can drive
+#    `passhrs -i ${PHR_TEST_KEY}` without needing to know where the
+#    key lives. Mirrors setup-macos-brew-openssh.sh lines 540-552
+#    so tests/12 + tests/15 auth_args() work identically on every
+#    platform. GITHUB_ENV is set by GitHub Actions; the `>>` is a
+#    no-op when running the script locally for iteration.
+if [ -n "${GITHUB_ENV:-}" ]; then
+    {
+        echo "PHR_TEST_KEY=${TEST_KEY}"
+        echo "==> Wrote PHR_TEST_KEY=${TEST_KEY} to GITHUB_ENV"
+    } | tee -a "${GITHUB_ENV}"
+else
+    echo "==> PHR_TEST_KEY=${TEST_KEY} (export manually for local iteration)"
 fi
 
 exit 0

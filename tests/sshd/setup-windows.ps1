@@ -52,6 +52,13 @@ $SshdLog    = Join-Path $SshRoot 'logs\sshd.log'
 # PR #14 root-cause investigation. Remove this block once windows-2022
 # is green again.
 $SshdDebugLog = Join-Path $SshRoot 'logs\sshd-debug.log'
+# Test-user ed25519 keypair for pubkey auth. Mirrors the linux +
+# macOS setup scripts so tests/12 (and any future key-auth test)
+# can drive `passhrs -i ${TestKey}` against this sshd. The private
+# key path is exported as PHR_TEST_KEY for the integration-tests
+# step to consume.
+$TestKey    = Join-Path $SshRoot 'runner_id_ed25519'
+$TestKeyPub = "${TestKey}.pub"
 
 # 1. The inbox Windows OpenSSH capability ships OpenSSH 8.1p1 (LibreSSL
 #    3.8.2) on windows-2022 runners and that build has a known
@@ -309,6 +316,52 @@ if (-not (Get-LocalGroup -Name $group -ErrorAction SilentlyContinue)) {
 }
 Add-LocalGroupMember -Group $group -Member $User -ErrorAction SilentlyContinue
 
+# 7a. Generate the test-user ed25519 keypair used by tests/12 (and
+#     any future key-auth test). Idempotent: only generate on first
+#     run so the file persists across re-runs.
+$SshKeygenBin = Join-Path $SshdBinDir 'ssh-keygen.exe'
+if (-not (Test-Path $TestKey)) {
+    & $SshKeygenBin -t ed25519 -f $TestKey -N '""' -q
+    if ($LASTEXITCODE -ne 0) {
+        throw "FATAL: ssh-keygen ed25519 failed (exit $LASTEXITCODE)"
+    }
+}
+
+# 7b. Drop the public key into the runner's authorized_keys.
+#     sshd resolves authorized_keys to `%USERPROFILE%\.ssh\authorized_keys`
+#     for the authenticated user — NOT the runner's profile. On
+#     GitHub Windows runners $User (e.g. `runneradmin`) and the
+#     runner that executes this script are different accounts with
+#     different profile paths, so we resolve $User's profile via
+#     `Get-LocalUser ... .Profile` and write there.
+#
+#     ACL note: Win32-OpenSSH sshd rejects authorized_keys whose
+#     DACL has any ACE granting access to an SID that isn't the
+#     target user, Administrators, or SYSTEM — this is the same
+#     host-key check that step 5b-5c do for ssh_host_ed25519_key.
+#     We strip inheritance and grant only $User:R + Administrators:F
+#     + SYSTEM:F to match.
+$userProfile = (Get-LocalUser -Name $User).Profile
+if ([string]::IsNullOrEmpty($userProfile)) {
+    throw "FATAL: Get-LocalUser -Name $User returned empty Profile path"
+}
+$AuthorizedKeysDir  = Join-Path $userProfile '.ssh'
+$AuthorizedKeysPath = Join-Path $AuthorizedKeysDir 'authorized_keys'
+New-Item -ItemType Directory -Force -Path $AuthorizedKeysDir | Out-Null
+if (-not (Test-Path $AuthorizedKeysPath)) {
+    New-Item -ItemType File -Force -Path $AuthorizedKeysPath | Out-Null
+}
+$pubkeyLine = (Get-Content -LiteralPath $TestKeyPub -Raw).Trim() -replace '\s+', ' '
+$existingLines = ''
+if (Test-Path $AuthorizedKeysPath) {
+    $existingLines = (Get-Content -LiteralPath $AuthorizedKeysPath -Raw) -replace '\s+', ' '
+}
+if ($existingLines -notmatch [regex]::Escape($pubkeyLine)) {
+    Add-Content -LiteralPath $AuthorizedKeysPath -Value $pubkeyLine
+}
+icacls $AuthorizedKeysPath /inheritance:r /grant:r "${User}:(R)" /grant:r 'BUILTIN\Administrators:(F)' /grant:r 'NT AUTHORITY\SYSTEM:(F)' | Out-Null
+Write-Host "pubkey auth: appended $(Split-Path $TestKeyPub -Leaf) to $AuthorizedKeysPath"
+
 # 8. Validate the config syntactically before launching sshd. `sshd -t`
 #    parses the file and exits non-zero on any error, printing the
 #    offending line to stderr. This is now safe because the upgraded
@@ -540,3 +593,37 @@ if (-not $sshdStartupOk -or -not $ready) {
 }
 
 Write-Host "test sshd ready at ${ListenHost}:${Port} (foreground sshd.exe pid=$($sshdProc.Id), log=$SshdLog)"
+
+# 13. Export PHR_TEST_KEY so the integration-tests step can drive
+#     `passhrs -i ${PHR_TEST_KEY}` without needing to know where
+#     the key lives. Mirrors setup-linux.sh + setup-macos-brew-
+#     openssh.sh so tests/12 + tests/15 auth_args() work identically
+#     on every platform. GITHUB_ENV is set by GitHub Actions; the
+#     `Add-Content` is a no-op when running the script locally
+#     for iteration.
+if ($env:GITHUB_ENV) {
+    Add-Content -LiteralPath $env:GITHUB_ENV -Value "PHR_TEST_KEY=$TestKey"
+    Write-Host "==> Wrote PHR_TEST_KEY=$TestKey to GITHUB_ENV"
+} else {
+    Write-Host "==> PHR_TEST_KEY=$TestKey (set manually for local iteration)"
+}
+
+# 14. Smoke-probe pubkey auth end-to-end so a misconfigured ACL on
+#     $AuthorizedKeysPath surfaces here instead of in the integration
+#     tests' first `-i` invocation. Uses the inbox ssh.exe if it's
+#     on PATH; falls back to skipping the probe (the test will
+#     surface the failure with a clearer context).
+$SshBin = Join-Path $SshdBinDir 'ssh.exe'
+if (-not (Test-Path $SshBin)) { $SshBin = 'ssh' }
+Write-Host "==> Smoke-testing ssh pubkey auth..."
+try {
+    $probeOutput = & $SshBin -i $TestKey -p $Port -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 "${User}@${ListenHost}" "echo win_pubkey_ok" 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($probeOutput -notmatch 'win_pubkey_ok')) {
+        Write-Host "FATAL: ssh pubkey auth probe failed; check authorized_keys ACL + key perms" -ForegroundColor Red
+        Write-Host "probe output: $probeOutput"
+        if (Test-Path $SshdLog) { Get-Content $SshdLog -Tail 50 | Write-Host }
+        exit 1
+    }
+} catch {
+    Write-Host "WARN: pubkey smoke probe could not run (no ssh.exe on PATH?) — continuing. Error: $_"
+}
