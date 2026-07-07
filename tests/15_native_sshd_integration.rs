@@ -17,8 +17,9 @@
 //! the test process's local filesystem — tests can read/clean up
 //! remote artifacts with `std::fs` directly instead of shelling out
 //! to the server.
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -100,50 +101,96 @@ fn pick_unused_port() -> u16 {
         .port()
 }
 
-/// Capture a spawned child's stderr into a String on a background thread.
-/// On Drop (i.e. test panic before `finish()` is called), the captured
-/// stderr is printed so a CI failure shows what passhrs did during the
-/// failure window instead of just the assertion panic. The data-plane
-/// round-trip tests use this to diagnose the recurring Linux/macOS -R
-/// timeout: if the test panics with EAGAIN, the Drop dump tells us
-/// whether passhrs got past handshake, whether `tcpip_forward` returned
-/// Ok, whether the channel-open for forwarded-tcpip ever arrived, etc.
-struct StderrCapture(Option<thread::JoinHandle<String>>);
+/// Capture a spawned child's stderr to a tempfile on disk, then dump it on
+/// test failure. Why tempfile instead of a piped reader: passhrs spawns
+/// the SSH session as a worker that, in the failure case, can outlive the
+/// parent's `kill()`+`wait()`. A piped `read_to_string` then blocks
+/// waiting for EOF that never arrives — which hangs the test binary
+/// indefinitely and the CI runner times out after 6 hours. With a
+/// tempfile, the file persists independent of process state, so Drop
+/// can always read whatever passhrs wrote before death (or before being
+/// leaked). The tempfile is unlinked in Drop.
+struct StderrCapture {
+    path: PathBuf,
+}
 
 impl StderrCapture {
-    fn new(child: &mut std::process::Child) -> Self {
-        let pipe = child.stderr.take().expect("stderr pipe");
-        let handle = thread::spawn(move || {
-            let mut buf = String::new();
-            let mut reader = std::io::BufReader::new(pipe);
-            let _ = reader.read_to_string(&mut buf);
-            buf
-        });
-        Self(Some(handle))
+    /// Build the unique path each invocation uses. Namespaced by PID
+    /// plus a nanosecond timestamp so two concurrent invocations on the
+    /// same process (cargo runs each test in its own process so this
+    /// is belt-and-suspenders) cannot collide.
+    fn make_path() -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("passhrs-stderr-{pid}-{nanos}.log"))
     }
 
-    /// Consume self and return the captured stderr. Use this on the
-    /// happy path to suppress the Drop dump.
-    fn finish(mut self) -> String {
-        self.0
-            .take()
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default()
+    /// Convenience wrapper that opens the file, dups the fd for the
+    /// child's stderr, and spawns the command. The returned capture
+    /// owns the tempfile path; the caller still owns the `Child`.
+    fn spawn(bin: &str, args: &[String]) -> (std::process::Child, Self) {
+        let path = Self::make_path();
+        let file = File::create(&path).expect("create stderr tempfile");
+        let dup = file.try_clone().expect("dup stderr fd");
+        // Drop the original handle — the dup is what the child holds,
+        // and dropping `file` here does not close the dup. The dup is
+        // moved into `Stdio::from`, which the child takes ownership of.
+        drop(file);
+        let child = Command::new(bin)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(dup))
+            .spawn()
+            .expect("spawn with stderr capture");
+        (child, Self { path })
+    }
+
+    /// Read the captured stderr from disk. Safe to call any time —
+    /// whether the child is alive, dead, or leaked.
+    fn dump(&self) {
+        match std::fs::read_to_string(&self.path) {
+            Ok(s) if !s.trim().is_empty() => {
+                eprintln!("--- passhrs stderr (captured during failed test) ---");
+                eprintln!("{}", s);
+                eprintln!("--- end passhrs stderr ---");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "--- passhrs stderr: could not read {}: {} ---",
+                self.path.display(),
+                e
+            ),
+        }
+    }
+
+    /// Consume self and dump the captured stderr. Use on the happy
+    /// path when you still want to see passhrs stderr for debugging,
+    /// or rely on the Drop impl (which suppresses when finish is
+    /// called) by calling `capture.finish()`.
+    #[allow(dead_code)]
+    fn finish(self) {
+        self.dump();
     }
 }
 
 impl Drop for StderrCapture {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            let captured = handle.join().unwrap_or_default();
-            if !captured.trim().is_empty() {
-                eprintln!("--- passhrs stderr (captured during failed test) ---");
-                eprintln!("{}", captured);
-                eprintln!("--- end passhrs stderr ---");
-            }
-        }
+        // Print whatever passhrs wrote, even on panic. Safe: the
+        // file is on disk, never blocked on a pipe.
+        self.dump();
+        // Best-effort cleanup; ignore errors (file may already be gone
+        // or held open by a leaked worker — both fine).
+        let _ = std::fs::remove_file(&self.path);
     }
 }
+
+/// Suppress unused-import warnings for `Path` when no capture is taken
+/// (keeps the import set self-documenting across the file).
+#[allow(dead_code)]
+fn _path_anchor(_: &Path) {}
 
 /// Authentication arguments prepended to every `run_phr` call.
 ///
@@ -1405,19 +1452,13 @@ fn test_remote_forward_data_plane_round_trip() {
         d,
     ];
     prepend_auth_args(&mut args);
-    let mut phr = Command::new(BIN)
-        .args(&args)
-        .stdout(Stdio::null())
-        // stderr piped → StderrCapture. On a panic during the data
-        // plane (the most common failure shape on Linux/macOS), the
-        // Drop impl dumps whatever passhrs printed before the timeout
-        // — handshake state, `tcpip_forward` reply, channel-open log
-        // lines — alongside the assertion panic so the CI log carries
-        // enough information to root-cause without a re-run.
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn passhrs -R");
-    let stderr_cap = StderrCapture::new(&mut phr);
+    // stderr → tempfile via StderrCapture::spawn. On a panic during
+    // the data plane (the most common failure shape on Linux/macOS),
+    // the Drop impl reads passhrs's stderr from the tempfile on disk
+    // and prints it alongside the assertion panic. The tempfile
+    // approach is hang-safe (no pipe that a leaked worker can keep
+    // open forever, which the previous piped-reader version hit).
+    let (mut phr, stderr_cap) = StderrCapture::spawn(BIN, &args);
 
     let client = (|| -> Option<std::net::TcpStream> {
         for _ in 0..20 {
@@ -1452,7 +1493,7 @@ fn test_remote_forward_data_plane_round_trip() {
     let _ = phr.wait();
     // finish() consumes the capture so the Drop impl does not also
     // dump stderr on the happy path.
-    let _ = stderr_cap.finish();
+    stderr_cap.finish();
 }
 
 #[test]
