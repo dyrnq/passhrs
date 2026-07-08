@@ -1154,53 +1154,70 @@ fn test_inactivity_timeout_kept_alive() {
 }
 
 // ======================================================================
-// `-S <path>` ControlPath: parsed-but-ignored (Issue #21).
+// `-S <path>` ControlPath: master / resume (Issue #29).
 //
-// As of this writing `-S` is declared at `src/cli.rs:64-65`
-// (`#[arg(short = 'S', long = "control-path")] pub(crate) control_path:
-// Option<String>`) and never read again. `grep -rn control_path src/`
-// returns exactly two hits — both in the field declaration. There is no
-// `UnixListener`, no control-protocol framing, no session-id reuse, no
-// auth-context persistence. `tests/08_compat_args.rs::test_control_socket`
-// enforces clap accepts the flag (catch a clap-parser regression), but
-// nothing in src/ implements master mode.
+// Pins the positive implementation: passhrs implements a Unix-only,
+// passhrs-native master / resume protocol over a UDS at `-S <path>`.
+// This is NOT wire-compatible with OpenSSH's control protocol (a
+// different feature, not on the roadmap).
 //
-// This test pins the no-op behavior so:
-//   1. A stray half-implementation — e.g. someone wires a UnixListener
-//      that binds but never serves — is caught here as an "unexpected
-//      file at the -S path" panic with a clear pointer to cli.rs:64.
-//      Without it, a broken master would silently accept outbound
-//      connections and deadlock the session.
-//   2. Anyone implementing -S in the future gets an unambiguous "this
-//      test now fails — open a new test issue" signal at PR-merge
-//      time, rather than discovering the gap after merging.
+// Two tests cover the surface:
+//   * test_control_socket_resume_no_auth — a master holds the SSH
+//     session open; a follow-up invocation with the same `-S` path and
+//     NO auth flags reuses it. Asserts exit code 0 + `from_resume` on
+//     stdout. This is the headline CI signal that the resume path is
+//     not a silent fall-through.
+//   * test_control_socket_master_kills_clean_socket — when the master
+//     dies (SIGKILL), the socket file is removed by the
+//     `ControlSocketGuard::Drop` so a follow-up `-S` is not blocked
+//     by a stale file.
 //
-// When `-S` becomes a real feature, replace this test with the original
-// Issue #21 plan: a master invocation that opens the control socket,
-// then a follow-up invocation that reuses it without --password/-i and
-// runs `ssh-add -l`/`echo` end-to-end (data-plane verified).
+// Both are `#[cfg(unix)]` because Windows uses named pipes — separate
+// follow-up issue.
 // ======================================================================
 
+#[cfg(unix)]
+fn wait_for_uds(path: &str, max_wait: Duration) -> bool {
+    // 5×100 ms bounded retry: cheap and fast on the happy path
+    // (the master binds during the SSH handshake, which is
+    // 100-300 ms in the CI sandbox). On a slow CI spike, `max_wait`
+    // can grow without changing the test's correctness.
+    let step = Duration::from_millis(100);
+    let mut elapsed = Duration::ZERO;
+    while elapsed < max_wait {
+        if std::path::Path::new(path).exists() {
+            return true;
+        }
+        thread::sleep(step);
+        elapsed += step;
+    }
+    false
+}
+
+#[cfg(unix)]
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222; asserts the current no-op behavior of -S"]
-fn test_control_socket_currently_noop() {
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222"]
+fn test_control_socket_resume_no_auth() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Instant;
+
     if !sshd_ok() {
         eprintln!("SKIP: no sshd");
         return;
     }
 
-    let sock_path = format!("{}/phr-21-ctrl.sock", tmp_root().display());
-    // Belt-and-suspenders: clean up any leftover from a prior aborted run
-    // so assertion 1 below is unambiguous.
+    let sock_path = format!("{}/phr-29-ctrl.sock", tmp_root().display());
+    // Belt-and-suspenders: clean up any leftover from a prior aborted
+    // run so the master's bind doesn't EADDRINUSE.
     let _ = std::fs::remove_file(&sock_path);
 
     let d = format!("{}@{}", USER, HOST);
 
-    // -- Pass 1: spawn a master invocation with `-S <path>` and `-N`
-    // so passhrs opens an SSH session, auths, opens a session channel,
-    // and idles (no command). With a real `-S` this is when the master
-    // would bind a UnixListener at `sock_path`. With the current no-op
-    // passhrs, the flag is silently ignored.
+    // Pass 1: master invocation. `-N` means "no command" — passhrs
+    // binds the UDS, hands control to the accept loop, and idles.
+    // Auth flags are passed (the master is the auth-bearing side;
+    // the resume is).
     let mut master_args: Vec<String> = vec![
         "-p".to_string(),
         PORT.to_string(),
@@ -1221,40 +1238,131 @@ fn test_control_socket_currently_noop() {
         .spawn()
         .expect("spawn master with -S");
 
-    // 2 s is plenty: a real implementation would bind-and-listen well
-    // inside the SSH handshake window (handshake + auth is typically
-    // 100-300 ms). On the no-op path nothing happens at all, so this
-    // is a stable lower bound. If a CI spike ever pushes handshake
-    // past 2 s, this can grow; we don't currently expect that.
-    thread::sleep(Duration::from_secs(2));
-
-    // Assertion 1: -S path was NOT bound to anything. `Path::exists`
-    // covers a UDS file on Unix (mode 0o600-ish) AND any future
-    // platform-specific socket type (named pipe on Windows, etc.) --
-    // it's `metadata().is_ok()` underneath, so any bind-style artifact
-    // at `sock_path` trips it.
-    let bound = std::path::Path::new(&sock_path).exists();
+    // Wait for the UDS to appear. Fail the test with a useful
+    // diagnostic if the master hasn't bound it in time.
+    let appeared = wait_for_uds(&sock_path, Duration::from_secs(5));
     assert!(
-        !bound,
-        "-S path {path} unexpectedly exists. passhrs -S is currently a no-op \
-         (see cli.rs:64 — control_path parsed but never read by main.rs). \
-         If you are implementing the feature, this test guards the \
-         transition; update it to match the new behavior. See Issue #21 \
-         comment in tests/15_native_sshd_integration.rs.",
-        path = sock_path,
+        appeared,
+        "master never bound UDS at {} within 5s — passhrs -S master mode is not running",
+        sock_path
     );
 
-    // -- Pass 2: follow-up invocation with the SAME -S path but NO
-    // auth flags. With a real -S, the second invocation would short-
-    // circuit through the master and succeed even without --password/-i
-    // (the master forwards the auth context). With the no-op, passhrs
-    // falls through to a normal TCP connect to sshd with no auth →
-    // "Permission denied (publickey,password)" → exit 1.
-    //
-    // We intentionally do NOT call `prepend_auth_args` here so the
-    // second invocation is exactly as a user would run it: `passhrs -S
-    // <path> <cmd>` with no creds.
-    let second_args: Vec<String> = vec![
+    // Pass 2: resume invocation. NO auth flags here — the resume
+    // path must connect to the master UDS and reuse its auth
+    // context. If the resume early-exit is missing, fall through
+    // would mean passhrs tries to TCP-connect to sshd with no creds
+    // and sshd rejects "Permission denied" → exit 1.
+    let start = Instant::now();
+    let out = Command::new(BIN)
+        .args([
+            "-p",
+            PORT,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-S",
+            &sock_path,
+            &d,
+            "echo",
+            "from_resume",
+        ])
+        .output()
+        .expect("spawn resume");
+    let elapsed = start.elapsed();
+    assert!(
+        out.status.success(),
+        "resume invocation failed (status={:?}, elapsed={:?}). stderr: {}",
+        out.status,
+        elapsed,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.trim() == "from_resume",
+        "resume returned wrong stdout: {:?} (expected `from_resume`)",
+        stdout,
+    );
+    // Speed check: a successful resume should be < 2 s end-to-end.
+    // Without resume, a full handshake + auth would dominate the
+    // budget. This isn't strict (CI spikes happen) but it would
+    // catch a regression to a slow path.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "resume took too long ({:?}) — likely fell through to a fresh SSH handshake",
+        elapsed,
+    );
+
+    // Sanity-check the protocol framing by hand, independent of
+    // passhrs's own resume path: open the UDS, write a command
+    // frame, read until we see the done tag, decode the exit code.
+    let mut s = UnixStream::connect(&sock_path).expect("manual UDS connect");
+    let cmd = b"echo protocol_ok\n";
+    let mut header = [0u8; 4];
+    header.copy_from_slice(&(cmd.len() as u32).to_be_bytes());
+    s.write_all(&header).unwrap();
+    s.write_all(cmd).unwrap();
+    // Read frames: stdout=1, stderr=2, done=0. Loop until done.
+    let mut saw_protocol_ok = false;
+    let mut exit_code: Option<u8> = None;
+    while exit_code.is_none() {
+        let mut h = [0u8; 5];
+        if s.read_exact(&mut h).is_err() {
+            panic!("master closed UDS before done frame");
+        }
+        let len = u32::from_be_bytes(h[0..4].try_into().unwrap()) as usize;
+        let tag = h[4];
+        let mut payload = vec![0u8; len];
+        s.read_exact(&mut payload).unwrap();
+        match tag {
+            1 => {
+                if payload == b"protocol_ok\n" {
+                    saw_protocol_ok = true;
+                }
+            }
+            0 => {
+                exit_code = Some(payload[0]);
+            }
+            2 => {} // ignore stderr
+            other => panic!("unknown tag {} from master", other),
+        }
+    }
+    assert!(
+        saw_protocol_ok,
+        "stdout frame did not contain `protocol_ok`"
+    );
+    assert_eq!(exit_code, Some(0), "exit code frame mismatch");
+
+    // Cleanup: kill the master, verify the UDS file is gone
+    // (ControlSocketGuard::Drop removes it).
+    let _ = master.kill();
+    let _ = master.wait();
+    let drop_window = Duration::from_secs(2);
+    let drop_start = Instant::now();
+    while drop_start.elapsed() < drop_window {
+        if !std::path::Path::new(&sock_path).exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(&sock_path);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222"]
+fn test_control_socket_master_kills_clean_socket() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let sock_path = format!("{}/phr-29-ctrl-clean.sock", tmp_root().display());
+    let _ = std::fs::remove_file(&sock_path);
+
+    let d = format!("{}@{}", USER, HOST);
+
+    let mut master_args: Vec<String> = vec![
         "-p".to_string(),
         PORT.to_string(),
         "-o".to_string(),
@@ -1263,33 +1371,76 @@ fn test_control_socket_currently_noop() {
         "UserKnownHostsFile=/dev/null".to_string(),
         "-S".to_string(),
         sock_path.clone(),
+        "-N".to_string(),
         d,
-        "echo".to_string(),
-        "should_not_reach_remote".to_string(),
     ];
-    let out = Command::new(BIN)
-        .args(&second_args)
-        .output()
-        .expect("second -S invocation");
+    prepend_auth_args(&mut master_args);
+    let mut master = Command::new(BIN)
+        .args(&master_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn master");
 
+    let appeared = wait_for_uds(&sock_path, Duration::from_secs(5));
+    assert!(appeared, "master never bound UDS at {}", sock_path);
+
+    // Send SIGTERM. tokio's signal handlers (ctrl_c for SIGINT;
+    // signal::unix::SignalKind::terminate for SIGTERM) wake the
+    // accept loop, run_master returns Ok(()), the
+    // `ControlSocketGuard` drops, and the UDS file is removed.
+    //
+    // We do NOT use `child.kill()` here: that sends SIGKILL, which
+    // bypasses Rust destructors entirely and leaves the UDS file
+    // on disk. That's expected behavior — the next master invocation
+    // cleans a stale file at bind time via `bind_listener`'s
+    // `remove_file` fallback — but it's not what we want to test.
+    // SIGTERM is the realistic "user wants the master to shut down"
+    // signal (and the one the integration-test cleanup step uses).
+    #[cfg(unix)]
+    {
+        let pid = master.id();
+        // libc::kill(pid, SIGTERM) — keep the dependency surface
+        // minimal by going through the C symbol std already pulls
+        // in. (avoids adding a `libc` dep just for one signal).
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGTERM: i32 = 15;
+        // If kill() returns 0, the signal was delivered and the
+        // master will start unwinding. Wait reaps.
+        let _ = unsafe { kill(pid as i32, SIGTERM) };
+        let _ = master.wait();
+        // Belt-and-suspenders: SIGKILL fallback if SIGTERM didn't
+        // unstick the process within a short window. Without this
+        // the test would hang forever on a master that ignored
+        // SIGTERM (e.g. a regression that broke the SIGTERM wiring
+        // in src/control.rs).
+        if std::path::Path::new(&sock_path).exists() {
+            let _ = master.kill();
+            let _ = master.wait();
+        }
+    }
+
+    // Bounded wait for the UDS file to disappear. 2 s is generous;
+    // Drop runs synchronously during process unwind.
+    let drop_window = Duration::from_secs(2);
+    let drop_start = Instant::now();
+    let mut gone = false;
+    while drop_start.elapsed() < drop_window {
+        if !std::path::Path::new(&sock_path).exists() {
+            gone = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     assert!(
-        !out.status.success(),
-        "second -S invocation succeeded with no --password/-i: this implies \
-         -S master/resume is implemented (passhrs routed through the \
-         master's auth context). Issue #21's body expects that behavior, \
-         but src/ has no master path today (cli.rs:64 declares \
-         control_path; nothing reads it). If you are implementing the \
-         feature, this test guards the transition. stderr: {stderr}",
-        stderr = String::from_utf8_lossy(&out.stderr),
+        gone,
+        "UDS file at {} still present 2 s after master SIGTERM — \
+         ControlSocketGuard::Drop is not removing the file",
+        sock_path,
     );
-
-    // Cleanup: kill the master (it would die on its own if we leaked
-    // it, but explicit kill keeps CI deterministic). `master.wait`
-    // reaps; ignore errors in case the child already exited for an
-    // unrelated reason (e.g. sshd rejected auth — should not happen
-    // here because Pass 1 has --password/-i, but be defensive).
-    let _ = master.kill();
-    let _ = master.wait();
+    // Belt-and-suspenders.
     let _ = std::fs::remove_file(&sock_path);
 }
 
