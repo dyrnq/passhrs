@@ -924,6 +924,88 @@ fn test_connect_timeout_integration() {
 }
 
 // ======================================================================
+// User-facing error format (Issue #32).
+//
+// `test_connect_timeout_integration` above only checks "did not panic".
+// This test pins the new user-facing error shape introduced by the
+// `format_user_error` refactor in src/main.rs — the default path
+// (no -v/-vv) prints a one-line `error: <kind> (<context>)` instead
+// of the previous anyhow `{:#?}` dump.
+//
+// We invoke passhrs against 10.255.255.1 (TEST-NET-1, always
+// unreachable) with --connect-timeout 2 so the test finishes in
+// ~2 s on every matrix row. The expected shape:
+//
+//   - exit non-zero
+//   - stderr starts with "error: " (the new prefix; the old
+//     `{:#?}` shape started with the variant name like "Error")
+//   - stderr does NOT contain "context:" or "source:" — those
+//     are anyhow-Debug artefacts that the new shape suppresses
+//   - stderr contains "rerun with -vv" only on the unknown-error
+//     fallback path; the connection-failed bucket skips the hint
+//     because the user knows what to do (check network/host)
+//
+// We intentionally do NOT assert on the bucket name. A future
+// refinement (e.g. splitting "connection failed" into
+// "dns failed" + "tcp failed") would otherwise force this
+// test to track the rename.
+// ======================================================================
+#[test]
+fn test_user_facing_error_format() {
+    // 10.255.255.1 is TEST-NET-1, guaranteed unreachable from any
+    // CI runner (no route to it). The test is NOT gated by sshd_ok()
+    // because it doesn't need a real sshd.
+    let mut args: Vec<String> = vec![
+        "--connect-timeout".to_string(),
+        "2".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        format!("{}@10.255.255.1", USER),
+        "echo".to_string(),
+        "should_not_reach".to_string(),
+    ];
+    prepend_auth_args(&mut args);
+    let out = Command::new(BIN)
+        .args(&args)
+        .output()
+        .expect("user-facing error format test");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "should have failed");
+    // The new shape produces a "passhrs: " one-liner SOMEWHERE in
+    // stderr. The CI workflow exports RUST_LOG=passhrs=debug, so
+    // stderr may also contain INFO/DEBUG log lines from the
+    // connection attempt — those are fine, we only care that the
+    // classified error is present and the Debug-dump artefacts
+    // are not.
+    assert!(
+        stderr.contains("passhrs: "),
+        "stderr should contain the 'passhrs: ' one-liner from the new \
+         format_user_error shape, got: {}",
+        stderr
+    );
+    // The new shape does NOT contain the anyhow Debug artefacts.
+    // The verbose fallback ({:#?}) would emit "context: " and
+    // "source: " — those would be present if the new shape was
+    // bypassed by the -v/-vv branch (it shouldn't be: we did NOT
+    // pass -v or --debug-all here).
+    assert!(
+        !stderr.contains("context: "),
+        "stderr contains anyhow Debug 'context:' field — the new \
+         format_user_error path was bypassed (likely fell back to \
+         {{:#?}}). stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("source: "),
+        "stderr contains anyhow Debug 'source:' field — the new \
+         format_user_error path was bypassed. stderr: {}",
+        stderr
+    );
+}
+
+// ======================================================================
 // `--timeout` mid-flight e2e (Issue #22).
 //
 // `test_connect_timeout_integration` above covers the

@@ -7,7 +7,7 @@ use clap::Parser;
 use crate::types::{DynamicForwardSpec, ForwardSpec, ProxyJumpSpec};
 const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(
     name = env!("CARGO_PKG_NAME"),
     version = env!("CARGO_PKG_VERSION"),
