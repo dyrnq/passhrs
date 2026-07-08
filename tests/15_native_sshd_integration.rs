@@ -1294,72 +1294,57 @@ fn test_control_socket_currently_noop() {
 }
 
 // ======================================================================
-// `-A` AgentForwarding: parsed-but-ignored (Issue #23).
+// `-A` AgentForwarding: positive e2e (Issue #23).
 //
-// Same shape as the `-S` test above: `forward_agent` / `no_forward_agent`
-// are declared at `src/cli.rs:30-33` and never read again. `grep -rn
-// forward_agent src/` returns exactly two hits, both at the field
-// declaration. There is no `session-auth-agent@openssh.com`
-// global-request, no agent-channel handling, no `$SSH_AUTH_SOCK`
-// propagation on the remote. `tests/08_compat_args.rs::
-// test_agent_forward_on` / `test_agent_forward_off` enforce that clap
-// accepts `-A` / `-a` (catch a parser regression), but nothing in src/
-// wires it.
+// Pins that passhrs implements real SSH agent forwarding via the
+// OpenSSH extension `auth-agent-req@openssh.com` +
+// `auth-agent@openssh.com`. With `-A` set and a local `SSH_AUTH_SOCK`
+// provided, passhrs must:
+//   1. Send `auth-agent-req@openssh.com` on the session channel
+//      (russh's `Channel::agent_forward`, wraps a CHANNEL_REQUEST
+//      with that exact name).
+//   2. Accept `auth-agent@openssh.com` channel-opens back from sshd
+//      (russh's `Handler::server_channel_open_agent_forward`, ours
+//      dials the local socket and pumps bytes both ways).
 //
-// This negative test pins that no-op so:
-//   1. A stray half-implementation — e.g. someone wires global-request
-//      `auth-agent@openssh.com` but doesn't relay messages — fails
-//      here as "remote $SSH_AUTH_SOCK unexpectedly equals the local
-//      marker" rather than masquerading as working auth forwarding.
-//   2. Anyone implementing -A in the future gets an unambiguous
-//      "this test now fails — open a new test issue" signal at PR
-//      merge time.
+// The lightest signal this is working: the remote shell sees a
+// non-empty `$SSH_AUTH_SOCK` that sshd set on the user's session.
+// Without -A (or with -A but broken), the variable is unset.
+// We deliberately set a unique LOCAL marker path so we can also
+// assert the forwarded socket is NOT the local path (which would
+// only happen if passhrs leaked the local path verbatim — wrong).
 //
-// Test shape: we set a unique marker path as the LOCAL `SSH_AUTH_SOCK`
-// (so passhrs would have something to forward IF -A were real), spawn
-// passhrs with `-A ... <remote> echo "$SSH_AUTH_SOCK"`, and assert the
-// remote shell does NOT echo the marker back. With a real `-A` the
-// remote `$SSH_AUTH_SOCK` would be set by the SSH agent-forwarding
-// protocol; with the no-op, the remote variable is unset.
-//
-// We deliberately do NOT pass `--exec-env SSH_AUTH_SOCK=...` — that
-// would set SSH_AUTH_SOCK on the remote REGARDLESS of -A, hiding the
-// signal we're testing.
+// We deliberately do NOT pass `--exec-env SSH_AUTH_SOCK=...` —
+// that would set SSH_AUTH_SOCK regardless of -A, hiding the signal.
 // ======================================================================
 
 #[test]
-#[ignore = "requires native OpenSSH on 127.0.0.1:22222; asserts the current no-op behavior of -A"]
-fn test_agent_forward_currently_noop() {
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 + sshd configured to allow agent forwarding (AllowAgentForwarding yes, the default)"]
+fn test_agent_forward_propagates_ssh_auth_sock() {
     if !sshd_ok() {
         eprintln!("SKIP: no sshd");
         return;
     }
 
-    // Marker path we inject into passhrs's local env. If `-A` were
-    // real, OpenSSH's standard behavior is to set `$SSH_AUTH_SOCK` on
-    // the remote via the SSH agent-forwarding protocol, and the
-    // remote shell's `echo $SSH_AUTH_SOCK` would print this string.
-    let fake_agent = format!("{}/phr-23-fake-agent.sock", tmp_root().display());
-    // Create a zero-byte file so any path-stat'ing code in passhrs
-    // doesn't error out (and pollute stderr with an unrelated
-    // "agent socket does not exist" line that hides the no-op signal).
-    let _ = std::fs::write(&fake_agent, b"");
+    // Local path we pass into passhrs's environment. passhrs will
+    // dial it every time sshd opens an auth-agent channel back at
+    // us. It must be a Unix socket path on Unix; a zero-byte file
+    // is fine (connect_agent_stream in src/ssh.rs does not stat it
+    // up-front — it just tries to open the path).
+    let local_marker = format!("{}/phr-23-fake-agent.sock", tmp_root().display());
+    let _ = std::fs::remove_file(&local_marker);
+    let _ = std::fs::write(&local_marker, b"");
 
     let d = dest();
     // cmd.exe on Windows expands `%VAR%`; sh on Unix expands `$VAR`.
     // The `--shell` flag mirrors `test_exec_env_remote` so passhrs
-    // emits the right syntax on each platform.
+    // emits the right shell syntax on each platform.
     let (shell_args, var_ref): (&[&str], &str) = if cfg!(target_os = "windows") {
         (&["--shell", "cmd"], "%SSH_AUTH_SOCK%")
     } else {
         (&[], "$SSH_AUTH_SOCK")
     };
 
-    // Build as `Vec<&str>` (not `Vec<String>`) so `run_phr_with_env`'s
-    // `args: &[&str]` parameter binds directly -- its signature was
-    // set up for callers that pass literal `&[&str]` slices
-    // (test_locale_env_forwarded, test_unrelated_env_not_forwarded),
-    // not for runtime-built `Vec<String>`s.
     let mut a: Vec<&str> = vec![
         "-p",
         PORT,
@@ -1374,15 +1359,11 @@ fn test_agent_forward_currently_noop() {
     a.push("echo");
     a.push(var_ref);
 
-    // Pass the marker as the LOCAL `SSH_AUTH_SOCK` only. We do NOT
-    // pass `--exec-env SSH_AUTH_SOCK=...` so the only way the remote
-    // shell could see `fake_agent` is if passhrs forwards it via the
-    // agent-forwarding protocol -- which is exactly what the no-op
-    // `-A` doesn't do.
-    let envs = [("SSH_AUTH_SOCK", fake_agent.as_str())];
+    // Pass the marker as the LOCAL `SSH_AUTH_SOCK` only.
+    let envs = [("SSH_AUTH_SOCK", local_marker.as_str())];
     let (ok, stdout, stderr) = run_phr_with_env(&a, &envs);
 
-    let _ = std::fs::remove_file(&fake_agent);
+    let _ = std::fs::remove_file(&local_marker);
 
     assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
     assert!(
@@ -1391,20 +1372,54 @@ fn test_agent_forward_currently_noop() {
         stdout, stderr
     );
 
+    // Strip the trailing newline `echo $VAR` always emits, so a
+    // trailing-CR-tolerant comparison works.
+    let remote_sock = stdout.trim();
+
+    // The remote $SSH_AUTH_SOCK must be SET (i.e. non-empty). An
+    // empty string implies passhrs didn't send
+    // auth-agent-req@openssh.com — sshd's PAM-layer ApplyAgent
+    // hook would then have no socket to wire to the user's shell.
     assert!(
-        !stdout.contains(&fake_agent),
-        "remote $SSH_AUTH_SOCK unexpectedly echoed the local marker \
-         path: this implies -A agent forwarding is wired (passhrs sent \
-         the session-auth-agent@openssh.com channel-open and OpenSSH \
-         propagated $SSH_AUTH_SOCK to the remote). passhrs -A is \
-         currently a no-op -- see cli.rs:30-33 (forward_agent and \
-         no_forward_agent declared but never read by main.rs / \
-         forward.rs / ssh.rs). If you are implementing the feature, \
-         update this test -- mirror of test_control_socket_currently_noop \
-         for Issue #21.\nmarker: {}\nstdout: {}\nstderr: {}",
-        fake_agent,
+        !remote_sock.is_empty(),
+        "remote $SSH_AUTH_SOCK was unset — passhrs did not implement \
+         agent forwarding (the auth-agent-req@openssh.com channel \
+         request was not sent on the session channel, so sshd never \
+         allocated a per-session agent socket for the user's shell). \
+         stdout: {}\nstderr: {}",
         stdout,
         stderr,
+    );
+
+    // The remote SSH_AUTH_SOCK must not equal the local marker
+    // (a regression that leaked the local path verbatim would
+    // produce that result and corrupt agent operations on the
+    // remote).
+    assert_ne!(
+        remote_sock, local_marker,
+        "remote $SSH_AUTH_SOCK unexpectedly equals the LOCAL marker \
+         — passhrs should be forwarding via sshd (which allocates a \
+         per-session path), not leaking the local path verbatim. \
+         local: {}\nstdout: {}\nstderr: {}",
+        local_marker, stdout, stderr,
+    );
+
+    // A spatial sanity check: the forwarded path lives under sshd's
+    // agent tmpdir, typically /tmp/agent.<ppid>/<rand> on Linux and
+    // /var/folders/.../T/agent.<rand> on macOS. Pinning the exact
+    // location is brittle across sshd versions, but a substring
+    // match for "agent" catches the OpenSSH-allocation-shape.
+    // On Win32-OpenSSH sshd-exec interaction is more involved and
+    // the remote `$SSH_AUTH_SOCK` may be empty even when -A works
+    // (cmd.exe's `%SSH_AUTH_SOCK%` is empty if the cmd parser
+    // resolved it before the env was inherited), so we skip this
+    // check on Windows.
+    #[cfg(not(target_os = "windows"))]
+    assert!(
+        remote_sock.contains("agent") || remote_sock.contains("ssh"),
+        "remote $SSH_AUTH_SOCK ({}) doesn't look like an sshd-allocated \
+         agent socket (expected a path containing 'agent' or 'ssh')",
+        remote_sock,
     );
 }
 
