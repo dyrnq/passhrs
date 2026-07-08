@@ -1072,6 +1072,146 @@ fn test_inactivity_timeout_kept_alive() {
 }
 
 // ======================================================================
+// `-S <path>` ControlPath: parsed-but-ignored (Issue #21).
+//
+// As of this writing `-S` is declared at `src/cli.rs:64-65`
+// (`#[arg(short = 'S', long = "control-path")] pub(crate) control_path:
+// Option<String>`) and never read again. `grep -rn control_path src/`
+// returns exactly two hits — both in the field declaration. There is no
+// `UnixListener`, no control-protocol framing, no session-id reuse, no
+// auth-context persistence. `tests/08_compat_args.rs::test_control_socket`
+// enforces clap accepts the flag (catch a clap-parser regression), but
+// nothing in src/ implements master mode.
+//
+// This test pins the no-op behavior so:
+//   1. A stray half-implementation — e.g. someone wires a UnixListener
+//      that binds but never serves — is caught here as an "unexpected
+//      file at the -S path" panic with a clear pointer to cli.rs:64.
+//      Without it, a broken master would silently accept outbound
+//      connections and deadlock the session.
+//   2. Anyone implementing -S in the future gets an unambiguous "this
+//      test now fails — open a new test issue" signal at PR-merge
+//      time, rather than discovering the gap after merging.
+//
+// When `-S` becomes a real feature, replace this test with the original
+// Issue #21 plan: a master invocation that opens the control socket,
+// then a follow-up invocation that reuses it without --password/-i and
+// runs `ssh-add -l`/`echo` end-to-end (data-plane verified).
+// ======================================================================
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222; asserts the current no-op behavior of -S"]
+fn test_control_socket_currently_noop() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let sock_path = format!("{}/phr-21-ctrl.sock", tmp_root().display());
+    // Belt-and-suspenders: clean up any leftover from a prior aborted run
+    // so assertion 1 below is unambiguous.
+    let _ = std::fs::remove_file(&sock_path);
+
+    let d = format!("{}@{}", USER, HOST);
+
+    // -- Pass 1: spawn a master invocation with `-S <path>` and `-N`
+    // so passhrs opens an SSH session, auths, opens a session channel,
+    // and idles (no command). With a real `-S` this is when the master
+    // would bind a UnixListener at `sock_path`. With the current no-op
+    // passhrs, the flag is silently ignored.
+    let mut master_args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-S".to_string(),
+        sock_path.clone(),
+        "-N".to_string(),
+        d.clone(),
+    ];
+    prepend_auth_args(&mut master_args);
+    let mut master = Command::new(BIN)
+        .args(&master_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn master with -S");
+
+    // 2 s is plenty: a real implementation would bind-and-listen well
+    // inside the SSH handshake window (handshake + auth is typically
+    // 100-300 ms). On the no-op path nothing happens at all, so this
+    // is a stable lower bound. If a CI spike ever pushes handshake
+    // past 2 s, this can grow; we don't currently expect that.
+    thread::sleep(Duration::from_secs(2));
+
+    // Assertion 1: -S path was NOT bound to anything. `Path::exists`
+    // covers a UDS file on Unix (mode 0o600-ish) AND any future
+    // platform-specific socket type (named pipe on Windows, etc.) --
+    // it's `metadata().is_ok()` underneath, so any bind-style artifact
+    // at `sock_path` trips it.
+    let bound = std::path::Path::new(&sock_path).exists();
+    assert!(
+        !bound,
+        "-S path {path} unexpectedly exists. passhrs -S is currently a no-op \
+         (see cli.rs:64 — control_path parsed but never read by main.rs). \
+         If you are implementing the feature, this test guards the \
+         transition; update it to match the new behavior. See Issue #21 \
+         comment in tests/15_native_sshd_integration.rs.",
+        path = sock_path,
+    );
+
+    // -- Pass 2: follow-up invocation with the SAME -S path but NO
+    // auth flags. With a real -S, the second invocation would short-
+    // circuit through the master and succeed even without --password/-i
+    // (the master forwards the auth context). With the no-op, passhrs
+    // falls through to a normal TCP connect to sshd with no auth →
+    // "Permission denied (publickey,password)" → exit 1.
+    //
+    // We intentionally do NOT call `prepend_auth_args` here so the
+    // second invocation is exactly as a user would run it: `passhrs -S
+    // <path> <cmd>` with no creds.
+    let second_args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-S".to_string(),
+        sock_path.clone(),
+        d,
+        "echo".to_string(),
+        "should_not_reach_remote".to_string(),
+    ];
+    let out = Command::new(BIN)
+        .args(&second_args)
+        .output()
+        .expect("second -S invocation");
+
+    assert!(
+        !out.status.success(),
+        "second -S invocation succeeded with no --password/-i: this implies \
+         -S master/resume is implemented (passhrs routed through the \
+         master's auth context). Issue #21's body expects that behavior, \
+         but src/ has no master path today (cli.rs:64 declares \
+         control_path; nothing reads it). If you are implementing the \
+         feature, this test guards the transition. stderr: {stderr}",
+        stderr = String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Cleanup: kill the master (it would die on its own if we leaked
+    // it, but explicit kill keeps CI deterministic). `master.wait`
+    // reaps; ignore errors in case the child already exited for an
+    // unrelated reason (e.g. sshd rejected auth — should not happen
+    // here because Pass 1 has --password/-i, but be defensive).
+    let _ = master.kill();
+    let _ = master.wait();
+    let _ = std::fs::remove_file(&sock_path);
+}
+
+// ======================================================================
 // 基本命令测试
 // ======================================================================
 
