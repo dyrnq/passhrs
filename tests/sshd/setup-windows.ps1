@@ -637,9 +637,9 @@ $SshBin = Join-Path $SshdBinDir 'ssh.exe'
 if (-not (Test-Path $SshBin)) { $SshBin = 'ssh' }
 Write-Host "==> Smoke-testing ssh pubkey auth..."
 Write-Host "    probe: & ${SshBin} -i '$TestKey' -p $Port -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=10 -v '${User}@${ListenHost}' 'echo win_pubkey_ok'"
-Write-Host "    ACL check on $TestKey:"
+Write-Host "    ACL check on ${TestKey}:"
 icacls $TestKey | Write-Host
-Write-Host "    ACL check on $AuthorizedKeysPath:"
+Write-Host "    ACL check on ${AuthorizedKeysPath}:"
 icacls $AuthorizedKeysPath | Write-Host
 try {
     $probeOutput = & $SshBin -i $TestKey -p $Port -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes -o ConnectTimeout=10 -v "${User}@${ListenHost}" "echo win_pubkey_ok" 2>&1
