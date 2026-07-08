@@ -63,6 +63,43 @@ fn test_login_name() {
 }
 
 #[test]
+fn test_disable_pty_short() {
+    let (_, _, stderr) = run_phr(&["-T", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_disable_pty_long() {
+    let (_, _, stderr) = run_phr(&["--no-pty", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_version_short() {
+    // clap 4 auto-version flag provides -V via the `version =`
+    // attribute on #[command]. Previously the README lied about
+    // this being unimplemented; the test pins it.
+    let (ok, stdout, stderr) = run_phr(&["-V"]);
+    assert!(ok, "-V should exit 0: {}", stderr);
+    assert!(
+        stdout.starts_with("passhrs "),
+        "-V should print 'passhrs <ver>', got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_version_long() {
+    let (ok, stdout, stderr) = run_phr(&["--version"]);
+    assert!(ok, "--version should exit 0: {}", stderr);
+    assert!(
+        stdout.starts_with("passhrs "),
+        "--version should print 'passhrs <ver>', got: {}",
+        stdout
+    );
+}
+
+#[test]
 fn test_port_flag() {
     let (_, _, stderr) = run_phr(&["-p", "2222", "user@localhost", "id"]);
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);

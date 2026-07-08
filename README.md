@@ -199,8 +199,8 @@ ssh:   passhrs:   description
  -O    ❌  —        Control command
  -Q    ❌  —        Query algorithms
  -s    ❌  —        SSH subsystem
- -T    ❌  —        Disable PTY (passhrs default behavior matches)
- -V    ❌  —        Version
+ -T    ✅  -T       Disable PTY allocation
+ -V    ✅  -V       Version
  -W    ❌  —        Tunnel forwarding
  -w    ❌  —        Tunnel device
  -x    ❌  —        Disable X11 forwarding
@@ -213,7 +213,7 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **21**| **49%** |
+| **Implemented**       | **22**| **51%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
 | Not implemented       | ~21   | 49%   |
 
