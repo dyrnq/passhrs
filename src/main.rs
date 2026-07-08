@@ -151,7 +151,9 @@ async fn main() -> Result<()> {
         std::process::exit(0);
     }
 
-    let log_level = if cli.quiet {
+    let log_level = if cli.debug_all {
+        "debug"
+    } else if cli.quiet {
         "error"
     } else {
         match cli.verbose {
