@@ -46,8 +46,7 @@
 | `--pull <remote>:<local>`       | Download files/dirs via SFTP (multi)           |
 | `--rsync <local>:<remote>`      | Smart sync (mtime/size + copia delta)          |
 | `--rsync-opt <opt>`             | Rsync options (delete, dry-run, exclude, etc.) |
-| `--nohup`                       | Keep running in background                     |
-| `--debug-all`                   | Enable russh protocol-level debugging          |
+| `--debug-all`                   | Force debug-level logging (overrides `-q`)     |
 
 ### Supported `-o` Key-Value Pairs
 
@@ -122,6 +121,12 @@ passhrs --identity-passphrase <(echo -n myphrase) -i ~/.ssh/id_ed25519 user@host
 
 # Port forwarding (background)
 passhrs -N -f -L 8118:localhost:8118 user@host
+
+# To run passhrs detached from your shell session, use your shell's
+# job control rather than a dedicated passhrs flag. POSIX:
+nohup passhrs -N -L 8118:localhost:8118 user@host &
+# Windows PowerShell:
+Start-Process passhrs -ArgumentList '-N','-L','8118:localhost:8118','user@host' -WindowStyle Hidden
 
 # SOCKS5 proxy
 passhrs -D 1080 user@host

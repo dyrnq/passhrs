@@ -92,6 +92,25 @@ fn test_compression_with_rsync() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
+// Issue #27: `--debug-all` is the surviving half of a docs/cli mismatch
+// (the other half -- `--nohup` -- was removed from README because it's
+// better expressed via the shell's job control). This test pins the
+// accept-by-clap surface so a clap-parser regression gets caught
+// before the rest of issue #27's flow shows up at the user.
+#[test]
+fn test_debug_all_flag() {
+    let (_, _, stderr) = run_phr(&["--debug-all", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+    // Also exercise the short-circuited path that previously raised
+    // "unexpected argument --debug-all found". The error message
+    // string is what clap prints when the flag is not declared.
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should now recognize --debug-all, but stderr still complains: {}",
+        stderr
+    );
+}
+
 #[test]
 fn test_full_openssl_compatible() {
     let (_, _, stderr) = run_phr(&[

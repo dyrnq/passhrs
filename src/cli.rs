@@ -100,6 +100,11 @@ pub(crate) struct Cli {
     pub(crate) rsync: Vec<String>,
     #[arg(long = "rsync-opt", num_args = 1)]
     pub(crate) rsync_opt: Vec<String>,
+    /// Force debug-level log output (overrides `-q`; equivalent to
+    /// setting `RUST_LOG=debug`). Useful for triaging without
+    /// exporting RUST_LOG in the calling shell.
+    #[arg(long = "debug-all")]
+    pub(crate) debug_all: bool,
 }
 
 pub(crate) fn parse_destination(dest: &str) -> Result<(String, Option<String>, u16)> {
