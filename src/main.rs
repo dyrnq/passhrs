@@ -421,12 +421,47 @@ async fn run(cli: Cli) -> Result<()> {
         if tcp_keepalive && keepalive_interval.is_none() {
             config.keepalive_interval = Some(std::time::Duration::from_secs(60));
         }
+        // ----- -A agent forwarding (Issue #23) -----
+        //
+        // Resolve the local agent socket path that the russh handler
+        // will dial when sshd later opens an `auth-agent@openssh.com`
+        // channel at us. Decision order (mirrors OpenSSH):
+        //
+        //   1. `-a` (no_forward_agent): explicit disable — pass None
+        //      down so the handler treats every agent channel-open as
+        //      a no-op (channel accepted, immediately drained).
+        //   2. `-A` (forward_agent): forward IFF `$SSH_AUTH_SOCK` is
+        //      set AND non-empty. If the var is missing or empty,
+        //      log a warning and fall through with None — OpenSSH
+        //      silently does the same.
+        //   3. Neither `-A` nor `-a`: do not forward (None).
+        let agent_sock_path: Option<std::path::PathBuf> = if cli.no_forward_agent {
+            None
+        } else if cli.forward_agent {
+            match std::env::var("SSH_AUTH_SOCK") {
+                Ok(sock_path) if !sock_path.is_empty() => {
+                    info!("Agent forwarding: local socket {}", sock_path);
+                    Some(std::path::PathBuf::from(sock_path))
+                }
+                Ok(_) | Err(_) => {
+                    warn!(
+                        "-A requested but $SSH_AUTH_SOCK is unset; \
+                             agent forwarding disabled for this session"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let config = Arc::new(config);
         let mut handler = SshHandler::new(
             strict_check,
             host.clone(),
             port,
             (*user_known_hosts).clone(),
+            agent_sock_path.clone(),
         );
         handler.remote_forwards = remote_forward_map.clone();
 
@@ -454,6 +489,7 @@ async fn run(cli: Cli) -> Result<()> {
                 jump.host.clone(),
                 jump.port,
                 (*user_known_hosts).clone(),
+                agent_sock_path.clone(),
             );
             let mut jump_handle = client::connect_stream(config.clone(), jump_stream, jump_handler)
                 .await
@@ -490,6 +526,17 @@ async fn run(cli: Cli) -> Result<()> {
                 host.clone(),
                 port,
                 (*user_known_hosts).clone(),
+                // The target session is a fresh SSH handshake
+                // tunneled through sshd on the jump host. passhrs
+                // owns the client side; the jump-host sshd relays
+                // anything we send through the tunnel. For agent
+                // forwarding we want THIS target session channel
+                // (where passhrs opens the shell/command) to also
+                // be -A-aware, so the jump handler and the target
+                // handler both get the local agent path. Either
+                // sshd in the chain can ask us to pump bytes; both
+                // pump to the same local agent.
+                agent_sock_path.clone(),
             );
             target_handler.remote_forwards = remote_forward_map.clone();
 
@@ -647,6 +694,26 @@ async fn run(cli: Cli) -> Result<()> {
                 || !http_connects.is_empty());
         if !pure_fwd {
             let channel = handle.channel_open_session().await?;
+            // -A agent forwarding (Issue #23): tell sshd that we
+            // accept `auth-agent@openssh.com` channel-opens on this
+            // session. sshd then exposes a per-process
+            // `$SSH_AUTH_SOCK` to the user's command and opens the
+            // auth-agent channel back to passhrs the first time a
+            // remote process contacts it. The actual byte pump lives
+            // in `SshHandler::server_channel_open_agent_forward`
+            // (src/ssh.rs) — this line only tells sshd it's OK to
+            // open the channel.
+            //
+            // Mirroring OpenSSH semantics: skip the request when no
+            // local agent is configured (None above), so we don't
+            // burn a sshd feature for sessions where there's
+            // nothing to forward.
+            if cli.forward_agent && !cli.no_forward_agent && agent_sock_path.is_some() {
+                info!("Agent forward: sending auth-agent-req@openssh.com");
+                if let Err(e) = channel.agent_forward(true).await {
+                    warn!("Agent forward: sshd rejected request: {}", e);
+                }
+            }
             let want_pty = cli.force_tty || !cli.no_command;
             if want_pty {
                 let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());

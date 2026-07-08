@@ -123,7 +123,17 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
     tokio::spawn(async move {
         for spec in fw {
             let cfg = Arc::new(client::Config::default());
-            let h = SshHandler::new(strict_check, fwd_host.clone(), fwd_port, (*uk).clone());
+            let h = SshHandler::new(
+                strict_check,
+                fwd_host.clone(),
+                fwd_port,
+                (*uk).clone(),
+                // Forward-only sessions (-L/-D/-H) don't have an
+                // interactive agent-forwarding relationship: the
+                // user's SSH session is the one carrying the
+                // forwarded agent, not the tunnel's data plane.
+                None,
+            );
             let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
                 Ok(c) => c,
                 Err(e) => {

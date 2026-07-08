@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use log::*;
-use russh::client::{Handle, Handler, Msg};
+use russh::client::{ChannelOpenHandle, Handle, Handler, Msg};
 use russh::keys::{load_secret_key, HashAlg, PrivateKeyWithHashAlg};
 use russh::{Channel, ChannelMsg};
 
@@ -16,6 +17,18 @@ pub(crate) struct SshHandler {
     port: u16,
     known_hosts_path: Option<String>,
     pub(crate) remote_forwards: HashMap<u16, ForwardSpec>,
+    /// Local SSH agent socket path set when -A is in effect. Used
+    /// by `server_channel_open_agent_forward` to dial the local
+    /// agent whenever sshd opens a forwarded-agent channel back
+    /// at us. The remote-side socket (`$SSH_AUTH_SOCK` on the
+    /// remote host) is wired up by sshd itself, independent of
+    /// passhrs; passhrs only owns the client-side pump.
+    ///
+    /// `None` means forwarding is disabled (whether -a was passed,
+    /// -A wasn't, $SSH_AUTH_SOCK was unset, or this is an
+    /// intermediate session where forwarding shouldn't apply — e.g.
+    /// a ProxyJump hop).
+    agent_sock_path: Option<PathBuf>,
 }
 
 impl SshHandler {
@@ -24,6 +37,7 @@ impl SshHandler {
         host: String,
         port: u16,
         known_hosts_path: Option<String>,
+        agent_sock_path: Option<PathBuf>,
     ) -> Self {
         Self {
             strict_check,
@@ -31,6 +45,7 @@ impl SshHandler {
             port,
             known_hosts_path,
             remote_forwards: HashMap::new(),
+            agent_sock_path,
         }
     }
 }
@@ -210,6 +225,202 @@ impl Handler for SshHandler {
         }
         Ok(())
     }
+
+    /// Handle a server-initiated `auth-agent@openssh.com` channel-open.
+    /// sshd opens one of these for every process on the remote that
+    /// tries to talk to the forwarded agent socket (`$SSH_AUTH_SOCK`
+    /// on the remote); our job is to relay every byte between sshd
+    /// and the local agent at `self.agent_sock_path`.
+    ///
+    /// Must NOT await `reply.accept()` inline — same reason as the
+    /// forwarded-tcpip handler above: the callback runs synchronously
+    /// inside russh's `process_packet` event loop, and awaiting the
+    /// mpsc-send that notifies the loop about the reply would
+    /// deadlock. Spawn the accept, then drop the JoinHandle.
+    ///
+    /// `session` is unused here (we only need it for other hooks).
+    fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let agent_sock = self.agent_sock_path.clone();
+        async move {
+            let accept_handle = tokio::spawn(async move {
+                let _ = reply.accept().await;
+            });
+            drop(accept_handle);
+
+            let Some(sock_path) = agent_sock else {
+                // No local agent configured (forwarding was disabled
+                // or $SSH_AUTH_SOCK was unset when the session
+                // started). We already accepted — best-effort: drain
+                // the channel so sshd doesn't sit on a half-open
+                // channel forever. We can't really reject at this
+                // point (we accepted), so close the channel
+                // immediately.
+                let (_rx, _tx) = channel.split();
+                return Ok(());
+            };
+
+            let channel_id = channel.id();
+            debug!(
+                "Agent forward: sshd opened auth-agent channel {:?}, dialing local agent at {}",
+                channel_id,
+                sock_path.display()
+            );
+            // Detach the byte pump into a spawned task so the
+            // callback returns immediately and the event loop can
+            // keep draining. The pump is fire-and-forget — it
+            // self-terminates when sshd closes the channel or the
+            // local agent closes.
+            tokio::spawn(pump_agent_socket(channel, sock_path));
+            Ok(())
+        }
+    }
+}
+
+// ======================================================================
+// Agent forwarding pump (Issue #23).
+//
+// `pump_agent_socket` bridges a server-initiated
+// `auth-agent@openssh.com` channel to a local SSH agent over a Unix
+// socket (`$SSH_AUTH_SOCK`). On Unix that socket is a real Unix
+// domain socket; on Windows it is a named pipe (ssh-agent and the
+// Windows OpenSSH agent both expose a `\\.\pipe\…` path, and a few
+// setups additionally fall back to a Unix-style path when Cygwin /
+// MSYS / WSL is involved). The helper therefore resolves via
+// `tokio::net::UnixStream` for plain paths and via
+// `tokio::net::windows::named_pipe::ClientOptions::open` for the
+// `\\.\pipe\` prefix; the resulting stream is then used identically
+// for the read/write pump.
+//
+// Future-direction note: if someone later needs to support Windows
+// ssh-agent's AF_UNIX shim (it's not currently common), this is the
+// single point to extend.
+// ======================================================================
+
+#[cfg(unix)]
+async fn connect_agent_stream(path: &Path) -> Result<tokio::net::UnixStream> {
+    use anyhow::Context;
+    tokio::net::UnixStream::connect(path)
+        .await
+        .with_context(|| {
+            format!(
+                "agent forward: failed to connect to local agent socket {}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(windows)]
+async fn connect_agent_stream(path: &Path) -> Result<NamedPipeClientStream> {
+    use anyhow::Context;
+    let s = path.to_string_lossy();
+    // `\\.\pipe\<name>` is the canonical named-pipe path on Windows.
+    // The Windows OpenSSH agent and ssh-agent both register under
+    // `\\.\pipe\openssh-ssh-agent` (or a per-user variant); Cygwin /
+    // MSYS may surface them at /tmp/... paths, which tokio can't
+    // open as named pipes — but passhrs doesn't currently claim to
+    // support that mode.
+    if !s.starts_with(r"\\.\pipe\") {
+        return Err(anyhow::anyhow!(
+            "agent forward: local agent socket {} is not a Windows named pipe \
+             (must start with \\\\.\\pipe\\); passhrs does not currently \
+             translate non-pipe paths",
+            s
+        ));
+    }
+    let pipe_name: &str = &s[r"\\.\pipe\".len()..];
+    tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(pipe_name)
+        .with_context(|| format!("agent forward: failed to open local agent named pipe {}", s))
+}
+
+#[cfg(windows)]
+type NamedPipeClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+async fn pump_agent_socket(channel: Channel<Msg>, sock_path: PathBuf) {
+    use anyhow::Context;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stream = match connect_agent_stream(&sock_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("{}", e);
+            // Best-effort: close the channel so sshd doesn't sit on
+            // a half-open channel. Whether the close reaches sshd
+            // before sshd times out the forwarded agent request is
+            // up to the transport, but closing never makes things
+            // worse.
+            let (_rx, _tx) = channel.split();
+            return;
+        }
+    };
+
+    let (mut crx, ctx) = channel.split();
+    let (mut trx, mut ttx) = tokio::io::split(stream);
+
+    let pump_c2a = tokio::spawn(async move {
+        // channel -> local agent
+        loop {
+            match crx.wait().await {
+                Some(ChannelMsg::Data { ref data }) => {
+                    if let Err(e) = ttx.write_all(data).await {
+                        debug!("Agent forward c2a: write to local agent failed: {}", e);
+                        break;
+                    }
+                    let _ = ttx.flush().await;
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(other) => {
+                    debug!("Agent forward c2a: ignoring {:?}", other);
+                }
+            }
+        }
+    });
+
+    let pump_a2c = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        // local agent -> channel
+        loop {
+            match trx.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = ctx.eof().await;
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = ctx.data(&buf[..n]).await.with_context(|| {
+                        format!(
+                            "agent forward: failed to forward {} bytes from \
+                             local agent to sshd",
+                            n
+                        )
+                    }) {
+                        debug!("Agent forward a2c: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!("Agent forward a2c: read from local agent failed: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Drop both JoinHandles — they self-terminate on channel or
+    // agent EOF / error. Awaiting them inside a `join!` would
+    // re-introduce the same event-loop deadlock as the
+    // forwarded-tcpip handler (they only complete on EOF).
+    drop(pump_c2a);
+    drop(pump_a2c);
+
+    debug!(
+        "Agent forward: pump started for local socket {}",
+        sock_path.display()
+    );
 }
 
 // ======================================================================
