@@ -61,7 +61,13 @@ pub(crate) struct Cli {
     pub(crate) password: Option<String>,
     #[arg(long = "password-file")]
     pub(crate) password_file: Option<String>,
-    #[arg(short = 'S', long = "control-path")]
+    /// Passhrs-native Unix-domain control socket for master/resume
+    /// (`-S <path>`). When set, this invocation either becomes the
+    /// master (binds a UDS at `<path>`) or, if no fresh-auth flags
+    /// are given, tries to resume through an existing master at
+    /// `<path>`. Unix-only; wire format is passhrs-native (NOT
+    /// OpenSSH-compatible).
+    #[arg(short = 'S', long = "control-path", value_name = "path")]
     pub(crate) control_path: Option<String>,
     #[arg(long = "connect-timeout", default_value_t = 0)]
     pub(crate) connect_timeout: u64,
@@ -394,7 +400,7 @@ pub(crate) fn print_help() {
     println!("  -p <port>        SSH port");
     println!("  -q               Quiet");
     println!("  -R <spec>        Remote forward ([bind:]port:host:port)");
-    println!("  -S <path>        Control socket path");
+    println!("  -S <path>        Control socket path (master/resume; Unix only)");
     println!("  -t               Force PTY");
     println!("  -v/-vv/-vvv      Verbose");
     println!("  -V/--version     Version");

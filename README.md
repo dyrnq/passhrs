@@ -180,7 +180,7 @@ ssh:   passhrs:   description
  -p    ✅  -p       Port
  -q    ✅  -q       Quiet mode
  -R    ✅  -R       Remote port forwarding
- -S    ❌  —        OpenSSH: control socket (not implemented)
+ -S    ✅  -S       Control socket path (Unix only, passhrs-native protocol — see below)
  -t    ✅  -t       Force PTY
  -v    ✅  -v       Verbose output (-vv, -vvv)
 
@@ -213,9 +213,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **20**| **47%** |
+| **Implemented**       | **21**| **49%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~22   | 51%   |
+| Not implemented       | ~21   | 49%   |
 
 ### Not Implemented — Notes
 
@@ -224,7 +224,9 @@ ssh:   passhrs:   description
 - `-C` compression level: flate2 feature
 - `-V` version: add `--version` flag
 
-**Semantically not fitting:** `-D` (not a proxy tool), `-O` ControlMaster (single connection), `-W` tunnel, `-G`/`-Q` debug, `-B`/`-b`/`-e`/`-s`/`-w` (rarely used)
+**Semantically not fitting:** `-D` (not a proxy tool), `-W` tunnel, `-G`/`-Q` debug, `-B`/`-b`/`-e`/`-s`/`-w` (rarely used)
+
+**`-S` control socket caveat:** passhrs implements `-S <path>` as a **passhrs-native** master/resume protocol over a Unix-domain socket at `<path>` (mode `0o600`, removed automatically on master exit). It is **not wire-compatible with OpenSSH's** control protocol — an OpenSSH client cannot talk to a passhrs master and vice versa. Wire format: resume-to-master `<u32 BE length><UTF-8 command line>`; master-to-resume `<u32 BE length><tag 1=stdout / 2=stderr / 0=done><payload>`, where the done frame is `<u32 1><tag 0><u8 exit_code>` (length=1 so the reader picks up the exit code via the same `len`-byte payload read used for stdout/stderr). Unix-only in v1; Windows named-pipe equivalent is a separate follow-up.
 
 **Larger effort:** `-F` config file (needs full ssh_config parser)
 

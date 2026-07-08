@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(unix)]
+mod control;
 mod forward;
 mod proxy;
 mod sftp;
@@ -379,6 +381,39 @@ async fn run(cli: Cli) -> Result<()> {
         .get("exitonforwardfailure")
         .map(|v| v == "yes")
         .unwrap_or(false);
+
+    // ----- -S control socket: resume early-exit (Issue #29) -----
+    //
+    // If `-S <path>` is set AND the user supplied no fresh-auth
+    // flags (no -i / --password / --password-file), try to connect
+    // to a master on that path FIRST. A successful resume returns
+    // the remote exit code and exits the process directly; a
+    // missing master falls through to today's connect path.
+    //
+    // This early-exit must come BEFORE the `client::connect` block
+    // (line ~563): if we tried to authenticate first we'd burn a
+    // full handshake just to find out we should have reused the
+    // master. And it must come AFTER `dest_str` parsing so we have
+    // host/port to log meaningfully (the master logs "Connecting
+    // to X" once it has the live Handle).
+    #[cfg(unix)]
+    if let Some(ctrl_path) = cli.control_path.as_deref() {
+        if !host.is_empty() && control::has_no_fresh_auth(&cli) {
+            match control::try_resume(std::path::Path::new(ctrl_path), &cli).await? {
+                Some(code) => {
+                    info!("Control socket: resume succeeded (exit code {})", code);
+                    std::process::exit(code);
+                }
+                None => {
+                    info!(
+                        "Control socket: no live master at {}; opening fresh SSH connection",
+                        ctrl_path
+                    );
+                }
+            }
+        }
+    }
+
     let need_ssh = !host.is_empty();
     if need_ssh {
         info!("Connecting to {}:{} as {}", host, port, user);
@@ -580,6 +615,44 @@ async fn run(cli: Cli) -> Result<()> {
             passphrase.as_deref(),
         )
         .await?;
+
+        // ----- -S control socket: master mode (Issue #29) -----
+        //
+        // After auth succeeds, lift the `Handle` into an `Arc` so
+        // the master-mode accept loop (and any future proxy-style
+        // shared consumers) can clone it. Every `Handle::*` method
+        // we use downstream is `&self` (russh 0.62 verified), so
+        // the Arc needs no Mutex.
+        //
+        // The master branch must run BEFORE the SFTP / forward /
+        // session-channel blocks because in master mode the master
+        // blocks indefinitely on the accept loop — those other
+        // flows don't happen at all. A bare `-N user@host` with
+        // `-S /tmp/p.sock` is the canonical master invocation.
+        // ----- -S control socket: master mode (Issue #29) -----
+        //
+        // After auth succeeds, if `-S` is set we lift the `Handle`
+        // into an `Arc` so the master-mode accept loop can clone
+        // it. Every `Handle::*` method we use downstream is `&self`
+        // (russh 0.62 verified), so the Arc needs no Mutex.
+        //
+        // The master branch must run BEFORE the SFTP / forward /
+        // session-channel blocks because in master mode the master
+        // blocks indefinitely on the accept loop — those other
+        // flows don't happen at all. A bare `-N user@host` with
+        // `-S /tmp/p.sock` is the canonical master invocation.
+        #[cfg(unix)]
+        if let Some(ctrl_path) = cli.control_path.as_deref() {
+            let handle = Arc::new(handle);
+            info!(
+                "Control socket: master mode — entering accept loop at {}",
+                ctrl_path
+            );
+            control::run_master(handle, std::path::Path::new(ctrl_path)).await?;
+            // run_master only returns on shutdown / error; both
+            // are terminal for this invocation.
+            return Ok(());
+        }
 
         // --push / --pull / --rsync
         if !cli.push.is_empty() || !cli.pull.is_empty() || !cli.rsync.is_empty() {
