@@ -787,7 +787,10 @@ async fn run(cli: Cli) -> Result<()> {
                     warn!("Agent forward: sshd rejected request: {}", e);
                 }
             }
-            let want_pty = cli.force_tty || !cli.no_command;
+            // `-T` (`--no-pty`) suppresses PTY allocation regardless of
+            // whether `-t` (`--tty`) was also given. Matches OpenSSH
+            // semantics: `-T` always wins.
+            let want_pty = !cli.disable_pty && (cli.force_tty || !cli.no_command);
             if want_pty {
                 let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
                 channel

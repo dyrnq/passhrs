@@ -49,6 +49,12 @@ pub(crate) struct Cli {
     pub(crate) no_command: bool,
     #[arg(short = 't', long = "tty")]
     pub(crate) force_tty: bool,
+    /// Disable pseudo-terminal allocation (overrides `-t`).
+    /// Matches OpenSSH `-T`. By default passhrs allocates a PTY
+    /// for any non-`-N` command; pass `-T` to suppress that even
+    /// for interactive commands.
+    #[arg(short = 'T', long = "no-pty")]
+    pub(crate) disable_pty: bool,
     #[arg(short = 'L', long = "local-forward", num_args = 1)]
     pub(crate) local_forward: Vec<String>,
     #[arg(short = 'R', long = "remote-forward", num_args = 1)]
@@ -401,6 +407,7 @@ pub(crate) fn print_help() {
     println!("  -q               Quiet");
     println!("  -R <spec>        Remote forward ([bind:]port:host:port)");
     println!("  -S <path>        Control socket path (master/resume; Unix only)");
+    println!("  -T               Disable PTY allocation (overrides -t)");
     println!("  -t               Force PTY");
     println!("  -v/-vv/-vvv      Verbose");
     println!("  -V/--version     Version");

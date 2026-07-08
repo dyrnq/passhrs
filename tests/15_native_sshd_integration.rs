@@ -1958,6 +1958,50 @@ fn test_force_tty_flag() {
     assert!(stdout.contains("/"), "should show tty device: {}", stdout);
 }
 
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_disable_pty_flag() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    // -T must suppress PTY allocation so the remote `tty` command
+    // writes "not a tty" to stdout (rather than a /dev/pts/N path).
+    // Direct inverse of test_force_tty_flag above.
+    //
+    // NB: we intentionally do NOT assert on the local process
+    // exit code. passhrs's `run_session` (src/ssh.rs:529) breaks
+    // the reader loop on ChannelMsg::Eof without waiting for
+    // ChannelMsg::ExitStatus — so the remote `tty` exit 1 is lost
+    // and passhrs exits 0. That's a pre-existing bug surfaced by
+    // this test, NOT by `-T`. Tracked separately; for now we
+    // verify the PTY-suppression behavior via the stdout content,
+    // which is the actual proof.
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-T",
+        &d,
+        "tty",
+    ];
+    let (_ok, stdout, _stderr) = run_phr(&a);
+    assert!(
+        stdout.contains("not a tty"),
+        "-T should skip PTY; remote `tty` should print 'not a tty', got stdout={:?}",
+        stdout
+    );
+    assert!(
+        !stdout.contains("/dev/"),
+        "remote tty should not show a /dev device path, got: {}",
+        stdout
+    );
+}
+
 // ======================================================================
 // IPv6 测试
 // ======================================================================
