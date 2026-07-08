@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HOST: &str = "127.0.0.1";
 const PORT: &str = "22222";
@@ -921,6 +921,153 @@ fn test_connect_timeout_integration() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "should have failed");
     assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
+}
+
+// ======================================================================
+// `--timeout` mid-flight e2e (Issue #22).
+//
+// `test_connect_timeout_integration` above covers the
+// pre-handshake case (3 s, blackhole IP, no auth round-trip). This
+// block covers the inactivity-after-handshake case: a live session
+// that just sits there with no I/O. `--timeout <s>` wires through
+// `src/main.rs:303-305` -> `russh::client::Config::inactivity_timeout`,
+// and russh owns the actual firing. We can't assert on the exact
+// stderr wording (russh's wording shifts between releases), so the
+// signal is "did the timer fire at all" via wall-clock bounds plus
+// the exit-status semantic passhrs gives us.
+//
+// `--timeout 3` + remote `sleep 30` is the bare-firing case: the
+// channel goes idle at session-start (sleep is silent), the 3 s
+// window elapses, russh tears the session, passhrs exits non-zero.
+// We assert it happened in [2 s, 15 s) — the upper bound absorbs the
+// handshake/process-start cost and CI jitter, the lower bound
+// ensures we didn't fire before the user-configured window.
+//
+// `--timeout 5` + `-o ServerAliveInterval=2` + remote `sleep 8` is
+// the kept-alive case: 8 s > 5 s, so without keepalive this would
+// fail the same way as the bare case. With keepalive (`src/main.rs:
+// 266-275` + 307-308 wire `-o ServerAliveInterval=2` into
+// `config.keepalive_interval`), russh sends SSH transport keepalive
+// every 2 s, which resets the inactivity window. We assert the
+// 8 s sleep completed (success exit, took >= 5 s so the timer
+// didn't fire, took < 20 s so we left the test budget).
+// ======================================================================
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_inactivity_timeout_mid_flight() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+    let d = format!("{}@{}", USER, HOST);
+    // mirror `test_connect_timeout_integration`'s auth smart-inject
+    // shape so the same argv reaches passhrs as a real call.
+    let mut args: Vec<String> = vec![
+        "--timeout".to_string(),
+        "3".to_string(),
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        d,
+        "sleep".to_string(),
+        "30".to_string(),
+    ];
+    prepend_auth_args(&mut args);
+    let start = Instant::now();
+    let out = Command::new(BIN)
+        .args(&args)
+        .output()
+        .expect("inactivity timeout");
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Timer fired -> non-zero exit; no panic, no thread-related
+    // backtrace in stderr (the existing `test_connect_timeout_integration`
+    // already uses `!contains("thread")` for the same reason).
+    assert!(
+        !out.status.success(),
+        "should have failed on inactivity: stderr={}",
+        stderr
+    );
+    assert!(!stderr.contains("thread"), "should not panic: {}", stderr);
+    // Lower bound: must NOT fire before the configured 3 s window —
+    // catches a regression where passhrs sets
+    // `config.inactivity_timeout = Some(0)` or accidentally divides
+    // it by 10 (a hypothetical unit confusion).
+    // Upper bound: must NOT run the full 30 s sleep — catches a
+    // regression where `config.inactivity_timeout` is never set
+    // (timer never fires) or the value is silently multiplied.
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "fired too early (took {:?}, expected >= 2s)",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "did not fire within budget (took {:?}, expected < 15s) — \
+         inactivity_timeout may not be wired to russh config",
+        elapsed
+    );
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 + ServerAliveInterval honored end-to-end"]
+fn test_inactivity_timeout_kept_alive() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+    // sleep 8 > --timeout 5. Without keepalive the bare timer would
+    // fire at ~5 s. With `ServerAliveInterval=2` the inactivity
+    // window resets every 2 s so the 8 s sleep completes.
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "--timeout".to_string(),
+        "5".to_string(),
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=2".to_string(),
+        d,
+        "sleep".to_string(),
+        "8".to_string(),
+    ];
+    prepend_auth_args(&mut args);
+    let start = Instant::now();
+    let out = Command::new(BIN)
+        .args(&args)
+        .output()
+        .expect("kept alive timeout");
+    let elapsed = start.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "should succeed with keepalive\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    // Took at least the sleep duration (5 s lower bound ensures the
+    // timer did not fire prematurely). The 20 s upper bound leaves
+    // ~12 s of slack for CI jitter; a regression that hangs the
+    // session entirely would take much longer than that.
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "completed too fast ({:?}) — keepalive may not be in effect",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "took too long ({:?}) — keepalive or session error path",
+        elapsed
+    );
 }
 
 // ======================================================================
