@@ -48,13 +48,43 @@ const PASS: &str = "PassTest1234!";
 /// tests/15 — duplicated here to keep this binary self-contained
 /// (cargo runs each test file in its own process; there's no
 /// cross-file helper sharing).
+///
+/// macOS backoff (Issue #31): the 200 ms timeout the original
+/// version used races sshd's accept-queue refill on a quiet
+/// runner — the integration step's first `connect_timeout` after
+/// the provision step's 30-second gap can land before sshd is
+/// ready. Bump to 500 ms (matches tests/15) and retry twice on
+/// macOS only; the retry is 100 ms sleep + 500 ms timeout, so
+/// worst-case wait is ~1.7 s, well within cargo's per-test
+/// default. Linux + Windows keep the single-probe shape because
+/// they don't show the same flake.
 fn sshd_ok() -> bool {
     use std::net::TcpStream;
-    TcpStream::connect_timeout(
-        &format!("{}:{}", HOST, PORT).parse().unwrap(),
-        Duration::from_millis(200),
-    )
-    .is_ok()
+    use std::net::ToSocketAddrs;
+    let addr = match format!("{}:{}", HOST, PORT).to_socket_addrs() {
+        Ok(mut it) => match it.next() {
+            Some(a) => a,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    let probe = || TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
+    if probe() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        thread::sleep(Duration::from_millis(100));
+        if probe() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(100));
+        return probe();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 /// Auth args for `passhrs`. Mirrors tests/15::auth_args(): if the
@@ -63,10 +93,38 @@ fn sshd_ok() -> bool {
 /// to install per-test pubkeys into authorized_keys (test_key_auth_*
 /// run their own `ssh-keygen` and need a working channel to push
 /// the new pubkey through).
+///
+/// macOS fail-fast (Issue #31): on macOS, falling back to `--password
+/// PASS` is a silent failure — the brew-openssh setup script
+/// configures `PasswordAuthentication no`, so the password attempt
+/// raises a confusing `Permission denied (publickey)`, and the CI
+/// retry loop in `.github/workflows/ci.yml` masks the real cause
+/// (`PHR_TEST_KEY` didn't reach the test process). When the env
+/// var is unset OR empty on macOS, panic with a clear message that
+/// points at the right setup script and the env-var propagation
+/// path. Linux + Windows keep the existing password-fallback shape
+/// because their sshd_configs still accept password auth.
 fn auth_args() -> Vec<String> {
-    match std::env::var("PHR_TEST_KEY") {
-        Ok(key) if !key.is_empty() => vec!["-i".to_string(), key],
-        _ => vec!["--password".to_string(), PASS.to_string()],
+    let key_path = std::env::var("PHR_TEST_KEY").ok();
+    if let Some(key) = key_path {
+        if !key.is_empty() {
+            return vec!["-i".to_string(), key];
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        panic!(
+            "PHR_TEST_KEY is unset or empty on macOS — the brew-openssh \
+             setup script must drop a test key (see \
+             tests/sshd/setup-macos-brew-openssh.sh) and propagate it \
+             via $GITHUB_ENV. The previous fallback to --password \
+             masked this with Permission denied (publickey) and a \
+             CI-side retry — see Issue #31 for context."
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec!["--password".to_string(), PASS.to_string()]
     }
 }
 
