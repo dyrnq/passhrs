@@ -120,14 +120,114 @@ fn build_exec_env_prefix(parts: &[String], shell: &str) -> String {
     }
 }
 
+/// Classify an anyhow error into a one-line user-facing message.
+///
+/// The default anyhow Debug format (`{:#?}`) prints the full chain
+/// with variant names, which is great for a developer reading the
+/// source but reads as noise to a user triaging a failed CI run:
+/// `Crypto(std::io::Error { kind: UnexpectedEof, message: "..." })`.
+/// This walks the error chain looking for keywords that map to a
+/// small set of user-meaningful buckets, and returns a one-line
+/// message in each. If none match, returns the top-of-chain error
+/// plus a hint to rerun with `-vv` for the full detail.
+///
+/// This is the **default-shape** error path: invoked only when the
+/// user did NOT pass `-v`/`-vv`/`--debug-all`. The verbose ladder
+/// keeps the original Debug dump — see `main()` below.
+fn format_user_error(err: &anyhow::Error) -> String {
+    // Walk the chain (cause -> source -> source ...) collecting
+    // each layer's Display string. We match on the joined string
+    // so a single error can match multiple keywords across layers
+    // (e.g. the top says "Connection refused", the source says
+    // "Connection timed out" — both connection-related).
+    let chain: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+    let joined = chain.join(" | ").to_lowercase();
+
+    // Auth failures: russh surfaces these via its `Error::Agent`
+    // or as a plain "Permission denied" string from the server.
+    // Common: "Permission denied (publickey,password)" after
+    // exhausting auth methods.
+    if joined.contains("authentication")
+        || joined.contains("permission denied")
+        || joined.contains("auth failed")
+        || joined.contains("not authenticated")
+    {
+        return format!("passhrs: authentication failed ({})", chain[0]);
+    }
+
+    // Host key verification: the typical message is "Host key
+    // verification failed" or "REMOTE HOST IDENTIFICATION HAS
+    // CHANGED" depending on the source.
+    if joined.contains("host key")
+        || joined.contains("host identification")
+        || joined.contains("knownhosts")
+        || joined.contains("known_hosts")
+    {
+        return format!("passhrs: host key verification failed ({})", chain[0]);
+    }
+
+    // Connection failures: DNS, TCP refused, TCP timeout. These
+    // are the "could not reach the server at all" class.
+    if joined.contains("connection refused")
+        || joined.contains("connection timed out")
+        || joined.contains("failed to connect")
+        || joined.contains("connection reset")
+        || joined.contains("dns")
+        || joined.contains("resolve")
+        || joined.contains("no route to host")
+        || joined.contains("network is unreachable")
+    {
+        return format!("passhrs: connection failed ({})", chain[0]);
+    }
+
+    // Channel / SFTP / forward failures: distinguish from connection
+    // failures because the SSH handshake DID succeed — something
+    // specific (a -L/-R spec, an SFTP push) died.
+    if joined.contains("channel open")
+        || joined.contains("forward")
+        || joined.contains("sftp")
+        || joined.contains("subsystem")
+    {
+        return format!("passhrs: forwarding/sftp failed ({})", chain[0]);
+    }
+
+    // ProxyJump-specific: the top-of-chain context will name the
+    // jump host, which is what the user needs to act on.
+    if joined.contains("proxyjump") || joined.contains("proxy jump") {
+        return format!("passhrs: ProxyJump failed ({})", chain[0]);
+    }
+
+    // Unknown — fall back to a one-line summary + hint. The full
+    // Debug chain is still available via -vv.
+    format!(
+        "passhrs: {} (rerun with -vv for details)",
+        chain.first().map(String::as_str).unwrap_or("unknown")
+    )
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Cli::parse();
     if cli.help {
         print_help();
-        return Ok(());
+        return;
     }
 
+    // Run the actual work. The verbose ladder preserves the
+    // existing {:#?} Debug dump so -v / -vv / --debug-all
+    // continues to show the full anyhow chain. Only the default
+    // (warn) and -q (error) levels use the classified one-liner.
+    if let Err(err) = run(cli.clone()).await {
+        if cli.verbose > 0 || cli.debug_all {
+            eprintln!("{:#?}", err);
+        } else {
+            eprintln!("{}", format_user_error(&err));
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if cli.fork {
         let args: Vec<String> = std::env::args()
             .filter(|a| a != "-f" && a != "--fork")
@@ -828,4 +928,101 @@ mod exec_env_shell_tests {
     }
 
     // ---- end of exec_env_shell_tests ----
+}
+
+#[cfg(test)]
+mod format_user_error_tests {
+    //! Pin the user-facing error classifier (Issue #32). A regression
+    //! in `format_user_error` (e.g. dropping a keyword match, or
+    //! changing the prefix from "error: " to "Error: ") would silently
+    //! degrade the user experience; these tests catch that.
+    use super::format_user_error;
+    use anyhow::anyhow;
+
+    #[test]
+    fn classifies_authentication_failure() {
+        let e = anyhow!("Authentication failed");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: authentication failed"),
+            "expected 'error: authentication failed' prefix, got: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_permission_denied_as_auth() {
+        // The OpenSSH-style "Permission denied (publickey,password)"
+        // message comes back through the russh chain when all auth
+        // methods are exhausted.
+        let e = anyhow!("Permission denied (publickey,password)");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: authentication failed"),
+            "expected auth classification, got: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_connection_refused() {
+        let e = anyhow!("Failed to connect to SSH server").context("Connection refused");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: connection failed"),
+            "expected connection classification, got: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_connection_timed_out() {
+        let e = anyhow!("Connection timed out after 3s");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: connection failed"),
+            "expected connection classification, got: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_host_key_mismatch() {
+        let e = anyhow!("Host key verification failed");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: host key verification failed"),
+            "expected host key classification, got: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_proxyjump() {
+        let e = anyhow!("ProxyJump: failed to establish SSH session to jump host");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: ProxyJump failed"),
+            "expected ProxyJump classification, got: {s}"
+        );
+    }
+
+    #[test]
+    fn classifies_forwarding_or_sftp_failure() {
+        let e = anyhow!("SFTP subsystem initialization failed");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: forwarding/sftp failed"),
+            "expected forwarding classification, got: {s}"
+        );
+    }
+
+    #[test]
+    fn unknown_error_falls_back_to_summary_with_hint() {
+        let e = anyhow!("something completely unrelated to ssh");
+        let s = format_user_error(&e);
+        assert!(
+            s.starts_with("passhrs: "),
+            "unknown errors must still get the 'error: ' prefix, got: {s}"
+        );
+        assert!(
+            s.contains("rerun with -vv"),
+            "unknown errors must hint at -vv, got: {s}"
+        );
+    }
 }
