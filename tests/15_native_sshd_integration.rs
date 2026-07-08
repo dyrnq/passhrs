@@ -1510,6 +1510,88 @@ fn test_command_compress_flag() {
 }
 
 // ======================================================================
+// -C + --push 二进制字节比对 (Issue #33)
+//
+// `test_command_compress_flag` above only covers the exec channel with
+// a tiny ASCII payload — invisible to a regression that silently drops
+// zlib (the small text diff doesn't trip a string-equal check, and the
+// SFTP subsystem path isn't even exercised). This test pushes a binary
+// payload spanning the full 0x00..=0xff byte range under `-C` and
+// asserts byte-equality on the remote file. The NUL bytes are the
+// discriminator: any code path that treats the channel as a
+// NUL-terminated C string will either truncate or panic, both of
+// which surface as a byte mismatch.
+//
+// The native-sshd CI fixture means the "remote" file lives in the
+// same filesystem as the test process, so we read it back with
+// `std::fs` instead of shelling out a second `passhrs --pull` (which
+// would compound the variable under test: --pull's decompression path
+// could mask a broken --push compression path).
+// ======================================================================
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222; asserts -C + --push binary byte-equality"]
+fn test_command_compress_push_binary() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+    let d = dest();
+    // 4096 bytes = 16 full passes of 0x00..=0xff. Large enough to
+    // exercise zlib's LZ77 window (~32 KiB default, so we don't
+    // accidentally fit in a single no-compression block) but small
+    // enough that the test stays under 1 s end-to-end on every
+    // matrix row. Deterministic so the byte-equal assertion is
+    // meaningful.
+    let payload: Vec<u8> = (0u32..4096).map(|i| (i & 0xff) as u8).collect();
+
+    let local = format!("{}/phr_compress_push_src.bin", tmp_root().display());
+    let remote = format!("{}/phr_compress_push_dst.bin", tmp_root().display());
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&remote);
+    std::fs::write(&local, &payload).expect("write local binary");
+
+    let spec = format!("{}:{}", local, remote);
+    let a = [
+        "-p",
+        PORT,
+        "-C",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--push",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "push with -C failed: {}", stderr);
+
+    let round_tripped = std::fs::read(&remote).unwrap_or_default();
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&remote);
+
+    assert_eq!(
+        round_tripped.len(),
+        payload.len(),
+        "remote file size mismatch: expected {} bytes, got {}",
+        payload.len(),
+        round_tripped.len()
+    );
+    assert_eq!(
+        round_tripped,
+        payload,
+        "remote bytes do not match local source — -C + --push broke the \
+         binary data path. The first divergence is at offset {}.",
+        round_tripped
+            .iter()
+            .zip(payload.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0)
+    );
+}
+
+// ======================================================================
 // PTY / 输出格式测试
 // ======================================================================
 
