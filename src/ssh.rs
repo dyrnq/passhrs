@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
 use log::*;
@@ -29,6 +29,23 @@ pub(crate) struct SshHandler {
     /// intermediate session where forwarding shouldn't apply — e.g.
     /// a ProxyJump hop).
     agent_sock_path: Option<PathBuf>,
+    /// Per-channel exit status captured from the server's
+    /// `exit-status` channel request via the
+    /// `Handler::exit_status` callback. Populated by russh's
+    /// connection handler at `client/encrypted.rs:519-526`
+    /// *before* the channel sender is dropped (which happens at
+    /// `client/encrypted.rs:419` on CHANNEL_CLOSE).
+    ///
+    /// The channel mpsc (`Channel::wait()`) loses ExitStatus when
+    /// sshd emits Close before exit-status — russh removes the
+    /// channel at `encrypted.rs:419` and any subsequent
+    /// channel-request message is silently dropped at
+    /// `encrypted.rs:523` (`self.channels.get(...)` returns
+    /// `None`). The `Handler::exit_status` hook, however, fires
+    /// independently of the channel map and is the only path that
+    /// reliably sees ExitStatus in the Close-then-exit-status
+    /// ordering observed on ubuntu-24.04 runners. Issue #41.
+    pub(crate) exit_statuses: Arc<Mutex<HashMap<russh::ChannelId, u32>>>,
 }
 
 impl SshHandler {
@@ -46,6 +63,18 @@ impl SshHandler {
             known_hosts_path,
             remote_forwards: HashMap::new(),
             agent_sock_path,
+            exit_statuses: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Capture the remote exit status into the shared map. This
+    /// runs on russh's connection task whenever the server sends
+    /// an `exit-status` channel-request frame, regardless of
+    /// whether the channel's mpsc is still alive. `run_session`
+    /// reads back from this map after seeing the channel close.
+    pub(crate) fn record_exit_status(&self, channel: russh::ChannelId, status: u32) {
+        if let Ok(mut map) = self.exit_statuses.lock() {
+            map.insert(channel, status);
         }
     }
 }
@@ -278,6 +307,37 @@ impl Handler for SshHandler {
             tokio::spawn(pump_agent_socket(channel, sock_path));
             Ok(())
         }
+    }
+
+    /// Capture the remote process exit status as soon as sshd sends
+    /// the `exit-status` channel-request frame.
+    ///
+    /// This is the **only** reliable path for the exit code when
+    /// sshd sends CHANNEL_CLOSE before exit-status. russh's
+    /// connection handler removes the channel from its map on
+    /// CHANNEL_CLOSE (`client/encrypted.rs:419`) and drops the
+    /// mpsc sender; any subsequent `exit-status` frame is then
+    /// silently dropped at `encrypted.rs:523` because
+    /// `self.channels.get(&channel_num)` returns `None`. The
+    /// `Handler::exit_status` callback, however, fires
+    /// independently of the channel map (it's invoked at
+    /// `encrypted.rs:526` after the mpsc-send attempt). Issue #41.
+    ///
+    /// `run_session` reads this map back after the channel's
+    /// mpsc-side Close arrives, so it can return the right exit
+    /// code instead of falling back to 0.
+    async fn exit_status(
+        &mut self,
+        channel: russh::ChannelId,
+        exit_status: u32,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        debug!(
+            "Handler::exit_status: channel={:?} status={}",
+            channel, exit_status
+        );
+        self.record_exit_status(channel, exit_status);
+        Ok(())
     }
 }
 
@@ -526,9 +586,18 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> Result<i32> {
+pub(crate) async fn run_session(
+    channel: Channel<Msg>,
+    redirect_stdin: bool,
+    exit_statuses: Arc<Mutex<HashMap<russh::ChannelId, u32>>>,
+) -> Result<i32> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+    // Channel id used to look up the captured exit status from the
+    // `Handler::exit_status` callback. Computed once before the
+    // channel is split so the reader thread can read it after the
+    // channel's mpsc is closed. Issue #41.
+    let channel_id = channel.id();
 
     // Put local terminal in raw mode when running an interactive shell
     let _raw = if !redirect_stdin && std::io::stdin().is_terminal() {
@@ -555,32 +624,48 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
                 }
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
                     // Eof/Close can arrive BEFORE ExitStatus for non-PTY
-                    // execs (sshd closes the channel as soon as the
-                    // remote shell's last fd is gone, and ExitStatus is
-                    // a separate SSH_MSG_CHANNEL_REQUEST message that
-                    // races the close). Drain any trailing messages
-                    // with a 200ms grace window. Issue #41.
+                    // execs: sshd sends the channel close as soon as
+                    // the remote shell's last fd is gone, and the
+                    // `exit-status` SSH_MSG_CHANNEL_REQUEST is a
+                    // separate frame that races the close. On
+                    // ubuntu-24.04 runners the gap is large enough
+                    // (multiple hundred ms) that a 200ms grace window
+                    // (the previous value) reliably lost the
+                    // ExitStatus, so the remote command's exit code
+                    // was eaten and `passhrs` returned 0. Issue #41.
                     //
-                    // The drain loop matters because russh's
-                    // `Channel::wait()` is `mpsc::Receiver::recv()`
-                    // (russh-0.62.1/src/channels/mod.rs:655), which
-                    // returns `None` only after the sender drops.
-                    // So if Eof arrives and then the sender drops
-                    // immediately (the observed pattern with
-                    // `-T user@host false`), a single follow-up
-                    // `wait()` returns `None` — we'd miss a buffered
-                    // ExitStatus. The inner loop reads everything
-                    // that's already queued, with the timeout
-                    // bounding how long we wait for the sender to
-                    // deliver any messages it's still holding.
-                    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                    // The previous drain was also racy in a subtler
+                    // way: it broke on the *first* trailing Eof/Close,
+                    // but the russh mpsc is FIFO
+                    // (russh-0.62.1/src/channels/mod.rs:144-158 wraps
+                    // `tokio::sync::mpsc::Receiver<ChannelMsg>`),
+                    // so if the channel carried Eof *then* ExitStatus
+                    // (the order sshd emits when `-T` is in effect),
+                    // the drain consumed Eof and broke before
+                    // ExitStatus was ever polled.
+                    //
+                    // Fix: keep draining until the sender half has
+                    // actually dropped (`rx.wait()` returns `None`),
+                    // not until the next Eof/Close. Bound the wait
+                    // with a generous timeout — 5 s — as a safety net
+                    // for hung connections. Captured ExitStatus
+                    // values stay in `code` even if a later Eof/Close
+                    // arrives; the only signal that ends the drain is
+                    // `None`, i.e. the channel has been fully closed
+                    // by russh's connection handler.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
                         loop {
                             match rx.wait().await {
                                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                                     code = exit_status as i32;
                                 }
-                                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                                _ => {} // drain any other trailing messages
+                                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
+                                    // Keep draining: ExitStatus may
+                                    // still be queued behind this
+                                    // Eof/Close.
+                                }
+                                None => break, // sender dropped; channel fully closed
+                                _ => {}        // drain any other trailing messages
                             }
                         }
                     })
@@ -623,8 +708,36 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
         });
     }
     let code = tokio::select! { c = exit_rx => c.unwrap_or(0), _ = reader => 0 };
-    info!("Session exit code {}", code);
-    Ok(code)
+    // The reader thread only sees ExitStatus if russh happened to
+    // buffer it in the channel mpsc before the sender was dropped
+    // on CHANNEL_CLOSE. When sshd emits Close *before* exit-status
+    // — the ordering observed on ubuntu-24.04 — ExitStatus never
+    // reaches the mpsc (russh drops the channel at
+    // `client/encrypted.rs:419` and silently discards the
+    // late-arriving frame at line 523). The
+    // `Handler::exit_status` callback still fires for that late
+    // frame though, so we use the captured map as the
+    // authoritative source and only fall back to the mpsc-derived
+    // `code` if the callback never ran (i.e. sshd didn't send
+    // exit-status at all — happens for sessions aborted by signal).
+    let captured = exit_statuses
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&channel_id));
+    let final_code = match captured {
+        Some(c) if c as i32 != code => {
+            debug!(
+                "run_session: mpsc exit code ({}) overrode by Handler::exit_status ({}); \
+                 sshd sent Close before exit-status (Issue #41)",
+                code, c
+            );
+            c as i32
+        }
+        Some(c) => c as i32,
+        None => code,
+    };
+    info!("Session exit code {}", final_code);
+    Ok(final_code)
 }
 
 /// Decide whether a local environment variable should be forwarded to the

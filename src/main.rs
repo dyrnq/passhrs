@@ -542,6 +542,12 @@ async fn run(cli: Cli) -> Result<()> {
             agent_sock_path.clone(),
         );
         handler.remote_forwards = remote_forward_map.clone();
+        // Clone the per-handler exit-status map BEFORE the handler
+        // is moved into `Handle<SshHandler>`. `run_session` reads
+        // back from this map after the channel's mpsc is closed;
+        // without cloning first we'd lose access once `handler`
+        // is consumed by the Handle. Issue #41.
+        let exit_status_map = handler.exit_statuses.clone();
 
         let mut handle = if let Some(ref jump_spec) = cli.proxy_jump {
             // ProxyJump mode: connect through jump host
@@ -944,12 +950,12 @@ async fn run(cli: Cli) -> Result<()> {
                 };
                 info!("Exec: {}", full);
                 channel.exec(true, full.as_bytes()).await?;
-                let code = run_session(channel, cli.redirect_stdin).await?;
+                let code = run_session(channel, cli.redirect_stdin, exit_status_map).await?;
                 std::process::exit(code);
             } else if !cli.no_command {
                 channel.request_shell(true).await?;
                 info!("Starting shell");
-                let code = run_session(channel, cli.redirect_stdin).await?;
+                let code = run_session(channel, cli.redirect_stdin, exit_status_map).await?;
                 std::process::exit(code);
             } else {
                 info!("-N mode, waiting...");
