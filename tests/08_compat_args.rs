@@ -75,6 +75,42 @@ fn test_disable_pty_long() {
 }
 
 #[test]
+fn test_cipher_spec_short() {
+    let (_, _, stderr) = run_phr(&["-c", "aes128-ctr", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_cipher_spec_long() {
+    let (_, _, stderr) = run_phr(&["--cipher-spec", "aes128-ctr", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_cipher_spec_multi() {
+    // comma-separated multi-value: clap value_delimiter=',' splits this
+    let (_, _, stderr) = run_phr(&[
+        "-c",
+        "aes256-gcm@openssh.com,chacha20-poly1305@openssh.com",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_mac_spec_short() {
+    let (_, _, stderr) = run_phr(&["-m", "hmac-sha2-256", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_mac_spec_long() {
+    let (_, _, stderr) = run_phr(&["--mac-spec", "hmac-sha2-256", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
 fn test_version_short() {
     // clap 4 auto-version flag provides -V via the `version =`
     // attribute on #[command]. Previously the README lied about

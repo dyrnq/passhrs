@@ -553,27 +553,41 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
                     let _ = stderr.write_all(data).await;
                     let _ = stderr.flush().await;
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) => {
                     // Eof/Close can arrive BEFORE ExitStatus for non-PTY
                     // execs (sshd closes the channel as soon as the
                     // remote shell's last fd is gone, and ExitStatus is
                     // a separate SSH_MSG_CHANNEL_REQUEST message that
-                    // races the close). Without this grace window the
-                    // remote exit code is silently swallowed and
-                    // passhrs exits 0 — Issue #41.
+                    // races the close). Drain any trailing messages
+                    // with a 200ms grace window. Issue #41.
                     //
-                    // 200ms is enough for sshd to deliver ExitStatus
-                    // in the observed CI race window (it usually
-                    // arrives within ~10ms); if it doesn't, we fall
-                    // back to the default code=0 and the channel
-                    // really is dead.
-                    if let Ok(Some(ChannelMsg::ExitStatus { exit_status })) =
-                        tokio::time::timeout(std::time::Duration::from_millis(200), rx.wait()).await
-                    {
-                        code = exit_status as i32;
-                    }
+                    // The drain loop matters because russh's
+                    // `Channel::wait()` is `mpsc::Receiver::recv()`
+                    // (russh-0.62.1/src/channels/mod.rs:655), which
+                    // returns `None` only after the sender drops.
+                    // So if Eof arrives and then the sender drops
+                    // immediately (the observed pattern with
+                    // `-T user@host false`), a single follow-up
+                    // `wait()` returns `None` — we'd miss a buffered
+                    // ExitStatus. The inner loop reads everything
+                    // that's already queued, with the timeout
+                    // bounding how long we wait for the sender to
+                    // deliver any messages it's still holding.
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                        loop {
+                            match rx.wait().await {
+                                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                                    code = exit_status as i32;
+                                }
+                                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                                _ => {} // drain any other trailing messages
+                            }
+                        }
+                    })
+                    .await;
                     break;
                 }
+                None => break,
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     code = exit_status as i32;
                     break;
