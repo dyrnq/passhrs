@@ -190,7 +190,7 @@ ssh:   passhrs:   description
  -e    ❌  —        Escape character
  -F    ❌  —        SSH config file
  -G    ❌  —        Print config and exit
- -g    ❌  —        Allow remote hosts to connect local forwards
+ -g    ✅  -g       Allow remote hosts to connect local forwards
  -I    ❌  —        PKCS#11
  -K    ❌  —        Enable GSSAPI delegation
  -k    ❌  —        Disable GSSAPI delegation
@@ -213,7 +213,7 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **24**| **56%** |
+| **Implemented**       | **25**| **58%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
 | Not implemented       | ~21   | 49%   |
 

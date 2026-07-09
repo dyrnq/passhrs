@@ -166,6 +166,14 @@ impl StderrCapture {
         }
     }
 
+    /// Return the captured stderr as a `String`. Tests use this when
+    /// they need to *assert on the contents*, not just dump them on
+    /// failure. Empty if the file is missing or unreadable (which is
+    /// the safe shape for `assert!(text.contains(...)`).
+    fn read(&self) -> String {
+        std::fs::read_to_string(&self.path).unwrap_or_default()
+    }
+
     /// Consume self and dump the captured stderr. Use on the happy
     /// path when you still want to see passhrs stderr for debugging,
     /// or rely on the Drop impl (which suppresses when finish is
@@ -2457,6 +2465,116 @@ fn test_remote_forward_data_plane_round_trip() {
     // finish() consumes the capture so the Drop impl does not also
     // dump stderr on the happy path.
     stderr_cap.finish();
+}
+
+// -g / --gateway-ports: when set, -L binds 0.0.0.0 (instead of the
+// default 127.0.0.1) so a remote host can route traffic into the
+// local listener. The shape mirrors `test_local_forward_data_plane_round_trip`
+// (loops back to a same-process TCP listener via the SSH tunnel) but
+// adds a distinguishing assertion: passhrs's stderr must contain
+// `-L listening on 0.0.0.0:<local_port>`. Without -g the log would
+// say `-L listening on 127.0.0.1:<local_port>` — that non-gateway
+// baseline is already covered by the existing data-plane test, so
+// we don't repeat it here.
+//
+// Cross-platform-portable because the data-plane end is loopback on
+// every OS; only the bind-side semantics differ.
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_gateway_ports_binds_wildcard() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    // Echo target reachable via the SSH tunnel.
+    let remote_port = pick_unused_port();
+    let remote_listener =
+        std::net::TcpListener::bind(("127.0.0.1", remote_port)).expect("bind remote listener");
+    let echoed: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let echoed_w = echoed.clone();
+    let remote_thread = thread::spawn(move || {
+        let (mut stream, _) = remote_listener.accept().expect("remote accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set_read_timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set_write_timeout");
+        let mut buf = vec![0u8; 16];
+        stream.read_exact(&mut buf).expect("echo read");
+        stream.write_all(&buf).expect("echo write");
+        *echoed_w.lock().unwrap() = Some(buf);
+    });
+
+    let local_port = pick_unused_port();
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-vv".to_string(),
+        "-g".to_string(),
+        "-L".to_string(),
+        format!("{}:127.0.0.1:{}", local_port, remote_port),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut args);
+    let (mut phr, stderr_cap) = StderrCapture::spawn(BIN, &args);
+
+    let client = (|| -> Option<std::net::TcpStream> {
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", local_port)) {
+                return Some(s);
+            }
+        }
+        None
+    })()
+    .expect("-L listener never came up");
+    let mut client = client;
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("client set_read_timeout");
+
+    let payload: [u8; 16] = *b"hello-G-test-oke";
+    client.write_all(&payload).expect("client write");
+    let mut rx = [0u8; 16];
+    client.read_exact(&mut rx).expect("client read");
+    assert_eq!(rx, payload, "-L with -g did not echo back the same bytes");
+
+    remote_thread.join().expect("remote thread join");
+    assert_eq!(
+        echoed.lock().unwrap().as_deref(),
+        Some(&payload[..]),
+        "remote listener received wrong bytes"
+    );
+
+    drop(client);
+    let _ = phr.kill();
+    let _ = phr.wait();
+    let stderr_text = stderr_cap.read();
+
+    // Distinguishing assertion: -g flipped the default bind to wildcard.
+    // Without -g this log line would say `127.0.0.1:<local_port>` instead.
+    let expected = format!("-L listening on 0.0.0.0:{}", local_port);
+    assert!(
+        stderr_text.contains(&expected),
+        "expected stderr to contain {:?}; got stderr:\n{}",
+        expected,
+        stderr_text
+    );
+    let wrong = format!("-L listening on 127.0.0.1:{}", local_port);
+    assert!(
+        !stderr_text.contains(&wrong),
+        "stderr unexpectedly contained loopback bind {:?} — -g not applied.\nstderr:\n{}",
+        wrong,
+        stderr_text
+    );
 }
 
 #[test]

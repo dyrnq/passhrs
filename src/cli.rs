@@ -57,6 +57,14 @@ pub(crate) struct Cli {
     pub(crate) disable_pty: bool,
     #[arg(short = 'L', long = "local-forward", num_args = 1)]
     pub(crate) local_forward: Vec<String>,
+    /// Allow remote hosts to connect to locally-forwarded ports.
+    /// Matches OpenSSH `-g` / `-o GatewayPorts=yes`. By default,
+    /// `-L` and `-D` bind `127.0.0.1` only (loopback); with `-g`
+    /// they bind `0.0.0.0` so a remote host can route traffic into
+    /// the listener. Explicit bind addresses (`-L 1.2.3.4:...`)
+    /// are unaffected.
+    #[arg(short = 'g', long = "gateway-ports")]
+    pub(crate) gateway_ports: bool,
     #[arg(short = 'R', long = "remote-forward", num_args = 1)]
     pub(crate) remote_forward: Vec<String>,
     #[arg(long = "identity-passphrase")]
@@ -222,12 +230,13 @@ pub(crate) fn parse_proxy_jump(spec: &str) -> Result<ProxyJumpSpec> {
     Ok(ProxyJumpSpec { user, host, port })
 }
 
-pub(crate) fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
+pub(crate) fn parse_forward_spec(spec: &str, gateway_ports: bool) -> Result<ForwardSpec> {
     let spec = spec.trim();
 
     // Determine the optional bind address and the remaining
     // "port:host:hostport" core. Supported forms:
     //   port:host:hostport                 -> bind defaults to 127.0.0.1
+    //                                      (or 0.0.0.0 when gateway_ports=true)
     //   bind_addr:port:host:hostport       -> plain bind address
     //   [bind_addr]:port:host:hostport     -> bracketed bind (e.g. IPv6)
     let (bind_addr, core) = if let Some(s) = spec.strip_prefix('[') {
@@ -246,7 +255,14 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
         // first field is a bind address.
         let first = spec.split(':').next().unwrap_or("");
         if first.parse::<u16>().is_ok() {
-            ("127.0.0.1".to_string(), spec.to_string())
+            (
+                if gateway_ports {
+                    "0.0.0.0".to_string()
+                } else {
+                    "127.0.0.1".to_string()
+                },
+                spec.to_string(),
+            )
         } else {
             let (b, r) = spec
                 .split_once(':')
@@ -294,8 +310,10 @@ pub(crate) fn parse_forward_spec(spec: &str) -> Result<ForwardSpec> {
     })
 }
 
-pub(crate) fn parse_dynamic_spec(spec: &str) -> Result<DynamicForwardSpec> {
+pub(crate) fn parse_dynamic_spec(spec: &str, gateway_ports: bool) -> Result<DynamicForwardSpec> {
     if let Some(colon_idx) = spec.find(':') {
+        // Explicit bind address wins; gateway_ports does not override
+        // a user-provided bind (same as parse_forward_spec).
         Ok(DynamicForwardSpec {
             bind_addr: spec[..colon_idx].to_string(),
             bind_port: spec[colon_idx + 1..]
@@ -304,7 +322,11 @@ pub(crate) fn parse_dynamic_spec(spec: &str) -> Result<DynamicForwardSpec> {
         })
     } else {
         Ok(DynamicForwardSpec {
-            bind_addr: "127.0.0.1".into(),
+            bind_addr: if gateway_ports {
+                "0.0.0.0".into()
+            } else {
+                "127.0.0.1".into()
+            },
             bind_port: spec.parse().context("invalid SOCKS port")?,
         })
     }
@@ -424,6 +446,7 @@ pub(crate) fn print_help() {
     println!("  -H <spec>        HTTP CONNECT proxy (bind:port)");
     println!("  -E <file>        Log file");
     println!("  -f               Fork to background");
+    println!("  -g               Allow remote hosts to connect local forwards (0.0.0.0)");
     println!("  -i <file>        Identity file");
     println!("  -J <jump>        Proxy jump");
     println!("  -L <spec>        Local forward ([bind:]port:host:port)");
@@ -463,11 +486,11 @@ pub(crate) fn print_help() {
 
 #[cfg(test)]
 mod forward_spec_tests {
-    use super::parse_forward_spec;
+    use super::{parse_dynamic_spec, parse_forward_spec};
 
     #[test]
     fn plain_port_host_port() {
-        let f = parse_forward_spec("9090:localhost:90").unwrap();
+        let f = parse_forward_spec("9090:localhost:90", false).unwrap();
         assert_eq!(f.bind_addr, "127.0.0.1");
         assert_eq!(f.bind_port, 9090);
         assert_eq!(f.target_host, "localhost");
@@ -478,7 +501,7 @@ mod forward_spec_tests {
     fn regression_target_host_not_polluted_by_bind_port() {
         // Previously parsed target_host as "34567:localhost" because the bind
         // port was not peeled off before extracting the host.
-        let f = parse_forward_spec("34567:localhost:22222").unwrap();
+        let f = parse_forward_spec("34567:localhost:22222", false).unwrap();
         assert_eq!(f.bind_port, 34567);
         assert_eq!(f.target_host, "localhost");
         assert_eq!(f.target_port, 22222);
@@ -486,7 +509,7 @@ mod forward_spec_tests {
 
     #[test]
     fn plain_bind_address() {
-        let f = parse_forward_spec("0.0.0.0:8080:localhost:80").unwrap();
+        let f = parse_forward_spec("0.0.0.0:8080:localhost:80", false).unwrap();
         assert_eq!(f.bind_addr, "0.0.0.0");
         assert_eq!(f.bind_port, 8080);
         assert_eq!(f.target_host, "localhost");
@@ -495,7 +518,7 @@ mod forward_spec_tests {
 
     #[test]
     fn bracketed_ipv6_bind_address() {
-        let f = parse_forward_spec("[::1]:8080:localhost:80").unwrap();
+        let f = parse_forward_spec("[::1]:8080:localhost:80", false).unwrap();
         assert_eq!(f.bind_addr, "::1");
         assert_eq!(f.bind_port, 8080);
         assert_eq!(f.target_host, "localhost");
@@ -504,7 +527,7 @@ mod forward_spec_tests {
 
     #[test]
     fn bracketed_ipv6_target_host() {
-        let f = parse_forward_spec("9090:[::1]:80").unwrap();
+        let f = parse_forward_spec("9090:[::1]:80", false).unwrap();
         assert_eq!(f.bind_addr, "127.0.0.1");
         assert_eq!(f.bind_port, 9090);
         assert_eq!(f.target_host, "::1");
@@ -514,9 +537,78 @@ mod forward_spec_tests {
     #[test]
     fn invalid_specs_error() {
         // Missing target port.
-        assert!(parse_forward_spec("9090:localhost").is_err());
+        assert!(parse_forward_spec("9090:localhost", false).is_err());
         // Non-numeric bind port with no bind address.
-        assert!(parse_forward_spec("9090:localhost:notaport").is_err());
+        assert!(parse_forward_spec("9090:localhost:notaport", false).is_err());
+    }
+
+    // ---- -g / --gateway-ports: default-bind 0.0.0.0 ----
+    //
+    // When `gateway_ports=true` is threaded through the parser and the
+    // user did NOT supply an explicit bind address, the default bind
+    // address becomes 0.0.0.0 (the same default OpenSSH uses with
+    // `-g` or `-o GatewayPorts=yes`). An explicit bind address from
+    // the user always wins. Symmetric coverage for parse_dynamic_spec
+    // (used by `-D` and `-H`).
+
+    #[test]
+    fn gateway_ports_default_wildcard_when_no_explicit_bind() {
+        let f = parse_forward_spec("8118:localhost:80", true).unwrap();
+        assert_eq!(
+            f.bind_addr, "0.0.0.0",
+            "gateway_ports=true must default to 0.0.0.0"
+        );
+        assert_eq!(f.bind_port, 8118);
+    }
+
+    #[test]
+    fn gateway_ports_explicit_bind_wins() {
+        let f = parse_forward_spec("192.168.1.5:8118:localhost:80", true).unwrap();
+        assert_eq!(
+            f.bind_addr, "192.168.1.5",
+            "explicit bind must survive gateway_ports=true"
+        );
+    }
+
+    #[test]
+    fn gateway_ports_explicit_bracketed_ipv6_wins() {
+        let f = parse_forward_spec("[::1]:8118:localhost:80", true).unwrap();
+        assert_eq!(
+            f.bind_addr, "::1",
+            "explicit bracketed IPv6 bind must survive"
+        );
+    }
+
+    #[test]
+    fn no_gateway_ports_default_loopback() {
+        // Regression guard for the existing default. The flag's
+        // false branch must continue to produce 127.0.0.1 — i.e.
+        // flipping to 0.0.0.0 requires an explicit opt-in.
+        let f = parse_forward_spec("8118:localhost:80", false).unwrap();
+        assert_eq!(f.bind_addr, "127.0.0.1");
+    }
+
+    #[test]
+    fn dynamic_gateway_ports_default_wildcard_when_bare_port() {
+        // `-D 1080` — bare SOCKS spec, no explicit bind.
+        let d = parse_dynamic_spec("1080", true).unwrap();
+        assert_eq!(d.bind_addr, "0.0.0.0");
+        assert_eq!(d.bind_port, 1080);
+    }
+
+    #[test]
+    fn dynamic_no_gateway_ports_default_loopback_when_bare_port() {
+        let d = parse_dynamic_spec("1080", false).unwrap();
+        assert_eq!(d.bind_addr, "127.0.0.1");
+        assert_eq!(d.bind_port, 1080);
+    }
+
+    #[test]
+    fn dynamic_explicit_bind_wins_regardless_of_gateway_ports() {
+        let d = parse_dynamic_spec("0.0.0.0:1080", true).unwrap();
+        assert_eq!(d.bind_addr, "0.0.0.0");
+        let d = parse_dynamic_spec("127.0.0.1:1080", true).unwrap();
+        assert_eq!(d.bind_addr, "127.0.0.1");
     }
 }
 
