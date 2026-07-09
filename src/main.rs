@@ -276,6 +276,18 @@ async fn run(cli: Cli) -> Result<()> {
     builder.init();
 
     let opts = parse_ssh_options(&cli.ssh_option);
+    // `-g` / `-o GatewayPorts=yes` — flip the default bind of `-L` and
+    // `-D` from loopback (127.0.0.1) to wildcard (0.0.0.0) so remote
+    // hosts can route traffic into the local listener. Declared
+    // BEFORE the forward-spec parsing block below because the parser
+    // reads it. We OR the CLI flag with the `-o` value (last specified
+    // wins per OpenSSH; on the cli, `-g` between `-o` flags still
+    // wins because `cli.gateway_ports` is independent of `opts`).
+    let gateway_ports = cli.gateway_ports
+        || opts
+            .get("gatewayports")
+            .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
+            .unwrap_or(false);
     let dest_str = cli.destination.as_deref().unwrap_or("");
     if dest_str.is_empty()
         && cli.local_forward.is_empty()
@@ -340,12 +352,12 @@ async fn run(cli: Cli) -> Result<()> {
     let local_forwards: Vec<ForwardSpec> = cli
         .local_forward
         .iter()
-        .map(|s| parse_forward_spec(s))
+        .map(|s| parse_forward_spec(s, gateway_ports))
         .collect::<Result<Vec<_>>>()?;
     let remote_forwards: Vec<ForwardSpec> = cli
         .remote_forward
         .iter()
-        .map(|s| parse_forward_spec(s))
+        .map(|s| parse_forward_spec(s, gateway_ports))
         .collect::<Result<Vec<_>>>()?;
     let mut remote_forward_map: HashMap<u16, ForwardSpec> = HashMap::new();
     for fw in &remote_forwards {
@@ -354,12 +366,12 @@ async fn run(cli: Cli) -> Result<()> {
     let dynamic_forwards: Vec<DynamicForwardSpec> = cli
         .dynamic_forward
         .iter()
-        .map(|s| parse_dynamic_spec(s))
+        .map(|s| parse_dynamic_spec(s, gateway_ports))
         .collect::<Result<Vec<_>>>()?;
     let http_connects: Vec<DynamicForwardSpec> = cli
         .http_proxy_connect
         .iter()
-        .map(|s| parse_dynamic_spec(s))
+        .map(|s| parse_dynamic_spec(s, gateway_ports))
         .collect::<Result<Vec<_>>>()?;
 
     let user_known_hosts = std::sync::Arc::new(opts.get("userknownhostsfile").cloned());

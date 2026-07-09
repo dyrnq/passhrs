@@ -56,6 +56,63 @@ fn test_control_socket() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
+// `-g / --gateway-ports`: flips the default bind of `-L` and `-D`
+// from loopback (127.0.0.1) to wildcard (0.0.0.0). Surfaced
+// here as a clap-acceptance test; the bind-side semantics are
+// verified end-to-end in tests/15 (test_gateway_ports_binds_wildcard).
+#[test]
+fn test_gateway_ports_short() {
+    let (_, _, stderr) = run_phr(&["-g", "-L", "8118:localhost:80", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_gateway_ports_long() {
+    let (_, _, stderr) = run_phr(&[
+        "--gateway-ports",
+        "-L",
+        "8118:localhost:80",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_gateway_ports_via_o_option() {
+    // `-o GatewayPorts=yes` is the long-form alias OpenSSH accepts.
+    let (_, _, stderr) = run_phr(&[
+        "-o",
+        "GatewayPorts=yes",
+        "-L",
+        "8118:localhost:80",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_gateway_ports_via_o_option_no() {
+    // `-o GatewayPorts=no` must also be accepted (loopback default).
+    let (_, _, stderr) = run_phr(&[
+        "-o",
+        "GatewayPorts=no",
+        "-L",
+        "8118:localhost:80",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_gateway_ports_with_dynamic() {
+    // `-g` should also flip the default bind of `-D`.
+    let (_, _, stderr) = run_phr(&["-g", "-D", "1080", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
 #[test]
 fn test_login_name() {
     let (_, _, stderr) = run_phr(&["-l", "admin", "serverhost", "id"]);
