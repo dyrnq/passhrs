@@ -657,16 +657,31 @@ async fn run(cli: Cli) -> Result<()> {
 
             target_handle
         } else {
-            // Direct connection mode
-            let connect_fut = client::connect(config, (host.as_str(), port), handler);
+            // Direct connection mode. `-b` / `-o BindAddress=…`
+            // are honored here only — the ProxyJump path above
+            // tunnels through sshd on the jump host via
+            // `channel_open_direct_tcpip`, which has no outbound
+            // TCP socket for `-b` to bind. The CLI flag and the
+            // long-form option collapse into a single
+            // `bind_address: Option<&str>` and pass through
+            // `ssh::connect_with_bind`, which does the
+            // `TcpSocket::new → bind → connect` dance before
+            // handing the stream to `client::connect_stream` (the
+            // same entry ProxyJump uses).
+            let bind_address = cli.bind_address.as_deref().or_else(|| {
+                opts.get("bindaddress")
+                    .map(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+            });
+            let connect_fut =
+                ssh::connect_with_bind(config, host.as_str(), port, handler, bind_address);
             let h = if connect_timeout > 0 {
                 tokio::time::timeout(std::time::Duration::from_secs(connect_timeout), connect_fut)
                     .await
                     .with_context(|| format!("Connection timed out after {}s", connect_timeout))?
             } else {
                 connect_fut.await
-            }
-            .context("Failed to connect to SSH server")?;
+            }?;
             h
         };
 

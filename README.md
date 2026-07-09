@@ -185,7 +185,7 @@ ssh:   passhrs:   description
  -v    ✅  -v       Verbose output (-vv, -vvv)
 
  -B    ❌  —        Bind interface
- -b    ❌  —        Bind address
+ -b    ✅  -b       Source bind address for SSH connection (or -o BindAddress=)
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ❌  —        Escape character
  -F    ❌  —        SSH config file
@@ -213,7 +213,7 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **26**| **60%** |
+| **Implemented**       | **27**| **63%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
 | Not implemented       | ~21   | 49%   |
 

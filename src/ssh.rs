@@ -361,6 +361,105 @@ impl Handler for SshHandler {
 // single point to extend.
 // ======================================================================
 
+// ======================================================================
+// Outbound connection with optional source bind (`-b` / `-o
+// BindAddress=<address>`).
+//
+// `russh::client::connect(addr, ...)` builds the TCP socket
+// internally and lets the kernel pick the source IP, which is
+// fine when the host has one interface but unhelpful on
+// multi-homed hosts. To honor `-b <addr>` we have to build the
+// socket ourselves, `bind()` it to the local address, and
+// `connect()` it to the remote — only then hand the resulting
+// stream to `client::connect_stream`, the same entry the
+// ProxyJump path uses (`src/main.rs:592`).
+//
+// Family choice: tokio's `TcpSocket::new_v4()` and `new_v6()`
+// pick the address family at construction; `bind` will fail
+// with `EAFNOSUPPORT` if the local address is from the wrong
+// family. We resolve the local address via
+// `tokio::net::lookup_host` and pick `new_v4()` vs `new_v6()`
+// from the resolved `SocketAddr`'s `is_ipv4()`.
+//
+// `-b ""` (empty) is OpenSSH's "let the kernel pick" form and
+// behaves identically to not passing `-b`; the `is_some_and`
+// below folds both into the no-bind path.
+// ======================================================================
+
+/// Connect to `host:port` over SSH, optionally binding the local
+/// source address to `bind_address` (OpenSSH `-b`).
+///
+/// `bind_address` semantics:
+/// - `Some("")` or `None` → no `bind()`, fall through to
+///   `russh::client::connect` (kernel picks the source).
+/// - `Some(addr)` → resolve `addr` via libc, build a `TcpSocket`
+///   of the matching family, `bind()` to the resolved address,
+///   `connect()` to `host:port`, then hand the stream to
+///   `client::connect_stream` (the same path ProxyJump uses).
+pub(crate) async fn connect_with_bind(
+    config: Arc<russh::client::Config>,
+    host: &str,
+    port: u16,
+    handler: SshHandler,
+    bind_address: Option<&str>,
+) -> Result<russh::client::Handle<SshHandler>> {
+    use anyhow::Context;
+    use russh::client;
+
+    let needs_bind = bind_address.is_some_and(|s| !s.is_empty());
+    if !needs_bind {
+        return client::connect(config, (host, port), handler)
+            .await
+            .context("Failed to connect to SSH server");
+    }
+    let bind_str = bind_address.expect("needs_bind implies Some");
+    let mut local_addrs = tokio::net::lookup_host(bind_str)
+        .await
+        .with_context(|| format!("-b: failed to resolve bind address {}", bind_str))?;
+    let local = local_addrs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("-b: no addresses for {}", bind_str))?;
+    // Resolve the remote `host:port` to a SocketAddr so the
+    // TcpSocket can `connect()` it. We need the address of the
+    // same family the local bind resolved to — kernel will refuse
+    // a v4→v6 (or v6→v4) connect. If the local bind resolved to
+    // multiple families, prefer the matching one; if none match,
+    // surface a clear error rather than letting the OS produce a
+    // confusing "Network is unreachable".
+    let mut remote_addrs = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("-b: failed to resolve {}:{}", host, port))?;
+    let remote = remote_addrs
+        .find(|a| a.is_ipv4() == local.is_ipv4())
+        .or_else(|| remote_addrs.next())
+        .ok_or_else(|| anyhow::anyhow!("-b: no addresses for {}:{}", host, port))?;
+    if remote.is_ipv4() != local.is_ipv4() {
+        bail!(
+            "-b: local bind family ({}) does not match any resolved \
+             address for {}:{}",
+            if local.is_ipv4() { "v4" } else { "v6" },
+            host,
+            port
+        );
+    }
+    let socket = if local.is_ipv4() {
+        tokio::net::TcpSocket::new_v4().context("-b: failed to create IPv4 socket")?
+    } else {
+        tokio::net::TcpSocket::new_v6().context("-b: failed to create IPv6 socket")?
+    };
+    socket
+        .bind(local)
+        .with_context(|| format!("-b: failed to bind to {}", local))?;
+    let stream = socket
+        .connect(remote)
+        .await
+        .with_context(|| format!("-b: connect to {} failed", remote))?;
+    info!("Bound source to {} and connected to {}", local, remote);
+    client::connect_stream(config, stream, handler)
+        .await
+        .context("Failed to connect to SSH server (after -b bind)")
+}
+
 #[cfg(unix)]
 async fn connect_agent_stream(path: &Path) -> Result<tokio::net::UnixStream> {
     use anyhow::Context;

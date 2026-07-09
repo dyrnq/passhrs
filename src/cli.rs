@@ -71,6 +71,18 @@ pub(crate) struct Cli {
     /// are unaffected.
     #[arg(short = 'g', long = "gateway-ports")]
     pub(crate) gateway_ports: bool,
+    /// Use `<address>` as the **source** address for the outbound
+    /// TCP connection to sshd. Matches OpenSSH `-b` / `-o
+    /// BindAddress=<address>`. Useful on multi-homed hosts when
+    /// you need the connection to leave via a specific interface
+    /// (e.g. `-b 192.0.2.10` to make the kernel bind the source
+    /// IP before SYN). Distinct from `-g` (which sets the bind of
+    /// the local-forward listener, not the SSH connection) and
+    /// from `-L <bind>:…` (listener side of `-L`, again not the
+    /// SSH connection). Empty string (`-b ""`) is accepted and
+    /// behaves as if `-b` was not passed — same as OpenSSH.
+    #[arg(short = 'b', long = "bind", value_name = "address")]
+    pub(crate) bind_address: Option<String>,
     #[arg(short = 'R', long = "remote-forward", num_args = 1)]
     pub(crate) remote_forward: Vec<String>,
     #[arg(long = "identity-passphrase")]
@@ -445,6 +457,7 @@ pub(crate) fn print_help() {
     println!("OPTIONS:");
     println!("  -4, -6           IPv4/IPv6 only");
     println!("  -A, -a           Agent forward on/off");
+    println!("  -b <address>     Source bind address for SSH connection (or -o BindAddress=)");
     println!("  -c <list>        Cipher spec (comma-sep, priority order)");
     println!("  -m <list>        MAC spec (comma-sep, priority order)");
     println!("  -C               Compression");

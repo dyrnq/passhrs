@@ -309,6 +309,50 @@ fn test_compression_with_rsync() {
 // better expressed via the shell's job control). This test pins the
 // accept-by-clap surface so a clap-parser regression gets caught
 // before the rest of issue #27's flow shows up at the user.
+// `-b <address>` / `--bind <address>`: source bind address for
+// the outbound SSH connection. Mirrors OpenSSH `-b` and the
+// long-form `-o BindAddress=<address>`. Surfaced here as
+// clap-acceptance tests; the bind-side semantics (real
+// `TcpSocket::bind` before `connect`) are verified end-to-end in
+// tests/15 via the same `StderrCapture` helper that
+// `test_gateway_ports_binds_wildcard` uses.
+#[test]
+fn test_bind_address_short() {
+    let (_, _, stderr) = run_phr(&["-b", "127.0.0.1", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_bind_address_long() {
+    let (_, _, stderr) = run_phr(&["--bind", "127.0.0.1", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_bind_address_via_o_option() {
+    // `-o BindAddress=…` is the long-form alias OpenSSH accepts.
+    let (_, _, stderr) = run_phr(&["-o", "BindAddress=127.0.0.1", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_bind_address_empty_string_accepted() {
+    // `-b ""` is OpenSSH's "let the kernel pick" form. The CLI
+    // must accept it without error; `connect_with_bind` treats
+    // empty as `None`.
+    let (_, _, stderr) = run_phr(&["-b", "", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_bind_address_ipv6() {
+    // IPv6 bind should also be accepted by clap. The connect
+    // path resolves the address and picks `TcpSocket::new_v6()`
+    // for `is_ipv6()` resolved locals.
+    let (_, _, stderr) = run_phr(&["-b", "::1", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
 #[test]
 fn test_debug_all_flag() {
     let (_, _, stderr) = run_phr(&["--debug-all", "user@localhost", "id"]);
