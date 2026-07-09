@@ -553,7 +553,27 @@ pub(crate) async fn run_session(channel: Channel<Msg>, redirect_stdin: bool) -> 
                     let _ = stderr.write_all(data).await;
                     let _ = stderr.flush().await;
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    // Eof/Close can arrive BEFORE ExitStatus for non-PTY
+                    // execs (sshd closes the channel as soon as the
+                    // remote shell's last fd is gone, and ExitStatus is
+                    // a separate SSH_MSG_CHANNEL_REQUEST message that
+                    // races the close). Without this grace window the
+                    // remote exit code is silently swallowed and
+                    // passhrs exits 0 — Issue #41.
+                    //
+                    // 200ms is enough for sshd to deliver ExitStatus
+                    // in the observed CI race window (it usually
+                    // arrives within ~10ms); if it doesn't, we fall
+                    // back to the default code=0 and the channel
+                    // really is dead.
+                    if let Ok(Some(ChannelMsg::ExitStatus { exit_status })) =
+                        tokio::time::timeout(std::time::Duration::from_millis(200), rx.wait()).await
+                    {
+                        code = exit_status as i32;
+                    }
+                    break;
+                }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     code = exit_status as i32;
                     break;

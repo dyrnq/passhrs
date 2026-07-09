@@ -1967,17 +1967,8 @@ fn test_disable_pty_flag() {
     }
     let d = dest();
     // -T must suppress PTY allocation so the remote `tty` command
-    // writes "not a tty" to stdout (rather than a /dev/pts/N path).
-    // Direct inverse of test_force_tty_flag above.
-    //
-    // NB: we intentionally do NOT assert on the local process
-    // exit code. passhrs's `run_session` (src/ssh.rs:529) breaks
-    // the reader loop on ChannelMsg::Eof without waiting for
-    // ChannelMsg::ExitStatus — so the remote `tty` exit 1 is lost
-    // and passhrs exits 0. That's a pre-existing bug surfaced by
-    // this test, NOT by `-T`. Tracked separately; for now we
-    // verify the PTY-suppression behavior via the stdout content,
-    // which is the actual proof.
+    // writes "not a tty" to stdout (rather than a /dev/pts/N path)
+    // and exits 1. Direct inverse of test_force_tty_flag above.
     let a = [
         "-p",
         PORT,
@@ -1989,16 +1980,87 @@ fn test_disable_pty_flag() {
         &d,
         "tty",
     ];
-    let (_ok, stdout, _stderr) = run_phr(&a);
+    let (ok, stdout, stderr) = run_phr(&a);
+    assert!(
+        !ok,
+        "-T should skip PTY; remote `tty` (exit 1) should propagate. \
+         stdout={:?} stderr={:?}",
+        stdout, stderr
+    );
     assert!(
         stdout.contains("not a tty"),
-        "-T should skip PTY; remote `tty` should print 'not a tty', got stdout={:?}",
+        "expected 'not a tty' in stdout, got: {}",
         stdout
     );
     assert!(
         !stdout.contains("/dev/"),
         "remote tty should not show a /dev device path, got: {}",
         stdout
+    );
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_remote_exit_code_propagation() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    // Issue #41 regression: passhrs must propagate the remote
+    // command's exit code even for non-PTY execs that exit
+    // non-zero. `false` exits 1 on every Unix. We use `-T` to
+    // force the no-PTY path because that's where the Eof →
+    // ExitStatus race is exposed (sshd closes the channel fast).
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-T",
+        &d,
+        "false",
+    ];
+    let (ok, _stdout, stderr) = run_phr(&a);
+    assert!(
+        !ok,
+        "remote `false` (exit 1) must propagate as passhrs exit 1. stderr={}",
+        stderr
+    );
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_remote_exit_code_zero_propagation() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let d = dest();
+    // Companion to test_remote_exit_code_propagation: confirm
+    // exit-0 still propagates as exit-0 over the no-PTY path after
+    // the Issue #41 grace-window fix. (Without the fix, exit 0
+    // also worked by accident — `code` defaulted to 0 — but
+    // pinning both directions guards against the grace window
+    // accidentally swallowing ExitStatus=0.)
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-T",
+        &d,
+        "true",
+    ];
+    let (ok, _stdout, stderr) = run_phr(&a);
+    assert!(
+        ok,
+        "remote `true` (exit 0) must propagate as passhrs exit 0. stderr={}",
+        stderr
     );
 }
 
