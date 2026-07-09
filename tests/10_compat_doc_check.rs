@@ -14,7 +14,7 @@ fn test_help_covers_all_options() {
     // SSH 兼容参数
     for opt in &[
         "-L", "-R", "-D", "-i", "-o", "-p", "-N", "-f", "-C", "-v", "-q", "-E", "-J", "-t", "-T",
-        "-n", "-4", "-6", "-A", "-a", "-l", "-S", "-H", "-V", "-c", "-m", "-g", "-Q",
+        "-n", "-4", "-6", "-A", "-a", "-l", "-S", "-H", "-V", "-c", "-m", "-g", "-Q", "-b",
     ] {
         assert!(help_text.contains(opt), "help should mention {}", opt);
     }

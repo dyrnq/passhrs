@@ -2579,6 +2579,58 @@ fn test_gateway_ports_binds_wildcard() {
 
 #[test]
 #[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_bind_address_short() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    // `-b 127.0.0.1` must trigger the bind-source path in
+    // `ssh::connect_with_bind`, which logs at INFO level
+    // `Bound source to <local> and connected to <remote>`. We
+    // assert on that line. Without `-b` the log line is absent
+    // (the no-bind path in `connect_with_bind` short-circuits
+    // before the info!).
+    //
+    // We use `-N` so the client sits connected but does nothing
+    // — the bind happens during the initial TCP connect, well
+    // before any channel is opened.
+    let d = format!("{}@{}", USER, HOST);
+    let mut args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-v".to_string(),
+        "-b".to_string(),
+        "127.0.0.1".to_string(),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut args);
+    let (mut phr, stderr_cap) = StderrCapture::spawn(BIN, &args);
+
+    // Give the SSH handshake a moment to start so the bind log
+    // line is flushed to the captured stderr.
+    thread::sleep(Duration::from_secs(2));
+
+    let _ = phr.kill();
+    let _ = phr.wait();
+    let stderr_text = stderr_cap.read();
+
+    let expected = "Bound source to 127.0.0.1:";
+    assert!(
+        stderr_text.contains(expected),
+        "expected stderr to contain {:?}; got stderr:\n{}",
+        expected,
+        stderr_text
+    );
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
 fn test_socks5_proxy_spawn() {
     if !sshd_ok() {
         eprintln!("SKIP: no container");
