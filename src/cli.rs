@@ -85,6 +85,32 @@ pub(crate) struct Cli {
     pub(crate) fork: bool,
     #[arg(long = "exec-env", num_args = 1)]
     pub(crate) exec_env: Vec<String>,
+    /// Select symmetric cipher algorithm(s) for the SSH
+    /// transport. Comma-separated list in priority order.
+    /// Defaults to russh's built-in order
+    /// (chacha20-poly1305, aes256-gcm, aes256-ctr, …).
+    ///
+    /// Example: `-c chacha20-poly1305@openssh.com,aes256-gcm@openssh.com`
+    #[arg(
+        short = 'c',
+        long = "cipher-spec",
+        value_name = "spec",
+        value_delimiter = ','
+    )]
+    pub(crate) cipher_spec: Vec<String>,
+    /// Select MAC algorithm(s) for the SSH transport.
+    /// Comma-separated list in priority order. Defaults to
+    /// russh's built-in order (hmac-sha2-512-etm,
+    /// hmac-sha2-256-etm, hmac-sha2-512, hmac-sha2-256).
+    ///
+    /// Example: `-m hmac-sha2-256,hmac-sha2-512`
+    #[arg(
+        short = 'm',
+        long = "mac-spec",
+        value_name = "spec",
+        value_delimiter = ','
+    )]
+    pub(crate) mac_spec: Vec<String>,
     #[arg(
         long = "shell",
         value_parser = ["sh", "cmd"],
@@ -391,6 +417,8 @@ pub(crate) fn print_help() {
     println!("OPTIONS:");
     println!("  -4, -6           IPv4/IPv6 only");
     println!("  -A, -a           Agent forward on/off");
+    println!("  -c <list>        Cipher spec (comma-sep, priority order)");
+    println!("  -m <list>        MAC spec (comma-sep, priority order)");
     println!("  -C               Compression");
     println!("  -D <spec>        SOCKS5 proxy (bind:port)");
     println!("  -H <spec>        HTTP CONNECT proxy (bind:port)");

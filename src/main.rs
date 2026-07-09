@@ -452,6 +452,37 @@ async fn run(cli: Cli) -> Result<()> {
             config.preferred.compression =
                 Cow::Owned(vec![russh::compression::ZLIB, russh::compression::NONE]);
         }
+        // ----- -c cipher-spec (Issue #43) -----
+        if !cli.cipher_spec.is_empty() {
+            use std::borrow::Cow;
+            let parsed: Vec<russh::cipher::Name> = cli
+                .cipher_spec
+                .iter()
+                .map(|s| {
+                    russh::cipher::Name::try_from(s.as_str()).map_err(|_| {
+                        anyhow::anyhow!(
+                            "unknown cipher: {} (see `ssh -Q cipher` for valid names)",
+                            s
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            config.preferred.cipher = Cow::Owned(parsed);
+        }
+        // ----- -m mac-spec (Issue #43) -----
+        if !cli.mac_spec.is_empty() {
+            use std::borrow::Cow;
+            let parsed: Vec<russh::mac::Name> = cli
+                .mac_spec
+                .iter()
+                .map(|s| {
+                    russh::mac::Name::try_from(s.as_str()).map_err(|_| {
+                        anyhow::anyhow!("unknown mac: {} (see `ssh -Q mac` for valid names)", s)
+                    })
+                })
+                .collect::<anyhow::Result<_>>()?;
+            config.preferred.mac = Cow::Owned(parsed);
+        }
         // Apply TCPKeepAlive default if requested without explicit ServerAliveInterval
         if tcp_keepalive && keepalive_interval.is_none() {
             config.keepalive_interval = Some(std::time::Duration::from_secs(60));

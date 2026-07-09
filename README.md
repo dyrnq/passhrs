@@ -186,7 +186,7 @@ ssh:   passhrs:   description
 
  -B    ❌  —        Bind interface
  -b    ❌  —        Bind address
- -c    ❌  —        Cipher spec
+ -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ❌  —        Escape character
  -F    ❌  —        SSH config file
  -G    ❌  —        Print config and exit
@@ -195,7 +195,7 @@ ssh:   passhrs:   description
  -K    ❌  —        Enable GSSAPI delegation
  -k    ❌  —        Disable GSSAPI delegation
  -M    ❌  —        ControlMaster mode
- -m    ❌  —        MAC algorithm
+ -m    ✅  -m       MAC algorithm (comma-separated, priority order)
  -O    ❌  —        Control command
  -Q    ❌  —        Query algorithms
  -s    ❌  —        SSH subsystem
@@ -213,16 +213,14 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **22**| **51%** |
+| **Implemented**       | **24**| **56%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
 | Not implemented       | ~21   | 49%   |
 
 ### Not Implemented — Notes
 
 **Can be added via russh (low effort):**
-- `-c` cipher / `-m` MAC: configure `Preferred`
 - `-C` compression level: flate2 feature
-- `-V` version: add `--version` flag
 
 **Semantically not fitting:** `-D` (not a proxy tool), `-W` tunnel, `-G`/`-Q` debug, `-B`/`-b`/`-e`/`-s`/`-w` (rarely used)
 
