@@ -46,6 +46,11 @@ pub(crate) struct SshHandler {
     /// reliably sees ExitStatus in the Close-then-exit-status
     /// ordering observed on ubuntu-24.04 runners. Issue #41.
     pub(crate) exit_statuses: Arc<Mutex<HashMap<russh::ChannelId, u32>>>,
+    /// OpenSSH `-y` flag. When true, `check_server_key` short-
+    /// circuits to `Ok(true)` regardless of `known_hosts` or
+    /// `strict_check` — every host key is accepted, no entry is
+    /// appended. Issue #52.
+    pub(crate) accept_all_host_keys: bool,
 }
 
 impl SshHandler {
@@ -55,6 +60,7 @@ impl SshHandler {
         port: u16,
         known_hosts_path: Option<String>,
         agent_sock_path: Option<PathBuf>,
+        accept_all_host_keys: bool,
     ) -> Self {
         Self {
             strict_check,
@@ -64,6 +70,7 @@ impl SshHandler {
             remote_forwards: HashMap::new(),
             agent_sock_path,
             exit_statuses: Arc::new(Mutex::new(HashMap::new())),
+            accept_all_host_keys,
         }
     }
 
@@ -86,6 +93,20 @@ impl Handler for SshHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
+        // OpenSSH `-y` override: unconditionally accept. Wins
+        // over both `-o StrictHostKeyChecking=yes` (which would
+        // reject) and the default "ask / accept-new" path. The
+        // WARN line is the only signal a user gets that the
+        // verification was bypassed; surfacing it on every key
+        // is intentional so `-y` is hard to enable by accident.
+        // Issue #52.
+        if self.accept_all_host_keys {
+            warn!(
+                "-y: unconditionally accepting host key for {}:{} (no check, no persist)",
+                self.host, self.port
+            );
+            return Ok(true);
+        }
         if let Some(ref path) = self.known_hosts_path {
             if path != "/dev/null" && path != "nul" {
                 match russh::keys::known_hosts::check_known_hosts_path(
@@ -413,12 +434,27 @@ pub(crate) async fn connect_with_bind(
             .context("Failed to connect to SSH server");
     }
     let bind_str = bind_address.expect("needs_bind implies Some");
-    let mut local_addrs = tokio::net::lookup_host(bind_str)
-        .await
-        .with_context(|| format!("-b: failed to resolve bind address {}", bind_str))?;
-    let local = local_addrs
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("-b: no addresses for {}", bind_str))?;
+    // OpenSSH's `-b` accepts an IP literal (or DNS name) WITHOUT
+    // a port; the kernel picks an ephemeral source port. Going
+    // through `lookup_host` requires `<host>:<port>` — passing
+    // `127.0.0.1` alone yields `invalid socket address`, which is
+    // what test_bind_address_short hit on CI. Parse as `IpAddr`
+    // first (the common case — `-b 127.0.0.1`, `-b ::1`); if that
+    // fails, fall back to `lookup_host` with port 0 appended so a
+    // DNS name still resolves. The bound `SocketAddr` ends up with
+    // port 0 either way; kernel picks the source port.
+    let local = match bind_str.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, 0),
+        Err(_) => {
+            let with_port = format!("{}:0", bind_str);
+            let mut addrs = tokio::net::lookup_host(&with_port)
+                .await
+                .with_context(|| format!("-b: failed to resolve bind address {}", bind_str))?;
+            addrs
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("-b: no addresses for {}", bind_str))?
+        }
+    };
     // Resolve the remote `host:port` to a SocketAddr so the
     // TcpSocket can `connect()` it. We need the address of the
     // same family the local bind resolved to — kernel will refuse

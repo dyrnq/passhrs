@@ -205,7 +205,7 @@ ssh:   passhrs:   description
  -w    ❌  —        Tunnel device
  -x    ❌  —        Disable X11 forwarding
  -Y    ❌  —        Trusted X11 forwarding
- -y    ❌  —        Accept all host keys
+ -y    ✅  -y       Accept all host keys (no check, no persist)
 ```
 
 ### Statistics
@@ -213,9 +213,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **27**| **63%** |
+| **Implemented**       | **28**| **65%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~21   | 49%   |
+| Not implemented       | ~20   | 47%   |
 
 ### Not Implemented — Notes
 

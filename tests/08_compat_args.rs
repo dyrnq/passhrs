@@ -353,6 +353,37 @@ fn test_bind_address_ipv6() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
+// `-y` / `--accept-all-hosts`: unconditionally accept any host
+// key. Surfaced here as clap-acceptance tests; the
+// `check_server_key` short-circuit is verified end-to-end in
+// tests/15 (test_accept_all_host_keys_skips_known_hosts).
+#[test]
+fn test_accept_all_host_keys_short() {
+    let (_, _, stderr) = run_phr(&["-y", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_accept_all_host_keys_long() {
+    let (_, _, stderr) = run_phr(&["--accept-all-hosts", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_accept_all_host_keys_with_strict() {
+    // `-y` must be accepted alongside `-o StrictHostKeyChecking=yes`
+    // (they would otherwise be contradictory; `-y` wins at runtime
+    // — the test only verifies clap accepts the combination).
+    let (_, _, stderr) = run_phr(&[
+        "-y",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "user@localhost",
+        "id",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
 #[test]
 fn test_debug_all_flag() {
     let (_, _, stderr) = run_phr(&["--debug-all", "user@localhost", "id"]);

@@ -2592,6 +2592,16 @@ fn test_bind_address_short() {
     // (the no-bind path in `connect_with_bind` short-circuits
     // before the info!).
     //
+    // `-b 127.0.0.1` is the IP-literal form (no port); OpenSSH
+    // accepts this and lets the kernel pick an ephemeral source
+    // port. Earlier we routed through `tokio::net::lookup_host`
+    // which expects `<host>:<port>` and rejected `127.0.0.1`
+    // alone with `invalid socket address`. The parse-as-`IpAddr`
+    // path in `connect_with_bind` is what made this case work.
+    // This test pins that regression so a future refactor can't
+    // route IP-literal binds back through `lookup_host` and break
+    // it silently on the next `-b` invocation.
+    //
     // We use `-N` so the client sits connected but does nothing
     // — the bind happens during the initial TCP connect, well
     // before any channel is opened.
@@ -2986,5 +2996,97 @@ fn test_unrelated_env_not_forwarded() {
         !stdout.contains("PHR_SHOULD_NOT_LEAK"),
         "unrelated env leaked to remote; env output: {}",
         stdout
+    );
+}
+
+// `-y` / `--accept-all-hosts`: unconditionally accept any host
+// key. The negative half of this test (without `-y` → strict
+// rejects → fail) is the canonical OpenSSH behavior; the positive
+// half (with `-y` → override wins, even against
+// `StrictHostKeyChecking=yes`) is what Issue #52 added. We assert
+// both halves of the WARN line that the override emits at every
+// host-key exchange — that's the only signal a user gets that the
+// verification was bypassed, and `-y` should be hard to enable by
+// accident.
+#[test]
+fn test_accept_all_host_keys_skips_known_hosts() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+
+    let d = format!("{}@{}", USER, HOST);
+
+    // ---- Negative: strict without -y must fail ----
+    //
+    // `StrictHostKeyChecking=yes` plus an empty known_hosts file
+    // (so the host key isn't pre-trusted) must reject the
+    // connection. The user-visible signal is the WARN line
+    // `passhrs::ssh: Host key verification failed for <host>`
+    // emitted from `check_server_key` BEFORE russh drops the
+    // connection — the russh-side error chain then surfaces only
+    // as a generic "Failed to connect to SSH server", which is
+    // why the classifier-formatted text `host key verification
+    // failed` does NOT appear in stderr even though that was the
+    // underlying cause. We assert on the WARN line directly.
+    let mut strict_args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-N".to_string(),
+        d.clone(),
+    ];
+    prepend_auth_args(&mut strict_args);
+    let strict_refs: Vec<&str> = strict_args.iter().map(String::as_str).collect();
+    let (ok, _stdout, stderr) = run_phr(&strict_refs);
+    assert!(
+        !ok,
+        "without -y, StrictHostKeyChecking=yes + empty known_hosts must reject, but passhrs succeeded; stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Host key verification failed"),
+        "expected the WARN log line from check_server_key in stderr; got:\n{}",
+        stderr
+    );
+
+    // ---- Positive: -y override wins against strict ----
+    //
+    // Same flag set plus `-y`: the `Handler::check_server_key`
+    // short-circuit must accept the key unconditionally, and the
+    // WARN line must appear so users see they bypassed
+    // verification. We use `-N` so the client sits connected and
+    // we can kill it cleanly after observing stderr.
+    let mut y_args: Vec<String> = vec![
+        "-p".to_string(),
+        PORT.to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=yes".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "-y".to_string(),
+        "-N".to_string(),
+        d,
+    ];
+    prepend_auth_args(&mut y_args);
+    let (mut phr, stderr_cap) = StderrCapture::spawn(BIN, &y_args);
+
+    // Give the SSH handshake a moment so the -y WARN log line
+    // is flushed to the captured stderr before we kill.
+    thread::sleep(Duration::from_secs(2));
+
+    let _ = phr.kill();
+    let _ = phr.wait();
+    let stderr_text = stderr_cap.read();
+
+    let expected = "unconditionally accepting host key for";
+    assert!(
+        stderr_text.contains(expected),
+        "expected -y WARN line {:?} in stderr; got:\n{}",
+        expected,
+        stderr_text
     );
 }
