@@ -554,6 +554,7 @@ async fn run(cli: Cli) -> Result<()> {
             port,
             (*user_known_hosts).clone(),
             agent_sock_path.clone(),
+            cli.accept_all_host_keys,
         );
         handler.remote_forwards = remote_forward_map.clone();
         // Clone the per-handler exit-status map BEFORE the handler
@@ -588,6 +589,7 @@ async fn run(cli: Cli) -> Result<()> {
                 jump.port,
                 (*user_known_hosts).clone(),
                 agent_sock_path.clone(),
+                cli.accept_all_host_keys,
             );
             let mut jump_handle = client::connect_stream(config.clone(), jump_stream, jump_handler)
                 .await
@@ -635,6 +637,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // sshd in the chain can ask us to pump bytes; both
                 // pump to the same local agent.
                 agent_sock_path.clone(),
+                cli.accept_all_host_keys,
             );
             target_handler.remote_forwards = remote_forward_map.clone();
 
@@ -782,6 +785,7 @@ async fn run(cli: Cli) -> Result<()> {
             &cli.identity_file,
             &user_known_hosts,
             strict_check,
+            cli.accept_all_host_keys,
             exit_on_fwd_failure,
             |c, s, e| Box::pin(http_connect_forward(c, s, e)),
         );
@@ -798,6 +802,7 @@ async fn run(cli: Cli) -> Result<()> {
             &cli.identity_file,
             &user_known_hosts,
             strict_check,
+            cli.accept_all_host_keys,
             exit_on_fwd_failure,
             |c, s, e| Box::pin(socks_proxy_forward(c, s, e)),
         );
@@ -834,6 +839,7 @@ async fn run(cli: Cli) -> Result<()> {
             &cli.identity_file,
             &user_known_hosts,
             strict_check,
+            cli.accept_all_host_keys,
             exit_on_fwd_failure,
             |c, s, e| Box::pin(local_port_forward(c, s, e)),
         );

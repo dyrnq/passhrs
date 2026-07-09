@@ -103,6 +103,7 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
     identity_file: &Option<std::path::PathBuf>,
     user_known_hosts: &std::sync::Arc<Option<String>>,
     strict_check: bool,
+    accept_all_host_keys: bool,
     exit_on_fwd_failure: bool,
     forward_fn: fn(Handle<SshHandler>, Spec, bool) -> Pin<Box<Fut>>,
 ) where
@@ -133,6 +134,14 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
                 // user's SSH session is the one carrying the
                 // forwarded agent, not the tunnel's data plane.
                 None,
+                // Forward tunnels ride on a pre-established SSH
+                // session; the host key was already verified by
+                // the parent session. `-y` was already honored
+                // there, so the per-tunnel handler doesn't need
+                // to override again — but we thread the flag
+                // through anyway in case passhrs ever opens a
+                // fresh handshake here.
+                accept_all_host_keys,
             );
             let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
                 Ok(c) => c,

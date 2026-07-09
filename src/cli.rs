@@ -83,6 +83,17 @@ pub(crate) struct Cli {
     /// behaves as if `-b` was not passed — same as OpenSSH.
     #[arg(short = 'b', long = "bind", value_name = "address")]
     pub(crate) bind_address: Option<String>,
+    /// Unconditionally accept any host key. Matches OpenSSH `-y`.
+    /// Stricter than `-o StrictHostKeyChecking=no`: the latter
+    /// silently appends *new* keys to `known_hosts` and rejects
+    /// *mismatches*; `-y` accepts both without writing and without
+    /// comparing. Use for one-shot connections to short-lived
+    /// hosts (ephemeral CI containers, disposable VMs) where
+    /// persisting or verifying the key is not useful. A `WARN`
+    /// line is logged on every skip so the user knows verification
+    /// was bypassed.
+    #[arg(short = 'y', long = "accept-all-hosts")]
+    pub(crate) accept_all_host_keys: bool,
     #[arg(short = 'R', long = "remote-forward", num_args = 1)]
     pub(crate) remote_forward: Vec<String>,
     #[arg(long = "identity-passphrase")]
@@ -482,6 +493,7 @@ pub(crate) fn print_help() {
     println!("  -t               Force PTY");
     println!("  -v/-vv/-vvv      Verbose");
     println!("  -V/--version     Version");
+    println!("  -y               Accept any host key (no check, no persist)");
     println!("  --connect-timeout <s>");
     println!("  --exec-env <VAR=val>  Set env on remote");
     println!("  --identity-passphrase   Key passphrase (or @file)");
