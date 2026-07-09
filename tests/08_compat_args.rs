@@ -56,6 +56,88 @@ fn test_control_socket() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
+// `-Q <what>`: list supported algorithms. No SSH traffic, no
+// destination. Each variant exits 0 and prints at least one name
+// on stdout. `-Q help` lists the accepted queries. `-Q bogus`
+// exits non-zero and stderr names the unknown query.
+#[test]
+fn test_query_cipher() {
+    let (ok, stdout, _) = run_phr(&["-Q", "cipher"]);
+    assert!(ok, "-Q cipher must exit 0");
+    assert!(
+        !stdout.trim().is_empty(),
+        "-Q cipher must print at least one algorithm name"
+    );
+}
+
+#[test]
+fn test_query_mac() {
+    let (ok, stdout, _) = run_phr(&["-Q", "mac"]);
+    assert!(ok, "-Q mac must exit 0");
+    assert!(!stdout.trim().is_empty());
+}
+
+#[test]
+fn test_query_kex() {
+    let (ok, stdout, _) = run_phr(&["-Q", "kex"]);
+    assert!(ok, "-Q kex must exit 0");
+    assert!(!stdout.trim().is_empty());
+}
+
+#[test]
+fn test_query_compression() {
+    let (ok, stdout, _) = run_phr(&["-Q", "compression"]);
+    assert!(ok, "-Q compression must exit 0");
+    assert!(!stdout.trim().is_empty());
+}
+
+#[test]
+fn test_query_key() {
+    let (ok, stdout, _) = run_phr(&["-Q", "key"]);
+    assert!(ok, "-Q key must exit 0");
+    assert!(!stdout.trim().is_empty());
+}
+
+#[test]
+fn test_query_help_lists_accepted_queries() {
+    let (ok, stdout, _) = run_phr(&["-Q", "help"]);
+    assert!(ok, "-Q help must exit 0");
+    for q in &["cipher", "mac", "kex", "compression", "key", "help"] {
+        assert!(
+            stdout.contains(q),
+            "-Q help must mention {} (got: {:?})",
+            q,
+            stdout
+        );
+    }
+}
+
+#[test]
+fn test_query_unknown_exits_nonzero() {
+    let (ok, _, stderr) = run_phr(&["-Q", "definitely-not-a-real-query"]);
+    assert!(!ok, "unknown -Q must exit non-zero");
+    assert!(
+        stderr.contains("definitely-not-a-real-query"),
+        "stderr must mention the rejected query, got: {:?}",
+        stderr
+    );
+    // Message format matches OpenSSH: "Valid queries: cipher, …, help".
+    // The "help" entry is the canonical pointer to discoverability.
+    assert!(
+        stderr.contains("Valid queries") && stderr.contains("help"),
+        "stderr should list the valid queries (incl. help), got: {:?}",
+        stderr
+    );
+}
+
+#[test]
+fn test_query_multiple_flags() {
+    // Multiple -Q values: each prints in turn, exits 0.
+    let (ok, stdout, _) = run_phr(&["-Q", "cipher", "-Q", "mac"]);
+    assert!(ok, "multiple -Q must exit 0 when all known");
+    assert!(!stdout.trim().is_empty());
+}
+
 // `-g / --gateway-ports`: flips the default bind of `-L` and `-D`
 // from loopback (127.0.0.1) to wildcard (0.0.0.0). Surfaced
 // here as a clap-acceptance test; the bind-side semantics are

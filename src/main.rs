@@ -3,6 +3,7 @@ mod cli;
 mod control;
 mod forward;
 mod proxy;
+mod query;
 mod sftp;
 mod ssh;
 mod types;
@@ -213,6 +214,19 @@ async fn main() {
     if cli.help {
         print_help();
         return;
+    }
+
+    // `-Q <what>`: list supported algorithms and exit. Takes
+    // precedence over the destination / forward / help fallback —
+    // `passhrs -Q cipher` with no destination must print the
+    // cipher list, not help. Each query prints its own list and
+    // the process exits 0 (or 1 if any query was unknown).
+    // Verified at russh 0.62.1: ALL_* constants live at
+    //   cipher::ALL_CIPHERS, mac::ALL_MAC_ALGORITHMS,
+    //   kex::ALL_KEX_ALGORITHMS, compression::ALL_COMPRESSION_ALGORITHMS,
+    //   keys::key::ALL_KEY_TYPES.
+    if !cli.query.is_empty() {
+        std::process::exit(query::dispatch(&cli.query));
     }
 
     // Run the actual work. The verbose ladder preserves the

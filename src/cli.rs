@@ -17,6 +17,12 @@ const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) struct Cli {
     #[arg(short = 'p', long = "port", default_value_t = 22)]
     pub(crate) ssh_port: u16,
+    /// Introspect supported algorithms for one of: cipher, mac,
+    /// kex, compression, key, help. Multiple `-Q` flags print
+    /// each list in turn. Mirrors OpenSSH `-Q <what>` (no SSH
+    /// traffic involved — passhrs prints and exits 0).
+    #[arg(short = 'Q', long = "query", value_name = "what")]
+    pub(crate) query: Vec<String>,
     #[arg(short = 'l', long = "user")]
     pub(crate) user: Option<String>,
     #[arg(short = 'i', long = "key")]
@@ -445,6 +451,7 @@ pub(crate) fn print_help() {
     println!("  -D <spec>        SOCKS5 proxy (bind:port)");
     println!("  -H <spec>        HTTP CONNECT proxy (bind:port)");
     println!("  -E <file>        Log file");
+    println!("  -Q <what>        List supported algorithms (cipher|mac|kex|compression|key|help)");
     println!("  -f               Fork to background");
     println!("  -g               Allow remote hosts to connect local forwards (0.0.0.0)");
     println!("  -i <file>        Identity file");

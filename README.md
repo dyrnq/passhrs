@@ -197,7 +197,7 @@ ssh:   passhrs:   description
  -M    ❌  —        ControlMaster mode
  -m    ✅  -m       MAC algorithm (comma-separated, priority order)
  -O    ❌  —        Control command
- -Q    ❌  —        Query algorithms
+ -Q    ✅  -Q       Query algorithms (cipher|mac|kex|compression|key|help)
  -s    ❌  —        SSH subsystem
  -T    ✅  -T       Disable PTY allocation
  -V    ✅  -V       Version
@@ -213,7 +213,7 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **25**| **58%** |
+| **Implemented**       | **26**| **60%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
 | Not implemented       | ~21   | 49%   |
 
@@ -222,7 +222,7 @@ ssh:   passhrs:   description
 **Can be added via russh (low effort):**
 - `-C` compression level: flate2 feature
 
-**Semantically not fitting:** `-D` (not a proxy tool), `-W` tunnel, `-G`/`-Q` debug, `-B`/`-b`/`-e`/`-s`/`-w` (rarely used)
+**Semantically not fitting:** `-D` (not a proxy tool), `-W` tunnel, `-G` debug, `-B`/`-b`/`-e`/`-s`/`-w` (rarely used)
 
 **`-S` control socket caveat:** passhrs implements `-S <path>` as a **passhrs-native** master/resume protocol over a Unix-domain socket at `<path>` (mode `0o600`, removed automatically on master exit). It is **not wire-compatible with OpenSSH's** control protocol — an OpenSSH client cannot talk to a passhrs master and vice versa. Wire format: resume-to-master `<u32 BE length><UTF-8 command line>`; master-to-resume `<u32 BE length><tag 1=stdout / 2=stderr / 0=done><payload>`, where the done frame is `<u32 1><tag 0><u8 exit_code>` (length=1 so the reader picks up the exit code via the same `len`-byte payload read used for stdout/stderr). Unix-only in v1; Windows named-pipe equivalent is a separate follow-up.
 
