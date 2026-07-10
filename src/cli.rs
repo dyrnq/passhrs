@@ -112,6 +112,14 @@ pub(crate) struct Cli {
     /// OpenSSH-compatible).
     #[arg(short = 'S', long = "control-path", value_name = "path")]
     pub(crate) control_path: Option<String>,
+    /// Send a control command to an existing master at `-S <path>`
+    /// (`check` / `exit` / `stop`). Companion to `-S` (Issue #54).
+    /// `-O check` connects to the master and prints
+    /// "Master running" (exit 0) or "No master running" (exit 1).
+    /// `-O exit` / `-O stop` asks the master to terminate cleanly.
+    /// The master itself is bound by `-S`; both flags must be set.
+    #[arg(short = 'O', long = "control-command", value_name = "cmd")]
+    pub(crate) control_command: Option<String>,
     #[arg(long = "connect-timeout", default_value_t = 0)]
     pub(crate) connect_timeout: u64,
     #[arg(long = "timeout", default_value_t = 0)]
@@ -485,6 +493,7 @@ pub(crate) fn print_help() {
     println!("  -N               No command (forward only)");
     println!("  -n               Redirect stdin from /dev/null");
     println!("  -o <k=v>         SSH option");
+    println!("  -O <cmd>         Control command on -S master (check|exit|stop)");
     println!("  -p <port>        SSH port");
     println!("  -q               Quiet");
     println!("  -R <spec>        Remote forward ([bind:]port:host:port)");

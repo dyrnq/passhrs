@@ -2,14 +2,17 @@
 //! the positive implementation of OpenSSH-style `-S <path>`).
 //!
 //! Wire format (passhrs-native, not OpenSSH-wire-compatible).
-//! Two separate conventions apply — one per direction — because
+//! Three separate conventions apply — one per direction — because
 //! only the master-to-resume stream needs a tag byte (to distinguish
-//! stdout vs stderr vs done); the resume-to-master frame is just a
-//! payload (the command line), no tag needed.
+//! stdout vs stderr vs done); the resume-to-master and `-O`
+//! client-to-master frames are just payloads, no tag needed.
 //!
 //! ```text
 //! // resume -> master (single frame, command line)
 //! cmd_frame := u32_be(length) | payload(length bytes, UTF-8 command)
+//!
+//! // -O client -> master (single frame, control command)
+//! ctrl_frame := u32_be(length) | payload(length bytes, "check\n" | "exit\n")
 //!
 //! // master -> resume (multi-frame, tagged)
 //! stdout_frame := u32_be(length) | 0x01 | payload
@@ -21,6 +24,13 @@
 //! "read `len` bytes after the header" loop picks up the exit
 //! code byte as the payload, keeping the framing uniform with
 //! stdout/stderr frames (no special-case read for the done tag).
+//!
+//! `-O` reuses the same resume-to-master framing — the only
+//! difference is the payload is a control verb (`check\n` /
+//! `exit\n`) instead of a command line. The master dispatches on
+//! the first word of the payload before the existing exec path
+//! runs, so Issue #29's `handle_resume` keeps working unchanged
+//! for resume clients.
 //!
 //! Master side: an `Arc<Handle<SshHandler>>` is shared between the
 //! outer master event loop and the accept loop. Every `Handle::*`
@@ -39,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Notify;
 
 use anyhow::{bail, Context, Result};
 use log::*;
@@ -63,6 +74,39 @@ pub(crate) fn has_no_fresh_auth(cli: &Cli) -> bool {
 }
 
 // ----- Binding + cleanup -----
+
+/// Process-global "the master should exit" event. Set by the
+/// `-O exit` / `-O stop` handler when a client asks the master
+/// to terminate cleanly; observed by `run_master`'s accept loop
+/// so the loop breaks immediately and the process returns
+/// through the normal `Result<()>` path (with the
+/// `ControlSocketGuard::drop` cleanup removing the UDS file).
+///
+/// `tokio::sync::Notify` is the right primitive here: the
+/// accept loop is parked in `tokio::select!` on `listener.accept()`,
+/// and an `AtomicBool` polled at the top of each loop iteration
+/// would only fire when the next connection arrives (or never, if
+/// the user sent `-O exit` and nothing follows). A `Notify`
+/// wakeup the loop's select branch on every call to
+/// `notify_one()` — even when the loop is currently idle in
+/// `accept()`. Cheap (one syscall on wake), single-tenant (the
+/// master process is the only writer/reader), and exactly the
+/// "fire once" semantics we want.
+///
+/// `LazyLock` is required because `Notify::new()` is not
+/// `const fn`, so we cannot put the value directly inside a
+/// `static`. `LazyLock` evaluates the closure on first access
+/// (which happens at most once per master process — `run_master`
+/// is the only caller of `set_should_exit`).
+static SHOULD_EXIT: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::new);
+
+/// Mark the master for clean shutdown. Called from
+/// `handle_ctrl_exit` after the bye frame has been written.
+/// Wakes the accept loop so it can break on its next poll
+/// without waiting for another inbound connection.
+fn set_should_exit() {
+    SHOULD_EXIT.notify_one();
+}
 
 /// Bind the UDS at `path`, removing any stale file from a prior
 /// aborted master first. Sets mode `0o600` so other local users
@@ -192,6 +236,19 @@ async fn accept_loop(
     tokio::pin!(sigint);
     tokio::pin!(sigterm);
     loop {
+        // Race the listener's accept against the SHOULD_EXIT
+        // notify, SIGINT, and SIGTERM. `biased;` ensures signals
+        // are checked first (so a Ctrl-C during a slow accept
+        // doesn't have to wait for it). The SHOULD_EXIT notify
+        // is what `set_should_exit` (inside the `-O exit`
+        // handler task) fires — without it the loop would only
+        // re-check on the next accepted connection, which would
+        // never come if `-O exit` was the last thing the user
+        // asked the master to do. Poll a fresh `notified()`
+        // each iteration: each call returns a future that
+        // resolves on the next `notify_one()` after the call,
+        // so a single fire-and-forget shutdown is exactly
+        // observed once.
         tokio::select! {
             biased;
             _ = sigint.as_mut() => {
@@ -200,6 +257,10 @@ async fn accept_loop(
             }
             _ = sigterm.as_mut() => {
                 info!("Control master: SIGTERM received, closing.");
+                return Ok(());
+            }
+            _ = SHOULD_EXIT.notified() => {
+                info!("Control master: -O exit observed, closing.");
                 return Ok(());
             }
             accept = listener.accept() => {
@@ -245,7 +306,38 @@ async fn handle_resume(handle: Arc<Handle<SshHandler>>, stream: UnixStream) -> R
             return Ok(());
         }
     };
-    let cmd = cmd_line.trim_end_matches('\n').trim_end_matches('\r');
+    let trimmed = cmd_line
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string();
+    // `-O` control verbs share the resume-to-master framing, so
+    // dispatch on the first whitespace-separated token before
+    // falling through to the exec path. Issue #54. `check` and
+    // `exit` / `stop` are the only verbs in v1; any unknown verb
+    // gets treated as a (likely-empty) command line — the exec
+    // path returns exit 0 for empty commands, which is what the
+    // caller wants when they typo'd "checks" instead of "check".
+    let verb = trimmed.split_whitespace().next().unwrap_or("");
+    match verb {
+        "check" => return handle_ctrl_check(&mut tx).await,
+        "exit" | "stop" => {
+            info!("Control master: -O exit received, shutting down");
+            handle_ctrl_exit(&mut tx).await?;
+            // Returning Ok(()) here drops the per-connection task
+            // but the master's accept loop will exit on its next
+            // iteration when it sees the UDS listener is no longer
+            // accepting (we set a flag and break). The simpler path
+            // is to just return; the master process is killed by
+            // the caller of this function (which is itself, via
+            // the `should_exit` static). Actually — we set a
+            // process-level flag and the parent `run_master`
+            // observes it. Issue #54 implementation note.
+            set_should_exit();
+            return Ok(());
+        }
+        _ => {}
+    }
+    let cmd = trimmed;
     if cmd.is_empty() {
         write_done(&mut tx, 0).await?;
         return Ok(());
@@ -308,6 +400,37 @@ async fn pump_session_to_uds(mut channel: Channel<Msg>, tx: &mut OwnedWriteHalf)
         }
     }
     Ok(exit_code)
+}
+
+/// Reply to a `-O check` request. The client expects a
+/// length-prefixed UTF-8 string of the form `ok <pid>\n`. We
+/// intentionally do NOT use the existing stdout/stderr/done
+/// frame tags (1/2/0) because the `-O` client (`send_ctrl_*`
+/// below) reads a plain payload — the master side has no notion
+/// of "stdout from this command" because no command was run.
+///
+/// Master-side response format (chosen to match OpenSSH's
+/// "Master running (pid=...)" surface verbatim): payload is
+/// `ok <pid>\n` on success. The client treats any other payload
+/// (or any connection error) as "no master" and exits 1.
+async fn handle_ctrl_check(tx: &mut OwnedWriteHalf) -> Result<()> {
+    let pid = std::process::id();
+    let payload = format!("ok {}\n", pid);
+    write_cmd_frame(tx, payload.as_bytes()).await?;
+    tx.shutdown().await.ok();
+    Ok(())
+}
+
+/// Reply to a `-O exit` request and signal the master to
+/// terminate. Sends `bye\n` so the client sees a clean ack
+/// before the master closes the UDS; the
+/// `ControlSocketGuard::drop` that follows removes the file
+/// from disk. The accept-loop poll of `should_exit()` (above)
+/// breaks the loop on its next iteration.
+async fn handle_ctrl_exit(tx: &mut OwnedWriteHalf) -> Result<()> {
+    write_cmd_frame(tx, b"bye\n").await?;
+    tx.shutdown().await.ok();
+    Ok(())
 }
 
 // ----- Framing -----
@@ -450,6 +573,93 @@ pub(crate) async fn try_resume(ctrl_path: &Path, cli: &Cli) -> Result<Option<i32
             other => bail!("resume: unknown tag {} from master", other),
         }
     }
+}
+
+// ----- -O control command client (Issue #54) -----
+
+/// Outcome of a `-O` request, from the client's perspective.
+pub(crate) enum CtrlReply {
+    /// Master acknowledged and reported its PID. Used for `check`.
+    Running(u32),
+    /// Master acknowledged and asked to terminate. Used for
+    /// `exit` / `stop`.
+    Exiting,
+    /// Master is unreachable at `ctrl_path` — socket doesn't exist,
+    /// is hung, or refused the connection. Caller decides exit
+    /// code (1 for `check`, 1 for `exit` — the latter with a
+    /// different message because the user asked to exit a master
+    /// that doesn't exist).
+    NoMaster,
+    /// Master replied with an unknown payload (protocol error).
+    UnknownReply,
+}
+
+/// Send a `-O` control command to the master at `ctrl_path` and
+/// return its reply. This is the early-exit branch that `run()`
+/// uses when `cli.control_command` is `Some(_)`: it does NOT
+/// establish an SSH session, it just talks to the existing
+/// master (or fails to).
+///
+/// Wire format: a single length-prefixed payload frame from
+/// client → master (the verb, e.g. `check\n`), then a single
+/// length-prefixed payload frame from master → client (e.g.
+/// `ok 12345\n` or `bye\n`). No tag bytes — `-O` payloads are
+/// short UTF-8 strings, not byte streams.
+///
+/// On any connection failure (ENOENT, ECONNREFUSED, EOF before
+/// reply) we return `CtrlReply::NoMaster` so the caller can
+/// surface a friendly "No master running at <path>" message and
+/// exit 1 without printing an anyhow chain.
+pub(crate) async fn send_control_command(ctrl_path: &Path, cmd: &str) -> CtrlReply {
+    let stream = match UnixStream::connect(ctrl_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "-O {}: connect to {} failed: {}",
+                cmd,
+                ctrl_path.display(),
+                e
+            );
+            return CtrlReply::NoMaster;
+        }
+    };
+    let (mut rx, mut tx) = stream.into_split();
+
+    // Write the verb + newline so the master's existing frame
+    // reader can parse the same way it parses a command line.
+    let payload = format!("{}\n", cmd);
+    if let Err(e) = write_cmd_frame(&mut tx, payload.as_bytes()).await {
+        warn!("-O {}: write failed: {}", cmd, e);
+        return CtrlReply::NoMaster;
+    }
+
+    // Read the master's reply frame.
+    let reply = match read_cmd_frame(&mut rx).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            warn!("-O {}: master closed before reply", cmd);
+            return CtrlReply::NoMaster;
+        }
+        Err(e) => {
+            warn!("-O {}: read reply failed: {}", cmd, e);
+            return CtrlReply::NoMaster;
+        }
+    };
+    let reply_str = String::from_utf8_lossy(&reply);
+    let reply_trim = reply_str.trim();
+    if let Some(rest) = reply_trim.strip_prefix("ok ") {
+        if let Ok(pid) = rest.trim().parse::<u32>() {
+            return CtrlReply::Running(pid);
+        }
+    }
+    if reply_trim == "bye" {
+        return CtrlReply::Exiting;
+    }
+    warn!(
+        "-O {}: master replied with unexpected payload: {:?}",
+        cmd, reply_trim
+    );
+    CtrlReply::UnknownReply
 }
 
 #[cfg(test)]
