@@ -205,6 +205,16 @@ pub(crate) struct Cli {
     /// exporting RUST_LOG in the calling shell.
     #[arg(long = "debug-all")]
     pub(crate) debug_all: bool,
+    /// Print the resolved ssh_config for `<hostname>` and exit
+    /// without establishing an SSH session. Mirrors OpenSSH
+    /// `-G <hostname>`: walks `Cli` + `-o` overrides and prints
+    /// each resolved field (`host`, `hostname`, `port`, `user`,
+    /// `identityfile`, …) one per line. Standalone today —
+    /// honors CLI flags and `-o key=value` overrides; once
+    /// `-F <config>` lands, `-G` will also walk `ssh_config(5)`
+    /// `Host` blocks. Issue #62.
+    #[arg(short = 'G', long = "print-config", value_name = "host")]
+    pub(crate) print_config: Option<String>,
     /// Set the escape character for interactive sessions
     /// (matches OpenSSH `-e <ch>`). The escape character is a
     /// single character (`~` by default, matching OpenSSH) that,
@@ -621,6 +631,241 @@ pub(crate) fn print_help() {
         "         {} -N -f -L 8118:localhost:8118 user@host",
         PKG_NAME
     );
+}
+
+/// Print the resolved ssh_config for `-G <hostname>`. Mirrors
+/// OpenSSH's `ssh -G <host>`: walks the resolved
+/// `[user@]host[:port]` plus CLI flags + `-o` overrides and
+/// emits each field on its own line in the canonical OpenSSH
+/// order (`host`, `hostname`, `port`, `user`, `identityfile`,
+/// then any remaining `-o` keys in insertion order). Standalone
+/// today — once `-F` lands this becomes the front-end to the
+/// full `ssh_config(5)` resolver.
+///
+/// Returns `Err` if the destination string is malformed (the
+/// caller surfaces the parse error and exits 1). Issue #62.
+pub(crate) fn print_resolved_config(cli: &Cli, host_arg: &str) -> Result<()> {
+    write_resolved_config(&mut std::io::stdout(), cli, host_arg)
+}
+
+/// Test seam: write the `-G` output to an arbitrary `Write`.
+/// The public helper at `print_resolved_config` wraps this with
+/// `std::io::stdout()`; unit tests use a `Vec<u8>` so they can
+/// pin the exact rendered text without spawning a child
+/// process. Issue #62.
+pub(crate) fn write_resolved_config<W: std::io::Write>(
+    out: &mut W,
+    cli: &Cli,
+    host_arg: &str,
+) -> Result<()> {
+    let (host, user_from_dest, port_from_dest) = parse_destination(host_arg)?;
+    // OpenSSH emits `host <alias>` (the unbracketed component) and
+    // `hostname <resolved-addr>` separately when a `[…]:port`
+    // form was given. We follow the same convention: `host` is
+    // the first label of the dest (or the dest itself when no
+    // brackets), `hostname` is the resolved target host.
+    let alias = host_arg
+        .split('@')
+        .next_back()
+        .unwrap_or(host_arg)
+        .split('[')
+        .next()
+        .unwrap_or(host_arg)
+        .trim_end_matches(':')
+        .to_string();
+    // `parse_destination` returns `u16` with the standard
+    // default of 22 baked in. Override with `-p` if the user
+    // passed an explicit port that's not 22; otherwise leave
+    // as-is.
+    let port = if cli.ssh_port != 22 && port_from_dest == 22 {
+        cli.ssh_port
+    } else {
+        port_from_dest
+    };
+    let user = cli.user.clone().or(user_from_dest).unwrap_or_default();
+    let identity = cli
+        .identity_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    writeln!(out, "host {}", alias)?;
+    writeln!(out, "hostname {}", host)?;
+    writeln!(out, "port {}", port)?;
+    if !user.is_empty() {
+        writeln!(out, "user {}", user)?;
+    }
+    if !identity.is_empty() {
+        writeln!(out, "identityfile {}", identity)?;
+    }
+    // Echo the user's `-o` overrides in insertion order. We
+    // don't resolve them against defaults here — `-G` is purely
+    // a validation / introspection tool and the user's `-o`
+    // wins.
+    for opt in &cli.ssh_option {
+        if let Some(eq) = opt.find('=') {
+            writeln!(out, "{} {}", opt[..eq].to_lowercase(), opt[eq + 1..].trim())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod print_config_tests {
+    //! Unit tests for `-G <host>` (Issue #62). The parser-
+    //! acceptance tests in `tests/08_compat_args.rs` cover
+    //! the clap surface; here we exercise `write_resolved_config`
+    //! directly so the rendered key/value lines are pinned.
+    use super::*;
+    use clap::Parser;
+
+    fn render(args: &[&str]) -> String {
+        // Last arg is the `-G` hostname; everything before is
+        // either a flag or a flag value.
+        let cli = Cli::parse_from(args);
+        let host = cli.print_config.clone().expect("test must set -G");
+        let mut buf: Vec<u8> = Vec::new();
+        write_resolved_config(&mut buf, &cli, &host).expect("render");
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    fn render_with(cli: Cli) -> String {
+        let host = cli.print_config.clone().expect("test must set -G");
+        let mut buf: Vec<u8> = Vec::new();
+        write_resolved_config(&mut buf, &cli, &host).expect("render");
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    #[test]
+    fn cli_accepts_print_config_short() {
+        let cli = Cli::parse_from(["passhrs", "-G", "user@jumpbox", "-l", "admin"]);
+        assert_eq!(cli.print_config.as_deref(), Some("user@jumpbox"));
+        assert_eq!(cli.user.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn cli_accepts_print_config_long() {
+        let cli = Cli::parse_from([
+            "passhrs",
+            "--print-config",
+            "user@jumpbox:2222",
+            "-i",
+            "/tmp/k",
+        ]);
+        assert_eq!(cli.print_config.as_deref(), Some("user@jumpbox:2222"));
+        assert_eq!(
+            cli.identity_file.as_ref().map(|p| p.display().to_string()),
+            Some("/tmp/k".to_string())
+        );
+    }
+
+    #[test]
+    fn renders_canonical_lines() {
+        let out = render(&[
+            "passhrs",
+            "-G",
+            "user@jumpbox.example.com",
+            "-l",
+            "admin",
+            "-i",
+            "/tmp/id_rsa",
+        ]);
+        for line in [
+            "host jumpbox.example.com",
+            "hostname jumpbox.example.com",
+            "port 22",
+            "user admin",
+            "identityfile /tmp/id_rsa",
+        ] {
+            assert!(
+                out.contains(line),
+                "rendered output missing `{}`:\n{}",
+                line,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn dest_port_wins_over_default_p() {
+        // `-G user@jumpbox:2222` (no `-p`) must report port 2222.
+        // `-p 9999` (no dest port) must report 9999. Both paths
+        // are covered by `parse_destination` + the precedence
+        // logic in `write_resolved_config`.
+        let out = render(&["passhrs", "-G", "user@jumpbox:2222"]);
+        assert!(
+            out.contains("port 2222"),
+            "dest port must be honored:\n{}",
+            out
+        );
+        assert!(out.contains("host jumpbox"));
+    }
+
+    #[test]
+    fn explicit_p_wins_when_dest_has_no_port() {
+        let out = render(&["passhrs", "-G", "jumpbox", "-p", "9999"]);
+        assert!(
+            out.contains("port 9999"),
+            "`-p` flag must be reflected:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn dest_user_wins_when_no_l_flag() {
+        // `user@host` parses user out of the dest; passhrs
+        // follows OpenSSH: the dest's user wins over nothing,
+        // and `-l` wins over the dest.
+        let out = render(&["passhrs", "-G", "alice@jumpbox"]);
+        assert!(out.contains("user alice"), "got:\n{}", out);
+        let out = render(&["passhrs", "-G", "alice@jumpbox", "-l", "bob"]);
+        assert!(
+            out.contains("user bob"),
+            "`-l` must override dest user:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn renders_o_overrides_in_order() {
+        // `-G foo -o K1=v1 -o K2=v2` must emit both lines.
+        let out = render(&["passhrs", "-G", "jumpbox", "-o", "K1=v1", "-o", "K2=v2"]);
+        assert!(out.contains("k1 v1"), "got:\n{}", out);
+        assert!(out.contains("k2 v2"), "got:\n{}", out);
+        // Insertion order — k1 must precede k2.
+        let k1 = out.find("k1").unwrap();
+        let k2 = out.find("k2").unwrap();
+        assert!(k1 < k2, "must be insertion order: {}", out);
+    }
+
+    #[test]
+    fn bad_destination_returns_err() {
+        // Unclosed bracket — `parse_destination` rejects.
+        let cli = Cli::parse_from(["passhrs", "-G", "user@[bad::host"]);
+        let host = cli.print_config.clone().unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        let res = write_resolved_config(&mut buf, &cli, &host);
+        assert!(res.is_err(), "expected parse error for bad dest");
+    }
+
+    #[test]
+    fn render_with_helper_emits_baseline_only() {
+        // No `-l`, no `-i`: `user` and `identityfile` must be
+        // omitted entirely (printed only when non-empty).
+        let out = render_with(Cli::parse_from(["passhrs", "-G", "h"]));
+        assert!(out.contains("host h"));
+        assert!(out.contains("hostname h"));
+        assert!(out.contains("port 22"));
+        assert!(
+            !out.contains("user "),
+            "user line must be omitted when empty:\n{}",
+            out
+        );
+        assert!(
+            !out.contains("identityfile "),
+            "identityfile must be omitted when unset:\n{}",
+            out
+        );
+    }
 }
 
 #[cfg(test)]
