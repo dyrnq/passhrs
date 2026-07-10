@@ -1025,12 +1025,24 @@ async fn run(cli: Cli) -> Result<()> {
                 };
                 info!("Exec: {}", full);
                 channel.exec(true, full.as_bytes()).await?;
-                let code = run_session(channel, cli.redirect_stdin, exit_status_map).await?;
+                let code = run_session(
+                    channel,
+                    cli.redirect_stdin,
+                    exit_status_map,
+                    effective_escape_char(&cli),
+                )
+                .await?;
                 std::process::exit(code);
             } else if !cli.no_command {
                 channel.request_shell(true).await?;
                 info!("Starting shell");
-                let code = run_session(channel, cli.redirect_stdin, exit_status_map).await?;
+                let code = run_session(
+                    channel,
+                    cli.redirect_stdin,
+                    exit_status_map,
+                    effective_escape_char(&cli),
+                )
+                .await?;
                 std::process::exit(code);
             } else {
                 info!("-N mode, waiting...");

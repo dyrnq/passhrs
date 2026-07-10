@@ -187,7 +187,7 @@ ssh:   passhrs:   description
  -B    ❌  —        Bind interface
  -b    ✅  -b       Source bind address for SSH connection (or -o BindAddress=)
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
- -e    ❌  —        Escape character
+ -e    ✅  -e       Escape character (`~` default, `none` disables, only with -t)
  -F    ❌  —        SSH config file
  -G    ❌  —        Print config and exit
  -g    ✅  -g       Allow remote hosts to connect local forwards
@@ -213,9 +213,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **29**| **67%** |
+| **Implemented**       | **30**| **70%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~19   | 44%   |
+| Not implemented       | ~18   | 42%   |
 
 ### Not Implemented — Notes
 
