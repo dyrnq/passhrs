@@ -5,7 +5,7 @@
 ## Features
 
 ### SSH Standard Compatible Options
-`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S`
+`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G`
 
 | Option    | Description                        |
 |:----------|:-----------------------------------|
@@ -189,7 +189,7 @@ ssh:   passhrs:   description
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ✅  -e       Escape character (`~` default, `none` disables, only with -t)
  -F    ❌  —        SSH config file
- -G    ❌  —        Print config and exit
+ -G    ✅  -G       Print resolved config for `<hostname>` and exit (CLI flags + `-o` overrides; `-F` parsing deferred)
  -g    ✅  -g       Allow remote hosts to connect local forwards
  -I    ❌  —        PKCS#11
  -K    ❌  —        Enable GSSAPI delegation
@@ -213,9 +213,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **31**| **72%** |
+| **Implemented**       | **32**| **74%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~17   | 40%   |
+| Not implemented       | ~16   | 37%   |
 
 ### Not Implemented — Notes
 

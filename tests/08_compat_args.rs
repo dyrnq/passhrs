@@ -635,6 +635,94 @@ fn test_bind_interface_via_o_option() {
     );
 }
 
+// `-G <hostname>`: print the resolved ssh_config for the
+// given host and exit. Mirrors OpenSSH's `ssh -G`. Standalone
+// today — CLI flags + `-o` overrides; once `-F` lands, this
+// also walks `ssh_config(5)` `Host` blocks. Issue #62.
+#[test]
+fn test_print_config_short() {
+    // `-G user@jumpbox` (no command, no destination) must
+    // print at least the resolved `host` / `hostname` / `port`
+    // lines and exit 0. We don't pin the full output (unit
+    // tests in `cli::print_config_tests` cover the rendering
+    // byte-for-byte).
+    let (ok, stdout, stderr) = run_phr(&["-G", "user@jumpbox.example.com"]);
+    assert!(ok, "-G must exit 0 on a valid host: {}", stderr);
+    assert!(
+        stdout.contains("host jumpbox.example.com"),
+        "`-G` must print `host` line, got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("hostname jumpbox.example.com"),
+        "`-G` must print `hostname` line, got: {:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("port 22"),
+        "`-G` must print `port 22` by default, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn test_print_config_long() {
+    let (ok, stdout, _) = run_phr(&[
+        "--print-config",
+        "user@jumpbox:2222",
+        "-l",
+        "admin",
+        "-i",
+        "/tmp/id_rsa",
+    ]);
+    assert!(ok, "--print-config must exit 0");
+    assert!(stdout.contains("port 2222"), "got: {:?}", stdout);
+    assert!(stdout.contains("user admin"), "got: {:?}", stdout);
+    assert!(
+        stdout.contains("identityfile /tmp/id_rsa"),
+        "got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn test_print_config_with_p_flag_wins() {
+    // `-G host -p 9999` (no dest port) — `-p` flag must be
+    // reflected as the resolved port.
+    let (ok, stdout, _) = run_phr(&["-G", "jumpbox", "-p", "9999"]);
+    assert!(ok, "-G with -p must exit 0");
+    assert!(
+        stdout.contains("port 9999"),
+        "`-p` flag must drive the resolved port, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn test_print_config_no_host_exits_nonzero() {
+    // `-G` without an argument is a clap error; non-zero exit.
+    let (ok, _, stderr) = run_phr(&["-G"]);
+    assert!(!ok, "`-G` without an argument must exit non-zero");
+    assert!(
+        stderr.contains("required") || stderr.contains("argument"),
+        "stderr must mention the missing argument: {:?}",
+        stderr
+    );
+}
+
+#[test]
+fn test_print_config_bad_destination_exits_nonzero() {
+    // Unclosed bracket — `parse_destination` rejects at
+    // runtime; `-G` must exit 1 with a clear error.
+    let (ok, _, stderr) = run_phr(&["-G", "user@[bad::host"]);
+    assert!(!ok, "`-G` with malformed destination must exit non-zero");
+    assert!(
+        stderr.contains("unclosed") || stderr.contains("invalid") || stderr.contains("bracket"),
+        "stderr must explain the parse failure: {:?}",
+        stderr
+    );
+}
+
 #[test]
 fn test_debug_all_flag() {
     let (_, _, stderr) = run_phr(&["--debug-all", "user@localhost", "id"]);

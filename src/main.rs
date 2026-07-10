@@ -269,6 +269,22 @@ async fn main() {
         }
     }
 
+    // `-G <hostname>`: print the resolved ssh_config and exit.
+    // Pure introspection — no SSH session is established, no
+    // destination is required as a positional arg. Sits next
+    // to the `-Q` / `-O` early-exits for the same reason: we
+    // don't want the empty-destination print-help fallback
+    // below to trap a bare `passhrs -G foo`. Issue #62.
+    if let Some(host) = cli.print_config.as_deref() {
+        match cli::print_resolved_config(&cli, host) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("passhrs: invalid -G argument: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Run the actual work. The verbose ladder preserves the
     // existing {:#?} Debug dump so -v / -vv / --debug-all
     // continues to show the full anyhow chain. Only the default
