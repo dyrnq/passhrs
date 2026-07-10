@@ -725,6 +725,7 @@ pub(crate) async fn run_session(
     channel: Channel<Msg>,
     redirect_stdin: bool,
     exit_statuses: Arc<Mutex<HashMap<russh::ChannelId, u32>>>,
+    escape_char: Option<u8>,
 ) -> Result<i32> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
@@ -823,9 +824,25 @@ pub(crate) async fn run_session(
             tokio::time::sleep(std::time::Duration::from_secs(u64::MAX)).await;
         });
     } else {
-        tokio::spawn(async move {
+        // Escape-character handling. OpenSSH scans stdin for
+        // `<escape_char><action>` at the start of a line (i.e.
+        // immediately after `\n`), intercepting `~.` to
+        // disconnect, `~?` to print help, etc. We support the
+        // minimal v1 set here: `~.` (disconnect), `~?` (print
+        // help). `escape_char == None` (set by `-e none`) means
+        // skip the scan and forward everything unchanged. Issue
+        // #57.
+        let escape_pump = async move {
             let mut stdin = tokio::io::stdin();
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; 4096];
+            // Carry-over from the previous read so we never miss
+            // an escape sequence that crossed a read boundary.
+            let mut carry: Vec<u8> = Vec::new();
+            // Tracks whether the byte we're about to consume is at
+            // the *start of a line*: true initially, true after
+            // each `\n` we forward (so a `<esc>` typed mid-line
+            // is forwarded rather than interpreted).
+            let mut at_line_start = true;
             loop {
                 match stdin.read(&mut buf).await {
                     Ok(0) => {
@@ -833,14 +850,99 @@ pub(crate) async fn run_session(
                         break;
                     }
                     Ok(n) => {
-                        if tx.data(&buf[..n]).await.is_err() {
+                        // Combine carry + new bytes so the scanner
+                        // has the full stream in one buffer.
+                        let mut stream = std::mem::take(&mut carry);
+                        stream.extend_from_slice(&buf[..n]);
+                        let mut pos = 0usize;
+                        // First pass: scan for escape sequences
+                        // when `escape_char` is `Some(_)` AND
+                        // we're positioned at line start.
+                        if let Some(esc) = escape_char {
+                            while pos < stream.len() {
+                                let b = stream[pos];
+                                if b == b'\n' {
+                                    at_line_start = true;
+                                    pos += 1;
+                                    continue;
+                                }
+                                if at_line_start && b == esc && pos + 1 < stream.len() {
+                                    let action = stream[pos + 1];
+                                    match action {
+                                        b'.' => {
+                                            // Disconnect: echo a
+                                            // newline so the user
+                                            // sees that the key
+                                            // was consumed, then
+                                            // close cleanly.
+                                            let mut out = tokio::io::stdout();
+                                            let _ = out.write_all(b"\r\n").await;
+                                            let _ = out.flush().await;
+                                            info!("Escape sequence `~.`: disconnecting session");
+                                            let _ = tx.eof().await;
+                                            return;
+                                        }
+                                        b'?' => {
+                                            // Help: print the v1
+                                            // escape table to
+                                            // stderr so the user
+                                            // sees it but the
+                                            // remote shell does
+                                            // not. Consume the
+                                            // `<esc>?` and the
+                                            // `\n` that follows
+                                            // (if any).
+                                            let mut err = tokio::io::stderr();
+                                            let help = b"\r\n\
+                                                Supported escape sequences:\r\n\
+                                                  ~.  - disconnect session\r\n\
+                                                  ~?  - print this help\r\n\
+                                                Other characters are forwarded unchanged.\r\n";
+                                            let _ = err.write_all(help).await;
+                                            let _ = err.flush().await;
+                                            pos += 2;
+                                            // If next byte is `\n`,
+                                            // skip it too (the user
+                                            // typed Enter after ~?).
+                                            if pos < stream.len() && stream[pos] == b'\n' {
+                                                pos += 1;
+                                            }
+                                            at_line_start = true;
+                                            continue;
+                                        }
+                                        _ => {
+                                            // Unknown escape:
+                                            // forward normally;
+                                            // do not consume.
+                                            at_line_start = false;
+                                            pos += 1;
+                                        }
+                                    }
+                                } else {
+                                    at_line_start = false;
+                                    pos += 1;
+                                }
+                            }
+                        } else {
+                            pos = stream.len();
+                        }
+                        // Forward the unconsumed prefix to the
+                        // channel.
+                        if pos > 0 && tx.data(&stream[..pos]).await.is_err() {
                             break;
+                        }
+                        // Stash anything past `pos` for the next
+                        // read (rare — happens if the escape
+                        // sequence ran past the buffer's end).
+                        if pos < stream.len() {
+                            carry = stream[pos..].to_vec();
                         }
                     }
                     Err(_) => break,
                 }
             }
-        });
+        };
+        tokio::spawn(escape_pump);
     }
     let code = tokio::select! { c = exit_rx => c.unwrap_or(0), _ = reader => 0 };
     // The reader thread only sees ExitStatus if russh happened to

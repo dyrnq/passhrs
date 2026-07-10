@@ -479,6 +479,92 @@ fn test_accept_all_host_keys_with_strict() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
+// `-e <ch>`: interactive escape character for PTY sessions
+// (Issue #57). Mirrors OpenSSH `ssh -e <ch>`: a single byte
+// (or caret notation, e.g. `^a` for Ctrl-A) typed at the start
+// of a line on the local pty can trigger session-level actions
+// (`~.` disconnects, `~?` prints help). `none` disables the
+// scan. Only has effect when a PTY is allocated (`-t` or
+// auto-pty with a TTY). These tests pin the clap surface; the
+// runtime behavior is verified in `tests/15`
+// (`test_escape_*`).
+#[test]
+fn test_escape_char_short_tilde() {
+    let (_, _, stderr) = run_phr(&["-e", "~", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should recognize -e, but stderr complains: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_escape_char_long() {
+    let (_, _, stderr) = run_phr(&["--escape-char", "~", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_escape_char_none_disables() {
+    // `none` (case-insensitive) is OpenSSH's literal for "no
+    // escape char". Clap must accept the value verbatim.
+    let (_, _, stderr) = run_phr(&["-e", "none", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-e none`: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_escape_char_caret_notation() {
+    // `^a` is Ctrl-A. Verify clap accepts the caret form (the
+    // resolver at `cli::parse_escape_char` then maps it to 0x01).
+    let (_, _, stderr) = run_phr(&["-e", "^a", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-e ^a`: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_escape_char_question_mark() {
+    // `?` is a valid single-byte escape (different from OpenSSH's
+    // default `~`, useful if the user's shell expands `~`).
+    let (_, _, stderr) = run_phr(&["-e", "?", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-e ?`: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_escape_char_with_tty_flag() {
+    // `-e` must be combinable with `-t` (force PTY); both flags
+    // affect interactive sessions.
+    let (_, _, stderr) = run_phr(&["-e", "~", "-t", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-e ~ -t`: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_escape_char_with_no_pty_flag() {
+    // `-e` combined with `-T` (no PTY) is accepted — the runtime
+    // simply ignores the escape when no PTY is allocated.
+    let (_, _, stderr) = run_phr(&["-e", "~", "-T", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-e ~ -T`: {}",
+        stderr
+    );
+}
+
 #[test]
 fn test_debug_all_flag() {
     let (_, _, stderr) = run_phr(&["--debug-all", "user@localhost", "id"]);

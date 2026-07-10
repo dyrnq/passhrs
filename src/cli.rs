@@ -188,6 +188,20 @@ pub(crate) struct Cli {
     /// exporting RUST_LOG in the calling shell.
     #[arg(long = "debug-all")]
     pub(crate) debug_all: bool,
+    /// Set the escape character for interactive sessions
+    /// (matches OpenSSH `-e <ch>`). The escape character is a
+    /// single character (`~` by default, matching OpenSSH) that,
+    /// when typed at the start of a line on the local pty,
+    /// triggers session-level actions: `~.` disconnects cleanly,
+    /// `~?` prints the help text. The literal value `none`
+    /// disables the escape entirely (every byte is forwarded).
+    /// Other characters can be specified as a single UTF-8
+    /// character (e.g. `-e ~`, `-e ?`) or via the OpenSSH caret
+    /// notation (`-e ^a` = Ctrl-A, `-e ^?` = DEL). Only honored
+    /// when a PTY is allocated (`-t` or auto with a TTY);
+    /// ignored otherwise. Issue #57.
+    #[arg(short = 'e', long = "escape-char", value_name = "ch|none")]
+    pub(crate) escape_char: Option<String>,
 }
 
 pub(crate) fn parse_destination(dest: &str) -> Result<(String, Option<String>, u16)> {
@@ -235,6 +249,73 @@ pub(crate) fn parse_ssh_options(options: &[String]) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Resolve `-e <ch>` / `--escape-char <ch>` to the byte that
+/// opens an escape sequence at the start of a line, or `None`
+/// if escape handling is disabled.
+///
+/// OpenSSH accepts:
+/// - `none` (literal, case-insensitive) — disable escape
+/// - a single byte, e.g. `~`, `?`, `a`
+/// - caret notation: `^a` → Ctrl-A (0x01), `^?` → DEL (0x7F),
+///   `^^` → literal `^`, `^` followed by any other char error.
+///
+/// Default: `Some(b'~')` (the OpenSSH default). Issue #57.
+pub(crate) fn parse_escape_char(spec: &str) -> Result<Option<u8>> {
+    let s = spec.trim();
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    if s.is_empty() {
+        bail!("-e: empty escape character (use 'none' to disable)");
+    }
+    // Caret notation.
+    if let Some(rest) = s.strip_prefix('^') {
+        let bytes = rest.as_bytes();
+        if bytes.len() != 1 {
+            bail!(
+                "-e: '^' must be followed by exactly one character (got {:?})",
+                s
+            );
+        }
+        let c = bytes[0];
+        let resolved = match c {
+            b'?' => 0x7f,                // DEL
+            b'^' => b'^',                // literal '^'
+            b'a'..=b'z' => c - b'a' + 1, // ^A=0x01, ^Z=0x1A
+            b'A'..=b'Z' => c - b'A' + 1,
+            _ => bail!("-e: unsupported control character {:?}", s),
+        };
+        return Ok(Some(resolved));
+    }
+    // Plain literal — must be one character. OpenSSH takes the
+    // first byte of the UTF-8 string, since terminal escape
+    // chars are all ASCII in practice.
+    let bytes = s.as_bytes();
+    if bytes.len() != 1 {
+        bail!("-e: escape character must be exactly one byte, got {:?}", s);
+    }
+    Ok(Some(bytes[0]))
+}
+
+/// Resolve the effective escape character: takes the user's
+/// `-e` value if set, otherwise returns the OpenSSH default `~`.
+pub(crate) fn effective_escape_char(cli: &Cli) -> Option<u8> {
+    match cli.escape_char.as_deref() {
+        None => Some(b'~'),
+        Some(s) => match parse_escape_char(s) {
+            Ok(v) => v,
+            // An invalid `-e` should have been rejected at parse
+            // time (we'd add a `validate` hook on the field). On
+            // the off-chance it slipped through, fall back to
+            // the OpenSSH default rather than crash.
+            Err(e) => {
+                eprintln!("-e: invalid value {:?}, falling back to default: {}", s, e);
+                Some(b'~')
+            }
+        },
+    }
 }
 
 pub(crate) fn parse_proxy_jump(spec: &str) -> Result<ProxyJumpSpec> {
@@ -650,6 +731,85 @@ mod forward_spec_tests {
         assert_eq!(d.bind_addr, "0.0.0.0");
         let d = parse_dynamic_spec("127.0.0.1:1080", true).unwrap();
         assert_eq!(d.bind_addr, "127.0.0.1");
+    }
+}
+
+#[cfg(test)]
+mod escape_char_tests {
+    //! Unit tests for `-e` / `--escape-char` (Issue #57). The
+    //! cases here pin both the OpenSSH-compatible forms
+    //! (`none`, single char, `^X` control-char notation) and the
+    //! rejection paths (empty, multi-byte, malformed `^`).
+    use super::parse_escape_char;
+
+    #[test]
+    fn none_disables() {
+        assert_eq!(parse_escape_char("none").unwrap(), None);
+        assert_eq!(parse_escape_char("NONE").unwrap(), None);
+        assert_eq!(parse_escape_char("None").unwrap(), None);
+    }
+
+    #[test]
+    fn single_literal_char() {
+        assert_eq!(parse_escape_char("~").unwrap(), Some(b'~'));
+        assert_eq!(parse_escape_char("?").unwrap(), Some(b'?'));
+        assert_eq!(parse_escape_char("#").unwrap(), Some(b'#'));
+    }
+
+    #[test]
+    fn caret_ctrl_a_through_z() {
+        assert_eq!(parse_escape_char("^a").unwrap(), Some(0x01));
+        assert_eq!(parse_escape_char("^z").unwrap(), Some(0x1a));
+    }
+
+    #[test]
+    fn caret_uppercase_letters() {
+        // OpenSSH accepts both cases; `^A` maps to the same byte
+        // as `^a` (0x01).
+        assert_eq!(parse_escape_char("^A").unwrap(), Some(0x01));
+        assert_eq!(parse_escape_char("^Z").unwrap(), Some(0x1a));
+    }
+
+    #[test]
+    fn caret_question_mark_is_del() {
+        // `^?` is the OpenSSH convention for DEL (0x7F).
+        assert_eq!(parse_escape_char("^?").unwrap(), Some(0x7f));
+    }
+
+    #[test]
+    fn caret_double_caret_is_literal() {
+        // `^^` escapes to a literal `^` so the user can pick `^`
+        // as their escape char.
+        assert_eq!(parse_escape_char("^^").unwrap(), Some(b'^'));
+    }
+
+    #[test]
+    fn empty_string_is_error() {
+        assert!(parse_escape_char("").is_err());
+        assert!(parse_escape_char("   ").is_err());
+    }
+
+    #[test]
+    fn multi_byte_is_error() {
+        // `-e ab` is meaningless; reject.
+        assert!(parse_escape_char("ab").is_err());
+    }
+
+    #[test]
+    fn caret_with_no_following_char_is_error() {
+        // `-e ^` is malformed.
+        assert!(parse_escape_char("^").is_err());
+    }
+
+    #[test]
+    fn caret_with_multi_char_following_is_error() {
+        assert!(parse_escape_char("^ab").is_err());
+    }
+
+    #[test]
+    fn caret_with_unsupported_char_is_error() {
+        // `^1` has no canonical mapping in OpenSSH; reject.
+        assert!(parse_escape_char("^1").is_err());
     }
 }
 
