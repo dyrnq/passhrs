@@ -1467,6 +1467,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "futures",
+ "libc",
  "log",
  "russh",
  "russh-sftp",

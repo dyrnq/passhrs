@@ -184,7 +184,7 @@ ssh:   passhrs:   description
  -t    ✅  -t       Force PTY
  -v    ✅  -v       Verbose output (-vv, -vvv)
 
- -B    ❌  —        Bind interface
+ -B    ✅  -B       Bind interface (Linux SO_BINDTODEVICE; -b is source IP, -B is interface name)
  -b    ✅  -b       Source bind address for SSH connection (or -o BindAddress=)
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ✅  -e       Escape character (`~` default, `none` disables, only with -t)
@@ -213,9 +213,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **30**| **70%** |
+| **Implemented**       | **31**| **72%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~18   | 42%   |
+| Not implemented       | ~17   | 40%   |
 
 ### Not Implemented — Notes
 
