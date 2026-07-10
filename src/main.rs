@@ -716,8 +716,21 @@ async fn run(cli: Cli) -> Result<()> {
                     .map(|s| s.as_str())
                     .filter(|s| !s.is_empty())
             });
-            let connect_fut =
-                ssh::connect_with_bind(config, host.as_str(), port, handler, bind_address);
+            // `-B <interface>` (OpenSSH `SO_BINDTODEVICE`) is
+            // independent of `-b <address>`: `-b` chooses the
+            // source IP, `-B` chooses the kernel's routing
+            // interface. The two stack cleanly (e.g. `-b
+            // 192.0.2.10 -B eth0` pins both). Empty string is
+            // treated as not-set (matches `-b`).
+            let bind_interface = cli.bind_interface.as_deref().filter(|s| !s.is_empty());
+            let connect_fut = ssh::connect_with_bind(
+                config,
+                host.as_str(),
+                port,
+                handler,
+                bind_address,
+                bind_interface,
+            );
             let h = if connect_timeout > 0 {
                 tokio::time::timeout(std::time::Duration::from_secs(connect_timeout), connect_fut)
                     .await

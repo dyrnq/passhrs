@@ -565,6 +565,76 @@ fn test_escape_char_with_no_pty_flag() {
     );
 }
 
+// `-B <interface>`: bind the outbound TCP connection to a
+// specific local network interface (OpenSSH `-B`). Implements
+// `SO_BINDTODEVICE` on Linux. Distinct from `-b <address>`
+// (source IP) — `-B` and `-b` are orthogonal and stack
+// (`-b 192.0.2.10 -B eth0` pins both). Issue #60.
+#[test]
+fn test_bind_interface_short() {
+    let (_, _, stderr) = run_phr(&["-B", "eth0", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should recognize -B, but stderr complains: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_bind_interface_long() {
+    let (_, _, stderr) = run_phr(&["--bind-interface", "eth0", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_bind_interface_combined_with_bind_address() {
+    // `-B eth0 -b 192.0.2.10` must be parseable: the two flags
+    // stack (one picks the source IP, the other pins the
+    // kernel's interface). Both flows are independent in
+    // `connect_with_bind`.
+    let (_, _, stderr) = run_phr(&["-B", "eth0", "-b", "192.0.2.10", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-B -b` combo: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_bind_interface_empty_string_accepted() {
+    // `-B ""` is the "let me skip you but still set the flag"
+    // form, mirroring `-b ""`. clap accepts; runtime treats it
+    // as if `-B` was not passed (`apply_bind_interface` early-
+    // returns on empty string).
+    let (_, _, stderr) = run_phr(&["-B", "", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-B \"\"`: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_bind_interface_via_o_option() {
+    // OpenSSH accepts the long-form
+    // `-o BindInterface=eth0` alias (mirrors the
+    // `-o BindAddress=` companion of `-b`).
+    //
+    // NOTE: `-o BindInterface` is not yet honored at runtime by
+    // passhrs's `parse_ssh_options` plumb — this test pins only
+    // the clap-side "the value is accepted by `-o` regardless".
+    // Runtime honoring is a follow-up if we decide `-o
+    // BindInterface` should win over the explicit `-B` flag
+    // (OpenSSH precedence is unspecified).
+    let (_, _, stderr) = run_phr(&["-o", "BindInterface=eth0", "user@localhost", "id"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-o BindInterface=`: {}",
+        stderr
+    );
+}
+
 #[test]
 fn test_debug_all_flag() {
     let (_, _, stderr) = run_phr(&["--debug-all", "user@localhost", "id"]);

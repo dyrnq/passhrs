@@ -83,6 +83,23 @@ pub(crate) struct Cli {
     /// behaves as if `-b` was not passed — same as OpenSSH.
     #[arg(short = 'b', long = "bind", value_name = "address")]
     pub(crate) bind_address: Option<String>,
+    /// Bind the outbound SSH TCP connection to a specific local
+    /// network interface by name (OpenSSH `-B`). Implemented via
+    /// Linux's `SO_BINDTODEVICE` setsockopt — packets emitted by
+    /// the SSH socket are routed through the named interface
+    /// regardless of the routing table. Useful on multi-homed
+    /// Linux hosts that need outbound connections to leave via a
+    /// specific NIC (replication NIC, management NIC, etc.) when
+    /// the kernel's route table can't pick the right one. Distinct
+    /// from `-b <address>` (which chooses the source *IP* —
+    /// orthogonal: `-b 192.0.2.10 -B eth0` pins both). Linux-only;
+    /// on other Unixes a startup warn is logged and the flag is a
+    /// no-op (OpenSSH errors here; passhrs's existing "feature
+    /// unavailable on this OS" pattern is warn-and-continue). On
+    /// Windows the flag is accepted by clap and ignored. Empty
+    /// string (`-B ""`) is accepted and behaves as if not passed.
+    #[arg(short = 'B', long = "bind-interface", value_name = "interface")]
+    pub(crate) bind_interface: Option<String>,
     /// Unconditionally accept any host key. Matches OpenSSH `-y`.
     /// Stricter than `-o StrictHostKeyChecking=no`: the latter
     /// silently appends *new* keys to `known_hosts` and rejects

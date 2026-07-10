@@ -23,3 +23,8 @@ futures = "0.3"
 russh-sftp = "2.3.0"
 copia = { version = "0.1.3", features = ["async"] }
 crossterm = "0.29.0"
+# `libc` provides the SOL_SOCKET / SO_BINDTODEVICE constants and
+# `setsockopt` symbol used by `apply_bind_interface` (Linux-only).
+# Already a transitive dep of `tokio`/`russh`; declaring it
+# directly avoids an unsafe `extern "C"` block in src/ssh.rs.
+libc = "0.2"

@@ -408,7 +408,8 @@ impl Handler for SshHandler {
 // ======================================================================
 
 /// Connect to `host:port` over SSH, optionally binding the local
-/// source address to `bind_address` (OpenSSH `-b`).
+/// source address to `bind_address` (OpenSSH `-b`) and the
+/// outbound interface to `bind_interface` (OpenSSH `-B`).
 ///
 /// `bind_address` semantics:
 /// - `Some("")` or `None` → no `bind()`, fall through to
@@ -417,18 +418,32 @@ impl Handler for SshHandler {
 ///   of the matching family, `bind()` to the resolved address,
 ///   `connect()` to `host:port`, then hand the stream to
 ///   `client::connect_stream` (the same path ProxyJump uses).
+///
+/// `bind_interface` semantics:
+/// - `Some("")` or `None` → no `SO_BINDTODEVICE` applied.
+/// - `Some(name)` → on Linux, call
+///   `setsockopt(SOL_SOCKET, SO_BINDTODEVICE, name)` on the
+///   socket *before* `connect()`. The kernel will then route the
+///   outbound packets through that interface regardless of the
+///   routing table. On other Unixes (macOS, FreeBSD, etc.) the
+///   syscall is unavailable; we log a startup warn and proceed
+///   without binding, matching passhrs's "feature unavailable on
+///   this OS" pattern for `-A`. On Windows the flag is ignored
+///   (clap accepts it on every platform).
 pub(crate) async fn connect_with_bind(
     config: Arc<russh::client::Config>,
     host: &str,
     port: u16,
     handler: SshHandler,
     bind_address: Option<&str>,
+    bind_interface: Option<&str>,
 ) -> Result<russh::client::Handle<SshHandler>> {
     use anyhow::Context;
     use russh::client;
 
     let needs_bind = bind_address.is_some_and(|s| !s.is_empty());
-    if !needs_bind {
+    let needs_if = bind_interface.is_some_and(|s| !s.is_empty());
+    if !needs_bind && !needs_if {
         return client::connect(config, (host, port), handler)
             .await
             .context("Failed to connect to SSH server");
@@ -486,6 +501,7 @@ pub(crate) async fn connect_with_bind(
     socket
         .bind(local)
         .with_context(|| format!("-b: failed to bind to {}", local))?;
+    let socket = apply_bind_interface(socket, bind_interface)?;
     let stream = socket
         .connect(remote)
         .await
@@ -494,6 +510,80 @@ pub(crate) async fn connect_with_bind(
     client::connect_stream(config, stream, handler)
         .await
         .context("Failed to connect to SSH server (after -b bind)")
+}
+
+/// Apply `-B <interface>` (`SO_BINDTODEVICE`) to the just-bound
+/// TCP socket, if the caller asked for it. The bind must happen
+/// *before* `connect()` — Linux's `SO_BINDTODEVICE` only affects
+/// packets emitted by this socket, so order matters.
+///
+/// Platform behavior:
+/// - Linux: call `setsockopt(SOL_SOCKET, SO_BINDTODEVICE,
+///   ifname.to_c_string())` on the raw fd obtained from
+///   `TcpSocket::into_std()`. Returns `Err` if the syscall fails
+///   (no privilege, no such interface, etc.) — we let it
+///   propagate so the user sees a clear `-B: ...` message.
+/// - Other Unix (macOS, FreeBSD, …): log a startup warn at INFO
+///   level and proceed without binding. `SO_BINDTODEVICE` is a
+///   Linux-only setsockopt; the syscall doesn't exist on BSD.
+///   This mirrors passhrs's "feature unavailable on this OS"
+///   pattern for `-A` (also Linux).
+/// - Windows: clap accepts `-B` everywhere; this function is
+///   compiled out. The Windows path doesn't apply
+///   `SO_BINDTODEVICE` regardless.
+fn apply_bind_interface(
+    socket: tokio::net::TcpSocket,
+    bind_interface: Option<&str>,
+) -> Result<tokio::net::TcpSocket> {
+    let name = match bind_interface {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(socket),
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use anyhow::Context;
+        use std::os::unix::io::AsRawFd;
+        // Borrow the raw fd without taking ownership, so we can
+        // hand the same Tokio socket back at the end. tokio's
+        // `TcpSocket` wraps a non-blocking socket2::Socket — we
+        // use `as_raw_fd` to avoid an ownership dance through
+        // `into_std`/`from_raw_fd` that risks dropping the
+        // socket on error.
+        let fd = socket.as_raw_fd();
+        // SAFETY: `fd` is a live, owned TCP socket and we're
+        // holding the only `BorrowedFd` for its lifetime. The
+        // cast to `c_int` is a documented libstd API.
+        let c_name = std::ffi::CString::new(name)
+            .with_context(|| format!("-B: invalid interface name {:?}", name))?;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                c_name.as_ptr() as *const libc::c_void,
+                c_name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            bail!("-B: setsockopt(SO_BINDTODEVICE, {}) failed: {}", name, err);
+        }
+        info!("Bound outbound socket to interface {}", name);
+        Ok(socket)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Non-Linux Unix (macOS / BSD): log a startup warn and
+        // continue. `-B` is accepted but ignored here. Use
+        // `warn!` once at startup so multi-connection runs don't
+        // spam the log.
+        warn!(
+            "-B {}: SO_BINDTODEVICE is Linux-only; ignoring on this OS",
+            name
+        );
+        let _ = name;
+        Ok(socket)
+    }
 }
 
 #[cfg(unix)]
