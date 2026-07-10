@@ -56,6 +56,101 @@ fn test_control_socket() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
+// `-O <cmd>`: control command sent to a master at `-S <path>`
+// (`check` / `exit` / `stop`). Companion to `-S` (Issue #54).
+// These clap-acceptance tests pin the parser surface; the
+// connect/dispatch behavior is verified end-to-end in
+// tests/15 (`test_control_command_*`). The `-S` path is required
+// (the runtime rejects `-O` without `-S` with its own error
+// message) but `dest_str` is NOT required — `-O` is a
+// control-client operation, not an SSH invocation.
+//
+// Unix-only: `-O` rides on Issue #29's Unix-domain-socket
+// protocol. The Windows equivalent is a follow-up issue (named
+// pipes). On Windows the `-O` dispatch in main.rs is compiled
+// out, so `-O check` falls through to the empty-destination
+// print-help path and exits 0 — which the assertion below
+// would catch as a false failure. Gating on `cfg(unix)` keeps
+// the test set honest about what the binary can actually do
+// on each platform.
+#[cfg(unix)]
+#[test]
+fn test_control_command_short_check() {
+    // `-O check` must be accepted even without a destination —
+    // the early-exit in `main()` runs before the help fallback.
+    // We can't assert on the exact behavior here because the
+    // control socket path /tmp/...sock doesn't exist; we just
+    // pin that clap accepts the combination and the binary
+    // doesn't crash on a parser-level error.
+    let (ok, _, stderr) = run_phr(&["-O", "check", "-S", "/tmp/phr-ctrl-cmd.sock"]);
+    // ok=false is fine — the runtime rejects the missing master;
+    // what we DON'T want is a clap "unexpected argument" or
+    // "a value is required" failure.
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should recognize -O, but stderr complains: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("a value is required"),
+        "clap should accept the -O value, but stderr complains: {}",
+        stderr
+    );
+    assert!(!ok, "with no live master, -O check must exit non-zero");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_control_command_short_exit() {
+    let (ok, _, stderr) = run_phr(&["-O", "exit", "-S", "/tmp/phr-ctrl-cmd.sock"]);
+    assert!(!stderr.contains("unexpected argument"), "{}", stderr);
+    assert!(!stderr.contains("a value is required"), "{}", stderr);
+    assert!(!ok, "with no live master, -O exit must exit non-zero");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_control_command_short_stop() {
+    // `stop` is OpenSSH's alias for `exit`. The clap parser
+    // accepts any string as the value; the runtime dispatches.
+    let (ok, _, stderr) = run_phr(&["-O", "stop", "-S", "/tmp/phr-ctrl-cmd.sock"]);
+    assert!(!stderr.contains("unexpected argument"), "{}", stderr);
+    assert!(!stderr.contains("a value is required"), "{}", stderr);
+    assert!(!ok, "with no live master, -O stop must exit non-zero");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_control_command_long() {
+    let (ok, _, stderr) = run_phr(&[
+        "--control-command",
+        "check",
+        "--control-path",
+        "/tmp/phr-ctrl-cmd.sock",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+    assert!(
+        !ok,
+        "with no live master, long form must also exit non-zero"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_control_command_requires_s() {
+    // `-O check` without `-S` is a runtime error (the control
+    // module needs a path to connect to). We verify clap accepts
+    // the combination and the binary's stderr mentions the
+    // missing `-S`.
+    let (ok, _, stderr) = run_phr(&["-O", "check"]);
+    assert!(!ok, "-O without -S must exit non-zero");
+    assert!(
+        stderr.contains("-O requires") || stderr.contains("-S"),
+        "expected a runtime message about -S requirement, got: {:?}",
+        stderr
+    );
+}
+
 // `-Q <what>`: list supported algorithms. No SSH traffic, no
 // destination. Each variant exits 0 and prints at least one name
 // on stdout. `-Q help` lists the accepted queries. `-Q bogus`

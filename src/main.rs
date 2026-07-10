@@ -229,6 +229,46 @@ async fn main() {
         std::process::exit(query::dispatch(&cli.query));
     }
 
+    // `-O <cmd>`: send a control verb (`check` / `exit` /
+    // `stop`) to the master at `-S <path>` and exit. Like
+    // `-Q`, this is a pure control-client operation — no SSH
+    // session is established, no destination is required. We
+    // dispatch here in `main()` (before `run()`) so the
+    // empty-destination print-help fallback below doesn't trap
+    // a bare `passhrs -O check -S /tmp/p.sock`. Issue #54.
+    #[cfg(unix)]
+    if let Some(cmd) = cli.control_command.as_deref() {
+        let ctrl_path = match cli.control_path.as_deref() {
+            Some(p) => std::path::Path::new(p),
+            None => {
+                eprintln!("passhrs: -O requires -S <control-path>");
+                std::process::exit(1);
+            }
+        };
+        match control::send_control_command(ctrl_path, cmd).await {
+            control::CtrlReply::Running(pid) => {
+                eprintln!("Master running (pid={})", pid);
+                std::process::exit(0);
+            }
+            control::CtrlReply::Exiting => {
+                eprintln!("Master exiting");
+                std::process::exit(0);
+            }
+            control::CtrlReply::NoMaster => {
+                eprintln!("No master running at {}", ctrl_path.display());
+                std::process::exit(1);
+            }
+            control::CtrlReply::UnknownReply => {
+                eprintln!(
+                    "passhrs: -O {}: master at {} replied with an unexpected payload",
+                    cmd,
+                    ctrl_path.display()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Run the actual work. The verbose ladder preserves the
     // existing {:#?} Debug dump so -v / -vv / --debug-all
     // continues to show the full anyhow chain. Only the default

@@ -196,7 +196,7 @@ ssh:   passhrs:   description
  -k    ❌  —        Disable GSSAPI delegation
  -M    ❌  —        ControlMaster mode
  -m    ✅  -m       MAC algorithm (comma-separated, priority order)
- -O    ❌  —        Control command
+ -O    ✅  -O       Control command (`check` / `exit` / `stop` on -S master)
  -Q    ✅  -Q       Query algorithms (cipher|mac|kex|compression|key|help)
  -s    ❌  —        SSH subsystem
  -T    ✅  -T       Disable PTY allocation
@@ -213,9 +213,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **28**| **65%** |
+| **Implemented**       | **29**| **67%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~20   | 47%   |
+| Not implemented       | ~19   | 44%   |
 
 ### Not Implemented — Notes
 
