@@ -852,3 +852,61 @@ fn test_x11_disable_overrides_enable() {
         );
     }
 }
+
+// `-W <host>:<port>` / `--stdio-forward <host>:<port>`:
+// forward local stdio to host:port via sshd. Used to tunnel
+// RDP/VNC/HTTPS through an SSH bastion that doesn't expose
+// `-L`. Issue #63.
+//
+// The clap-acceptance tests here pin the parser surface;
+// the runtime byte-pump (stdin ↔ direct-tcpip channel) is
+// unit-tested in `src/cli.rs` via the `stdio_forward_tests`
+// mod plus an integration test in `tests/15_native_sshd_integration.rs`
+// (when added).
+#[test]
+fn test_stdio_forward_short() {
+    let (_, _, stderr) = run_phr(&["-W", "rdp.internal:3389", "user@localhost"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_stdio_forward_long() {
+    let (_, _, stderr) = run_phr(&["--stdio-forward", "192.0.2.10:8080", "user@localhost"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_stdio_forward_ipv6_bracketed() {
+    // IPv6 must be bracketed (`[::1]:port`), not bare
+    // (`::1:port`). The clap-acceptance layer accepts the
+    // value; the value-level validation happens in
+    // `parse_stdio_forward` (covered by unit tests).
+    let (_, _, stderr) = run_phr(&["-W", "[::1]:3389", "user@localhost"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_stdio_forward_with_no_command_flag() {
+    // `-W` already implies "no command"; combining with `-N`
+    // is a no-op rather than an error (matches OpenSSH).
+    let (_, _, stderr) = run_phr(&["-W", "rdp.internal:3389", "-N", "user@localhost"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_stdio_forward_combined_with_command() {
+    // `-W` with a trailing command is a parse error per
+    // OpenSSH semantics: the user is supposed to be piping
+    // a protocol's stdio, not running a remote command.
+    // The parser accepts the combination (it doesn't try to
+    // be clever about which mode wins); the runtime path
+    // takes the `-W` branch and never reaches exec.
+    let (_, _, stderr) = run_phr(&[
+        "-W",
+        "rdp.internal:3389",
+        "user@localhost",
+        "echo",
+        "from-remote",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}

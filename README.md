@@ -5,7 +5,7 @@
 ## Features
 
 ### SSH Standard Compatible Options
-`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-X` `-x` `-Y`
+`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-X` `-x` `-Y` `-W`
 
 | Option    | Description                        |
 |:----------|:-----------------------------------|
@@ -204,7 +204,8 @@ ssh:   passhrs:   description
  -s    ❌  —        SSH subsystem
  -T    ✅  -T       Disable PTY allocation
  -V    ✅  -V       Version
- -W    ❌  —        Tunnel forwarding
+ -W    ✅  -W       Forward stdio to host:port (via sshd's direct-tcpip; RDP/VNC tunneling through bastion; Issue #63)
+-w    ❌  —        Tunnel device (TUN/TAP; not implemented — Linux-only, requires CAP_NET_ADMIN; follow-up)
  -w    ❌  —        Tunnel device
  -x    ✅  -x       Disable X11 forwarding (parser-only for now; channel pump lands in follow-up; Issue #59)
  -X    ✅  -X       Enable X11 forwarding (subject to X11 SECURITY extension; parser-only for now; channel pump lands in follow-up; Issue #59)
@@ -217,9 +218,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **36**| **84%** |
+| **Implemented**       | **37**| **86%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~12   | 28%   |
+| Not implemented       | ~11   | 26%   |
 
 ### Not Implemented — Notes
 
