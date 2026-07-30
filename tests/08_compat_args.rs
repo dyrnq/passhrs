@@ -763,16 +763,36 @@ fn test_full_openssl_compatible() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
-// `-Y` / `--x11-forward-trusted`: enable **trusted** X11
-// forwarding. Skips the X server's `xauth` cookie check, used
-// for forwarding to servers that can't validate the cookie
-// locally (Windows X servers, MobaXterm, etc.). Issue #59.
+// `-X` / `--x11-forward`: enable **untrusted** X11
+// forwarding. Subject to the X server's `xauth` cookie check
+// (the X11 SECURITY extension controls). Distinct from `-Y`
+// (trusted, which skips the cookie check) and `-x` (disable).
+// Matches OpenSSH semantics: `-x` (disable) > `-Y` (trusted)
+// > `-X` (untrusted) > default Off. Issue #59.
 //
 // These are clap-acceptance tests pinning the parser surface;
 // the actual `x11-req@openssh.com` channel-request and the
 // `server_channel_open_x11` byte pump land in a follow-up PR.
 // Today the runtime accepts the flag and logs at startup; no
 // X11 traffic is generated.
+#[test]
+fn test_x11_untrusted_short() {
+    let (_, _, stderr) = run_phr(&["-X", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_x11_untrusted_long() {
+    let (_, _, stderr) = run_phr(&["--x11-forward", "user@localhost", "id"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+// `-Y` / `--x11-forward-trusted`: enable **trusted** X11
+// forwarding. Skips the X server's `xauth` cookie check, used
+// for forwarding to servers that can't validate the cookie
+// locally (Windows X servers, MobaXterm, etc.). Wins over
+// `-X` (trusted subsumes untrusted); loses to `-x` (disable
+// always wins).
 #[test]
 fn test_x11_trusted_short() {
     let (_, _, stderr) = run_phr(&["-Y", "user@localhost", "id"]);
@@ -795,31 +815,33 @@ fn test_x11_trusted_with_tty_flag() {
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
-// `-X` / `--no-x11-forward`: disable X11 forwarding. Wins over
-// `-Y` when both are passed (last-on-line wins in OpenSSH,
-// `-X` wins in passhrs because the runtime treats the
-// combination as "disabled"). Issue #59.
+// `-x` / `--disable-x11-forward`: disable X11 forwarding.
+// Wins over `-X` and `-Y` when set — explicit disable always
+// overrides enable, regardless of command-line order.
 #[test]
 fn test_x11_disable_short() {
-    let (_, _, stderr) = run_phr(&["-X", "user@localhost", "id"]);
+    let (_, _, stderr) = run_phr(&["-x", "user@localhost", "id"]);
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
 #[test]
 fn test_x11_disable_long() {
-    let (_, _, stderr) = run_phr(&["--no-x11-forward", "user@localhost", "id"]);
+    let (_, _, stderr) = run_phr(&["--disable-x11-forward", "user@localhost", "id"]);
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
 
 #[test]
-fn test_x11_disable_overrides_trusted() {
-    // `-Y -X` and `-X -Y` must both parse without error. The
-    // runtime resolution (which flag wins) is tested via the
-    // unit tests on `X11ForwardingStatus` in src/ssh.rs — here
-    // we only pin that clap accepts the combination.
+fn test_x11_disable_overrides_enable() {
+    // `-x` wins over `-X` and `-Y` regardless of order. The
+    // runtime resolution is tested via the unit tests on
+    // `X11ForwardingStatus` in src/ssh.rs — here we only pin
+    // that clap accepts the combination.
     for args in [
-        vec!["-Y", "-X", "user@localhost", "id"],
-        vec!["-X", "-Y", "user@localhost", "id"],
+        vec!["-Y", "-x", "user@localhost", "id"],
+        vec!["-x", "-Y", "user@localhost", "id"],
+        vec!["-X", "-x", "user@localhost", "id"],
+        vec!["-x", "-X", "user@localhost", "id"],
+        vec!["-X", "-Y", "-x", "user@localhost", "id"],
     ] {
         let (_, _, stderr) = run_phr(&args);
         assert!(

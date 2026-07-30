@@ -611,13 +611,17 @@ async fn run(cli: Cli) -> Result<()> {
             (*user_known_hosts).clone(),
             agent_sock_path.clone(),
             cli.accept_all_host_keys,
-            // `-Y` / `-X`: X11 forwarding is plumbed end-to-end
-            // (CLI → SshHandler field) but the actual
-            // `x11-req@openssh.com` channel-request + the
-            // `server_channel_open_x11` byte pump land in a
-            // follow-up PR. Today both flags are no-ops at
-            // runtime; the handler's info!() log surfaces them
-            // so users can script around it. Issue #59.
+            // `-X` / `-x` / `-Y`: X11 forwarding is plumbed
+            // end-to-end (CLI → SshHandler field) but the
+            // actual `x11-req@openssh.com` channel-request +
+            // the `server_channel_open_x11` byte pump land
+            // in a follow-up PR. Today all three flags are
+            // no-ops at runtime; the handler's info!() log
+            // surfaces the resolved state so users can script
+            // around it. Resolution order:
+            // `-x` (disable) > `-Y` (trusted) > `-X` (untrusted)
+            // > default Off. Issue #59.
+            cli.forward_x11,
             cli.forward_x11_trusted,
             cli.disable_x11,
         );
@@ -629,11 +633,14 @@ async fn run(cli: Cli) -> Result<()> {
         // channel-request and the `server_channel_open_x11`
         // byte pump land in a follow-up PR. Issue #59.
         match handler.x11_status() {
+            crate::ssh::X11ForwardingStatus::Untrusted => {
+                info!("X11 forwarding: untrusted (-X) accepted; channel pump lands in follow-up")
+            }
             crate::ssh::X11ForwardingStatus::Trusted => {
                 info!("X11 forwarding: trusted (-Y) accepted; channel pump lands in follow-up")
             }
             crate::ssh::X11ForwardingStatus::Disabled => {
-                info!("X11 forwarding: disabled (-X) wins over -Y when both are set")
+                info!("X11 forwarding: disabled (-x) wins over -X and -Y")
             }
             crate::ssh::X11ForwardingStatus::Off => {}
         }
@@ -672,12 +679,12 @@ async fn run(cli: Cli) -> Result<()> {
                 cli.accept_all_host_keys,
                 // X11 forwarding is per-handler; the jump host
                 // and the target session each get their own
-                // boolean. The user passes `-Y`/`-X` once on
-                // the CLI; the same value reaches every
-                // handler in the chain. `-X` overrides `-Y`
-                // at the parser layer because both flags set
-                // their booleans independently and the runtime
-                // sees `disable_x11=true` short-circuit.
+                // boolean triplet. The user passes `-X`/`-x`/
+                // `-Y` once on the CLI; the same value reaches
+                // every handler in the chain. `-x` always
+                // overrides everything (see the resolution
+                // comment on the main `handler` block).
+                cli.forward_x11,
                 cli.forward_x11_trusted,
                 cli.disable_x11,
             );
@@ -728,9 +735,11 @@ async fn run(cli: Cli) -> Result<()> {
                 // pump to the same local agent.
                 agent_sock_path.clone(),
                 cli.accept_all_host_keys,
-                // X11 forwarding flag threads through every
+                // X11 forwarding flags thread through every
                 // handler in the chain; see the comment on
-                // `jump_handler` above for the policy.
+                // `jump_handler` above for the resolution
+                // policy.
+                cli.forward_x11,
                 cli.forward_x11_trusted,
                 cli.disable_x11,
             );
