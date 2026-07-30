@@ -611,8 +611,32 @@ async fn run(cli: Cli) -> Result<()> {
             (*user_known_hosts).clone(),
             agent_sock_path.clone(),
             cli.accept_all_host_keys,
+            // `-Y` / `-X`: X11 forwarding is plumbed end-to-end
+            // (CLI → SshHandler field) but the actual
+            // `x11-req@openssh.com` channel-request + the
+            // `server_channel_open_x11` byte pump land in a
+            // follow-up PR. Today both flags are no-ops at
+            // runtime; the handler's info!() log surfaces them
+            // so users can script around it. Issue #59.
+            cli.forward_x11_trusted,
+            cli.disable_x11,
         );
         handler.remote_forwards = remote_forward_map.clone();
+        // Log the resolved X11 forwarding state once at session
+        // start so users can see whether `-Y` / `-X` was
+        // honored at parse time. Today this is a no-op beyond
+        // logging; the actual `x11-req@openssh.com`
+        // channel-request and the `server_channel_open_x11`
+        // byte pump land in a follow-up PR. Issue #59.
+        match handler.x11_status() {
+            crate::ssh::X11ForwardingStatus::Trusted => {
+                info!("X11 forwarding: trusted (-Y) accepted; channel pump lands in follow-up")
+            }
+            crate::ssh::X11ForwardingStatus::Disabled => {
+                info!("X11 forwarding: disabled (-X) wins over -Y when both are set")
+            }
+            crate::ssh::X11ForwardingStatus::Off => {}
+        }
         // Clone the per-handler exit-status map BEFORE the handler
         // is moved into `Handle<SshHandler>`. `run_session` reads
         // back from this map after the channel's mpsc is closed;
@@ -646,6 +670,16 @@ async fn run(cli: Cli) -> Result<()> {
                 (*user_known_hosts).clone(),
                 agent_sock_path.clone(),
                 cli.accept_all_host_keys,
+                // X11 forwarding is per-handler; the jump host
+                // and the target session each get their own
+                // boolean. The user passes `-Y`/`-X` once on
+                // the CLI; the same value reaches every
+                // handler in the chain. `-X` overrides `-Y`
+                // at the parser layer because both flags set
+                // their booleans independently and the runtime
+                // sees `disable_x11=true` short-circuit.
+                cli.forward_x11_trusted,
+                cli.disable_x11,
             );
             let mut jump_handle = client::connect_stream(config.clone(), jump_stream, jump_handler)
                 .await
@@ -694,6 +728,11 @@ async fn run(cli: Cli) -> Result<()> {
                 // pump to the same local agent.
                 agent_sock_path.clone(),
                 cli.accept_all_host_keys,
+                // X11 forwarding flag threads through every
+                // handler in the chain; see the comment on
+                // `jump_handler` above for the policy.
+                cli.forward_x11_trusted,
+                cli.disable_x11,
             );
             target_handler.remote_forwards = remote_forward_map.clone();
 

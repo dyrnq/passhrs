@@ -5,7 +5,7 @@
 ## Features
 
 ### SSH Standard Compatible Options
-`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G`
+`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-Y` `-X`
 
 | Option    | Description                        |
 |:----------|:-----------------------------------|
@@ -29,6 +29,8 @@
 | `-A`      | Forward agent                      |
 | `-a`      | Disable agent forwarding           |
 | `-S`      | Control socket path                |
+| `-Y`      | Trusted X11 forwarding (parser-accepted; channel pump lands in follow-up — Issue #59) |
+| `-X`      | Disable X11 forwarding (overrides `-Y`; parser-accepted; channel pump lands in follow-up — Issue #59) |
 | `-o`      | SSH options (see below)            |
 
 ### Exclusive Features
@@ -204,7 +206,8 @@ ssh:   passhrs:   description
  -W    ❌  —        Tunnel forwarding
  -w    ❌  —        Tunnel device
  -x    ❌  —        Disable X11 forwarding
- -Y    ❌  —        Trusted X11 forwarding
+ -X    ✅  -X       Disable X11 forwarding (overrides -Y; parser-only for now, channel pump lands in follow-up; Issue #59)
+ -Y    ✅  -Y       Trusted X11 forwarding (skips xauth cookie check; parser-only for now, channel pump lands in follow-up; Issue #59)
  -y    ✅  -y       Accept all host keys (no check, no persist)
 ```
 
@@ -213,9 +216,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **32**| **74%** |
+| **Implemented**       | **34**| **79%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~16   | 37%   |
+| Not implemented       | ~14   | 33%   |
 
 ### Not Implemented — Notes
 
