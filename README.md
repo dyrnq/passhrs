@@ -5,7 +5,7 @@
 ## Features
 
 ### SSH Standard Compatible Options
-`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-Y` `-X`
+`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-X` `-x` `-Y`
 
 | Option    | Description                        |
 |:----------|:-----------------------------------|
@@ -29,8 +29,9 @@
 | `-A`      | Forward agent                      |
 | `-a`      | Disable agent forwarding           |
 | `-S`      | Control socket path                |
-| `-Y`      | Trusted X11 forwarding (parser-accepted; channel pump lands in follow-up — Issue #59) |
-| `-X`      | Disable X11 forwarding (overrides `-Y`; parser-accepted; channel pump lands in follow-up — Issue #59) |
+| `-X`      | Enable X11 forwarding (subject to X11 SECURITY extension; parser-accepted; channel pump lands in follow-up — Issue #59) |
+| `-x`      | Disable X11 forwarding (wins over `-X` and `-Y`; parser-accepted; channel pump lands in follow-up — Issue #59) |
+| `-Y`      | Trusted X11 forwarding (skips xauth cookie check; wins over `-X`, loses to `-x`; parser-accepted; channel pump lands in follow-up — Issue #59) |
 | `-o`      | SSH options (see below)            |
 
 ### Exclusive Features
@@ -205,9 +206,9 @@ ssh:   passhrs:   description
  -V    ✅  -V       Version
  -W    ❌  —        Tunnel forwarding
  -w    ❌  —        Tunnel device
- -x    ❌  —        Disable X11 forwarding
- -X    ✅  -X       Disable X11 forwarding (overrides -Y; parser-only for now, channel pump lands in follow-up; Issue #59)
- -Y    ✅  -Y       Trusted X11 forwarding (skips xauth cookie check; parser-only for now, channel pump lands in follow-up; Issue #59)
+ -x    ✅  -x       Disable X11 forwarding (parser-only for now; channel pump lands in follow-up; Issue #59)
+ -X    ✅  -X       Enable X11 forwarding (subject to X11 SECURITY extension; parser-only for now; channel pump lands in follow-up; Issue #59)
+ -Y    ✅  -Y       Trusted X11 forwarding (skips xauth cookie check; wins over -X, loses to -x; parser-only for now; channel pump lands in follow-up; Issue #59)
  -y    ✅  -y       Accept all host keys (no check, no persist)
 ```
 
@@ -216,9 +217,9 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **34**| **79%** |
+| **Implemented**       | **36**| **84%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~14   | 33%   |
+| Not implemented       | ~12   | 28%   |
 
 ### Not Implemented — Notes
 

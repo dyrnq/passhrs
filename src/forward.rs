@@ -145,7 +145,8 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
                 // X11 forwarding never applies to a forward-only
                 // tunnel — X11 rides on the user's interactive
                 // session, not the data-plane port forwards.
-                // Both booleans default to false here.
+                // All three booleans default to false here.
+                false,
                 false,
                 false,
             );

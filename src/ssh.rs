@@ -51,17 +51,27 @@ pub(crate) struct SshHandler {
     /// `strict_check` — every host key is accepted, no entry is
     /// appended. Issue #52.
     pub(crate) accept_all_host_keys: bool,
-    /// OpenSSH `-Y` (trusted X11 forwarding). Accepted at parse
-    /// time; the actual `x11-req@openssh.com` request and the
+    /// OpenSSH `-X` flag. Asks sshd to set up an X11 proxy
+    /// channel; the forwarded connection is subject to the
+    /// X11 SECURITY extension. Accepted at parse time; the
+    /// actual `x11-req@openssh.com` request and the
     /// `server_channel_open_x11` byte pump land in a follow-up
     /// PR. Today the field is plumbed end-to-end so the runtime
     /// can emit a single `info!` line at startup, and so the
     /// follow-up only needs to wire the channel call rather
     /// than revisit the CLI/handler plumbing. Issue #59.
+    pub(crate) forward_x11: bool,
+    /// OpenSSH `-Y` flag (trusted X11 forwarding). Skips the
+    /// X11 SECURITY extension controls; required when the
+    /// remote X server (or a forwarded $DISPLAY) can't validate
+    /// the cookie locally. Plumbed end-to-end for the same
+    /// reason as `forward_x11`. Issue #59.
     pub(crate) forward_x11_trusted: bool,
-    /// OpenSSH `-X` (disable X11 forwarding). Wins over `-Y`
-    /// when both are set (matches OpenSSH). Plumbed end-to-end
-    /// for the same reason as `forward_x11_trusted`. Issue #59.
+    /// OpenSSH `-x` flag (disable X11 forwarding). Wins over
+    /// `-X` and `-Y` when set — explicit disable always
+    /// overrides enable, regardless of command-line order.
+    /// Plumbed end-to-end for the same reason as
+    /// `forward_x11`. Issue #59.
     pub(crate) disable_x11: bool,
 }
 
@@ -74,6 +84,7 @@ impl SshHandler {
         known_hosts_path: Option<String>,
         agent_sock_path: Option<PathBuf>,
         accept_all_host_keys: bool,
+        forward_x11: bool,
         forward_x11_trusted: bool,
         disable_x11: bool,
     ) -> Self {
@@ -86,6 +97,7 @@ impl SshHandler {
             agent_sock_path,
             exit_statuses: Arc::new(Mutex::new(HashMap::new())),
             accept_all_host_keys,
+            forward_x11,
             forward_x11_trusted,
             disable_x11,
         }
@@ -103,33 +115,45 @@ impl SshHandler {
     }
 
     /// Effective X11 forwarding state as resolved from the
-    /// `-Y` / `-X` flags. Used by the runtime to log the
-    /// resolution at session start (today the resolution is
-    /// the no-op "trusted / disabled" pair; the channel-pump
-    /// follow-up will branch on the returned enum). Issue #59.
+    /// `-X` / `-x` / `-Y` flags. Used by the runtime to log
+    /// the resolution at session start (today the resolution
+    /// is a no-op "trusted / untrusted / disabled" trio; the
+    /// channel-pump follow-up will branch on the returned enum).
+    /// Resolution order matches OpenSSH:
+    ///   1. `-x` (disable) always wins — X11 is OFF.
+    ///   2. else `-Y` (trusted) wins over `-X` — trusted X11.
+    ///   3. else `-X` — untrusted X11.
+    ///   4. else default — X11 is OFF.
+    ///
+    /// Issue #59.
     pub(crate) fn x11_status(&self) -> X11ForwardingStatus {
         if self.disable_x11 {
             X11ForwardingStatus::Disabled
         } else if self.forward_x11_trusted {
             X11ForwardingStatus::Trusted
+        } else if self.forward_x11 {
+            X11ForwardingStatus::Untrusted
         } else {
             X11ForwardingStatus::Off
         }
     }
 }
 
-/// X11 forwarding state resolved from `-Y` / `-X`. The runtime
-/// uses this to decide whether to send `x11-req@openssh.com`
-/// (when the follow-up PR lands); today the variants drive a
-/// startup `info!` line and nothing else. Issue #59.
+/// X11 forwarding state resolved from `-X` / `-x` / `-Y`. The
+/// runtime uses this to decide whether to send
+/// `x11-req@openssh.com` (when the follow-up PR lands); today
+/// the variants drive a startup `info!` line and nothing else.
+/// Issue #59.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum X11ForwardingStatus {
-    /// `-X` passed (or `-Y -X` order). X11 is OFF.
-    Disabled,
-    /// `-Y` passed without `-X`. Trusted X11.
-    Trusted,
-    /// Neither `-Y` nor `-X` passed. X11 is OFF (default).
+    /// Neither `-X` nor `-x` nor `-Y` passed. X11 is OFF.
     Off,
+    /// `-X` only (without `-x` or `-Y`). Untrusted X11.
+    Untrusted,
+    /// `-Y` only (without `-x`). Trusted X11.
+    Trusted,
+    /// `-x` passed (wins over everything). X11 is OFF.
+    Disabled,
 }
 
 impl Handler for SshHandler {
@@ -1163,17 +1187,20 @@ mod tests {
 
 #[cfg(test)]
 mod x11_tests {
-    //! Unit tests for the `-Y` / `-X` resolution in
+    //! Unit tests for the `-X` / `-x` / `-Y` resolution in
     //! `SshHandler::x11_status`. The clap-acceptance tests in
     //! `tests/08_compat_args.rs` pin the parser surface; here we
     //! pin the state machine so a future follow-up PR that wires
     //! the `x11-req@openssh.com` channel-request sees the
     //! expected `X11ForwardingStatus` for each flag combination.
+    //!
+    //! Resolution (matches OpenSSH): `-x` (disable) > `-Y`
+    //! (trusted) > `-X` (untrusted) > default Off.
     use super::X11ForwardingStatus;
     use crate::ssh::SshHandler;
     use std::path::PathBuf;
 
-    fn handler(forward_x11_trusted: bool, disable_x11: bool) -> SshHandler {
+    fn handler(forward_x11: bool, forward_x11_trusted: bool, disable_x11: bool) -> SshHandler {
         SshHandler::new(
             true,
             "h".into(),
@@ -1181,6 +1208,7 @@ mod x11_tests {
             None,
             None,
             false,
+            forward_x11,
             forward_x11_trusted,
             disable_x11,
         )
@@ -1188,38 +1216,68 @@ mod x11_tests {
 
     #[test]
     fn default_is_off() {
-        // Neither `-Y` nor `-X`: X11 is off (default OpenSSH behavior).
-        let h = handler(false, false);
+        // No X11 flags: X11 is off (default OpenSSH behavior).
+        let h = handler(false, false, false);
         assert_eq!(h.x11_status(), X11ForwardingStatus::Off);
     }
 
     #[test]
+    fn untrusted_when_x_only() {
+        // `-X` alone: untrusted X11 forwarding.
+        let h = handler(true, false, false);
+        assert_eq!(h.x11_status(), X11ForwardingStatus::Untrusted);
+    }
+
+    #[test]
     fn trusted_when_y_only() {
-        let h = handler(true, false);
+        // `-Y` alone: trusted X11 forwarding.
+        let h = handler(false, true, false);
         assert_eq!(h.x11_status(), X11ForwardingStatus::Trusted);
     }
 
     #[test]
-    fn disabled_when_x_only() {
-        let h = handler(false, true);
+    fn disabled_when_x_disable_only() {
+        // `-x` alone: X11 is OFF.
+        let h = handler(false, false, true);
         assert_eq!(h.x11_status(), X11ForwardingStatus::Disabled);
     }
 
     #[test]
+    fn trusted_wins_over_untrusted() {
+        // `-X -Y` and `-Y -X` both resolve to Trusted —
+        // trusted subsumes untrusted.
+        let h = handler(true, true, false);
+        assert_eq!(h.x11_status(), X11ForwardingStatus::Trusted);
+    }
+
+    #[test]
     fn disabled_wins_over_trusted() {
-        // `-Y -X` and `-X -Y` both resolve to Disabled —
-        // passhrs treats `-X` as the unconditional override
-        // (matching OpenSSH semantics: when both are passed,
-        // X11 is off).
-        let h = handler(true, true);
+        // `-Y -x` and `-x -Y` both resolve to Disabled —
+        // explicit disable overrides everything, regardless of
+        // command-line order.
+        let h = handler(false, true, true);
+        assert_eq!(h.x11_status(), X11ForwardingStatus::Disabled);
+    }
+
+    #[test]
+    fn disabled_wins_over_untrusted() {
+        // `-X -x` and `-x -X` both resolve to Disabled.
+        let h = handler(true, false, true);
+        assert_eq!(h.x11_status(), X11ForwardingStatus::Disabled);
+    }
+
+    #[test]
+    fn disabled_wins_over_all() {
+        // `-X -Y -x` resolves to Disabled. All three together.
+        let h = handler(true, true, true);
         assert_eq!(h.x11_status(), X11ForwardingStatus::Disabled);
     }
 
     #[test]
     fn fields_round_trip_through_constructor() {
-        // Pin that `forward_x11_trusted` and `disable_x11`
-        // actually survive being moved into the struct.
-        let h = handler(true, false);
+        // Pin that all three booleans actually survive being
+        // moved into the struct.
+        let h = handler(true, true, false);
         // Force a use of the struct so the unused-field lint
         // doesn't kick in if the resolution path changes.
         assert!(h.x11_status() == X11ForwardingStatus::Trusted);

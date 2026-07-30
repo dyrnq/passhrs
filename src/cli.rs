@@ -229,28 +229,42 @@ pub(crate) struct Cli {
     /// ignored otherwise. Issue #57.
     #[arg(short = 'e', long = "escape-char", value_name = "ch|none")]
     pub(crate) escape_char: Option<String>,
+    /// Enable X11 forwarding (OpenSSH `-X`). Asks sshd to set up
+    /// an X11 proxy channel and sets `$DISPLAY` on the remote
+    /// shell. The forwarded connection is subject to the X11
+    /// SECURITY extension — modern X servers will reject
+    /// untrusted clients, which is why `-Y` (trusted) is the
+    /// usual choice in practice. The actual `x11-req@openssh.com`
+    /// channel-request and the `server_channel_open_x11` byte
+    /// pump land in a follow-up PR; for now `-X` is a
+    /// parser-accepted no-op that logs at startup so users can
+    /// script around it. Issue #59.
+    #[arg(short = 'X', long = "x11-forward")]
+    pub(crate) forward_x11: bool,
+    /// Disable X11 forwarding (OpenSSH `-x`). Wins over `-X`
+    /// and `-Y` when set — explicit disable always overrides
+    /// enable, regardless of order on the command line (matches
+    /// OpenSSH: the resolution is "if `-x` is set, X11 is off;
+    /// else if `-Y` is set, X11 is trusted; else if `-X` is
+    /// set, X11 is untrusted; else X11 is off"). Accepted by
+    /// clap; runtime effect is a no-op until the follow-up PR
+    /// ships the X11 channel pump. Issue #59.
+    #[arg(short = 'x', long = "disable-x11-forward")]
+    pub(crate) disable_x11: bool,
     /// Enable **trusted** X11 forwarding (OpenSSH `-Y`). Like
     /// `-X` this asks sshd to set up an X11 proxy channel, but
     /// skips the X server's `xauth` cookie check — required
     /// when the remote X server (or a forwarded $DISPLAY) can't
     /// validate the cookie locally (Windows X servers, some
-    /// containerized X setups, MobaXterm, etc.). Distinct from
-    /// `-X` (which performs untrusted X11 forwarding and is
-    /// safer but more restrictive on modern X servers). The
-    /// actual `x11-req@openssh.com` request and the
+    /// containerized X setups, MobaXterm, etc.). Wins over
+    /// `-X` when both are passed (trusted subsumes untrusted).
+    /// Loses to `-x` (disable always wins). The actual
+    /// `x11-req@openssh.com` request and the
     /// `server_channel_open_x11` pump land in a follow-up PR;
     /// for now `-Y` is a parser-accepted no-op that logs at
     /// startup so users can script around it. Issue #59.
     #[arg(short = 'Y', long = "x11-forward-trusted")]
     pub(crate) forward_x11_trusted: bool,
-    /// Disable X11 forwarding (OpenSSH `-X`). Wins over `-Y`
-    /// when both are passed (matches OpenSSH: `-X -Y` resolves
-    /// to "no X11", `-Y -X` resolves to "no X11" too — last
-    /// flag on the command line wins at the runtime layer).
-    /// Accepted by clap; runtime effect is a no-op until the
-    /// follow-up PR ships the X11 channel pump. Issue #59.
-    #[arg(short = 'X', long = "no-x11-forward")]
-    pub(crate) disable_x11: bool,
 }
 
 pub(crate) fn parse_destination(dest: &str) -> Result<(String, Option<String>, u16)> {
