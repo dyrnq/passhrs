@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use log::*;
 use russh::client::{self};
+use russh::ChannelMsg;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -966,6 +967,89 @@ async fn run(cli: Cli) -> Result<()> {
             && (!remote_forwards.is_empty()
                 || !dynamic_forwards.is_empty()
                 || !http_connects.is_empty());
+        // `-W <host>:<port>` (stdio forward, Issue #63):
+        // mutually exclusive with file-transfer modes
+        // (--push/--pull/--rsync). Those modes never open a
+        // session channel; if both are set the user has
+        // confused the two and we should fail loudly rather
+        // than silently drop one of them.
+        if (!cli.push.is_empty() || !cli.pull.is_empty() || !cli.rsync.is_empty())
+            && cli.stdio_forward.is_some()
+        {
+            bail!(
+                "-W (stdio forward) is mutually exclusive with --push/--pull/--rsync; \
+                 use one mode or the other, not both"
+            );
+        }
+        if let Some(ref spec) = cli.stdio_forward {
+            // `-W host:port`: open direct-tcpip from sshd to
+            // host:port, then pump local stdio ↔ channel
+            // bytes bidirectionally. No PTY, no shell, no
+            // command — the protocol on the wire is whatever
+            // the remote endpoint speaks (RDP, VNC, custom
+            // TLS, etc.). Issue #63.
+            //
+            // Mutual exclusion with -N (no_command): OpenSSH
+            // allows `-W -N` because `-W` already implies
+            // "no command"; we mirror that — when `-W` is set,
+            // we skip the session-channel branch entirely
+            // regardless of `-N`.
+            let (host, port) = parse_stdio_forward(spec)
+                .with_context(|| format!("invalid -W host:port: {:?}", spec))?;
+            info!("stdio forward: sshd will dial {}:{}", host, port);
+            let channel = handle
+                .channel_open_direct_tcpip(host.as_str(), port as u32, "127.0.0.1", 0u32)
+                .await
+                .with_context(|| {
+                    format!(
+                        "stdio forward: sshd refused direct-tcpip channel to {}:{}",
+                        host, port
+                    )
+                })?;
+            // Byte pump: mirror the SOCKS5 / HTTP-CONNECT
+            // pump pattern at `src/proxy.rs:148-180`. Two
+            // tokio tasks — channel→stdout and stdin→channel
+            // — joined via `tokio::join!`. Either side
+            // closing terminates the pump; the program exits
+            // when both tasks complete.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut crx, ctx) = channel.split();
+            let mut stdout = tokio::io::stdout();
+            let c2s = tokio::spawn(async move {
+                loop {
+                    match crx.wait().await {
+                        Some(ChannelMsg::Data { ref data }) => {
+                            if stdout.write_all(data).await.is_err() {
+                                break;
+                            }
+                            let _ = stdout.flush().await;
+                        }
+                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                        _ => {}
+                    }
+                }
+            });
+            let mut stdin = tokio::io::stdin();
+            let s2c = tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match stdin.read(&mut buf).await {
+                        Ok(0) => {
+                            let _ = ctx.eof().await;
+                            break;
+                        }
+                        Ok(n) => {
+                            if ctx.data(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            let _ = tokio::join!(c2s, s2c);
+            return Ok(());
+        }
         if !pure_fwd {
             let channel = handle.channel_open_session().await?;
             // -A agent forwarding (Issue #23): tell sshd that we

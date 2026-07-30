@@ -265,6 +265,23 @@ pub(crate) struct Cli {
     /// startup so users can script around it. Issue #59.
     #[arg(short = 'Y', long = "x11-forward-trusted")]
     pub(crate) forward_x11_trusted: bool,
+    /// Forward local stdio to `host:port` via the SSH session
+    /// (OpenSSH `-W <host>:<port>`). Used for tunneling
+    /// application protocols (RDP/VNC/HTTPS) through an SSH
+    /// bastion that doesn't expose port forwarding. passhrs
+    /// opens a `direct-tcpip` channel from sshd to
+    /// `<host>:<port>` and pumps bytes bidirectionally: local
+    /// stdin → channel → remote, channel → remote socket →
+    /// remote → channel → local stdout. No PTY, no shell, no
+    /// command — the protocol on the wire is whatever the
+    /// remote endpoint speaks. Mutually exclusive with
+    /// `--push` / `--pull` / `--rsync` (those are file-transfer
+    /// modes that don't establish a session channel) and
+    /// ignored when combined with `-N` (no_command) because
+    /// `-W` already implies "no command, just tunnel". Issue
+    /// #63.
+    #[arg(short = 'W', long = "stdio-forward", value_name = "host:port")]
+    pub(crate) stdio_forward: Option<String>,
 }
 
 pub(crate) fn parse_destination(dest: &str) -> Result<(String, Option<String>, u16)> {
@@ -409,6 +426,59 @@ pub(crate) fn parse_proxy_jump(spec: &str) -> Result<ProxyJumpSpec> {
         (rest.to_string(), 22)
     };
     Ok(ProxyJumpSpec { user, host, port })
+}
+
+/// Parse `-W <host>:<port>`. Format mirrors OpenSSH's
+/// `-W host:port`: a single colon separates host and port,
+/// and an IPv6 literal may be bracketed (`-W [::1]:8080`).
+/// No `user@` prefix and no default port — the user must
+/// supply the port (sshd dials this exact pair from the
+/// remote side; passhrs only owns the byte pump on the
+/// local side). Issue #63.
+pub(crate) fn parse_stdio_forward(spec: &str) -> Result<(String, u16)> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        bail!("-W: empty host:port (expected host:port)");
+    }
+    if let Some(rest) = spec.strip_prefix('[') {
+        // Bracketed IPv6: `[::1]:8080` or `[::1]`.
+        let end = rest
+            .find(']')
+            .with_context(|| format!("-W: unclosed bracket in host:port: {}", spec))?;
+        let host = rest[..end].to_string();
+        let after = &rest[end + 1..];
+        if after.is_empty() {
+            bail!("-W: missing port after host (expected host:port): {}", spec);
+        }
+        if !after.starts_with(':') {
+            bail!("-W: expected ':' after ']' in IPv6 literal: {}", spec);
+        }
+        let port: u16 = after[1..]
+            .parse()
+            .with_context(|| format!("-W: invalid port in host:port: {}", spec))?;
+        Ok((host, port))
+    } else if let Some(colon_pos) = spec.rfind(':') {
+        // Bare IPv6 (no brackets) is ambiguous — sshd
+        // rejects it, so do the same. OpenSSH requires the
+        // brackets for IPv6 to disambiguate from
+        // `host:port`.
+        if spec[..colon_pos].contains(':') {
+            bail!(
+                "-W: IPv6 literal must be bracketed (use [::1]:port, not ::1:port): {}",
+                spec
+            );
+        }
+        let host = spec[..colon_pos].to_string();
+        let port: u16 = spec[colon_pos + 1..]
+            .parse()
+            .with_context(|| format!("-W: invalid port in host:port: {}", spec))?;
+        if host.is_empty() {
+            bail!("-W: missing host in host:port: {}", spec);
+        }
+        Ok((host, port))
+    } else {
+        bail!("-W: missing port (expected host:port): {}", spec);
+    }
 }
 
 pub(crate) fn parse_forward_spec(spec: &str, gateway_ports: bool) -> Result<ForwardSpec> {
@@ -1029,6 +1099,96 @@ mod forward_spec_tests {
         assert_eq!(d.bind_addr, "0.0.0.0");
         let d = parse_dynamic_spec("127.0.0.1:1080", true).unwrap();
         assert_eq!(d.bind_addr, "127.0.0.1");
+    }
+}
+
+#[cfg(test)]
+mod stdio_forward_tests {
+    //! Unit tests for the `-W <host>:<port>` parser (Issue
+    //! #63). The clap-acceptance tests in
+    //! `tests/08_compat_args.rs` pin the parser surface; here
+    //! we pin the resolution so a future change to
+    //! `parse_stdio_forward` doesn't silently break IPv6
+    //! or fail-open on empty input.
+    use super::parse_stdio_forward;
+
+    #[test]
+    fn hostname_and_port() {
+        assert_eq!(
+            parse_stdio_forward("rdp.internal:3389").unwrap(),
+            ("rdp.internal".to_string(), 3389u16)
+        );
+    }
+
+    #[test]
+    fn ipv4_and_port() {
+        assert_eq!(
+            parse_stdio_forward("192.0.2.10:8080").unwrap(),
+            ("192.0.2.10".to_string(), 8080u16)
+        );
+    }
+
+    #[test]
+    fn bracketed_ipv6_and_port() {
+        assert_eq!(
+            parse_stdio_forward("[::1]:3389").unwrap(),
+            ("::1".to_string(), 3389u16)
+        );
+        assert_eq!(
+            parse_stdio_forward("[2001:db8::1]:443").unwrap(),
+            ("2001:db8::1".to_string(), 443u16)
+        );
+    }
+
+    #[test]
+    fn bare_ipv6_is_rejected() {
+        // OpenSSH requires brackets for IPv6 to disambiguate
+        // from host:port. Without brackets, the parser can't
+        // tell where host ends and port begins.
+        assert!(parse_stdio_forward("::1:3389").is_err());
+    }
+
+    #[test]
+    fn missing_port_is_error() {
+        assert!(parse_stdio_forward("rdp.internal").is_err());
+    }
+
+    #[test]
+    fn empty_input_is_error() {
+        assert!(parse_stdio_forward("").is_err());
+        assert!(parse_stdio_forward("   ").is_err());
+    }
+
+    #[test]
+    fn unclosed_bracket_is_error() {
+        assert!(parse_stdio_forward("[::1:3389").is_err());
+    }
+
+    #[test]
+    fn bracket_without_port_is_error() {
+        // `[::1]` with no `:port` after the bracket is
+        // ambiguous — reject.
+        assert!(parse_stdio_forward("[::1]").is_err());
+    }
+
+    #[test]
+    fn empty_host_is_error() {
+        // `:3389` — port with no host.
+        assert!(parse_stdio_forward(":3389").is_err());
+    }
+
+    #[test]
+    fn invalid_port_is_error() {
+        assert!(parse_stdio_forward("rdp.internal:notaport").is_err());
+        assert!(parse_stdio_forward("rdp.internal:99999").is_err());
+    }
+
+    #[test]
+    fn whitespace_is_trimmed() {
+        assert_eq!(
+            parse_stdio_forward("  rdp.internal:3389  ").unwrap(),
+            ("rdp.internal".to_string(), 3389u16)
+        );
     }
 }
 
