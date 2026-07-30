@@ -142,6 +142,12 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
                 // through anyway in case passhrs ever opens a
                 // fresh handshake here.
                 accept_all_host_keys,
+                // X11 forwarding never applies to a forward-only
+                // tunnel — X11 rides on the user's interactive
+                // session, not the data-plane port forwards.
+                // Both booleans default to false here.
+                false,
+                false,
             );
             let mut c = match client::connect(cfg, (fwd_host.as_str(), fwd_port), h).await {
                 Ok(c) => c,
