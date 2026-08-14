@@ -410,9 +410,9 @@ dependencies = [
 
 [[package]]
 name = "copia"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df62876708f3d6a8692e5623c0e3605c187de960063e93c15bf889602d70e811"
+checksum = "bbe4e24219d220441869b97847410b5eda563060e545f4856737fa5b891c1a17"
 dependencies = [
  "bincode",
  "blake3",

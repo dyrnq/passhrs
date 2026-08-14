@@ -21,7 +21,7 @@ bytes = "1"
 # futures is needed for channel read polling
 futures = "0.3"
 russh-sftp = "2.3.0"
-copia = { version = "0.1.3", features = ["async"] }
+copia = { version = "0.2", features = ["async"] }
 crossterm = "0.29.0"
 # `libc` provides the SOL_SOCKET / SO_BINDTODEVICE constants and
 # `setsockopt` symbol used by `apply_bind_interface` (Linux-only).
