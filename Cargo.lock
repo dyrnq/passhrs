@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "passhrs"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "bytes",
