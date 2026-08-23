@@ -3188,12 +3188,19 @@ fn test_ssh_config_hostname_override_connects_to_alias() {
     let mut args = vec![
         "-F".to_string(),
         cfg.to_string_lossy().to_string(),
+        // Canonical pattern used by every other sshd test in
+        // this file: bypass known_hosts entirely so tests are
+        // unaffected by state left behind by earlier tests
+        // (and by the CI runner's pre-existing known_hosts
+        // file, which may have a stale key for 127.0.0.1).
+        "-o".to_string(),
+        "StrictHostKeyChecking=no".to_string(),
+        "-o".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
         "-o".to_string(),
         "PasswordAuthentication=no".to_string(),
         "-o".to_string(),
         "PreferredAuthentications=publickey".to_string(),
-        "-o".to_string(),
-        "StrictHostKeyChecking=accept-new".to_string(),
         format!("{}@myalias", USER),
         "whoami".to_string(),
     ];
