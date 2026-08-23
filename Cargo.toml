@@ -21,6 +21,11 @@ bytes = "1"
 # futures is needed for channel read polling
 futures = "0.3"
 russh-sftp = "2.3.0"
+# Trial: use russh-config 0.58 against russh 0.63. Both are from the
+# same warp-tech monorepo but version-locking has slipped (russh is
+# ahead). Trial compile: if `cargo check` passes we adopt; if not we
+# fork a tiny patch or fall back to writing the parser from scratch.
+russh-config = "0.58"
 copia = { version = "0.2", features = ["async"] }
 crossterm = "0.29.0"
 # `libc` provides the SOL_SOCKET / SO_BINDTODEVICE constants and

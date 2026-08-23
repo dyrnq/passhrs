@@ -910,3 +910,134 @@ fn test_stdio_forward_combined_with_command() {
     ]);
     assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
 }
+
+// `-F <configfile>` / `--config <configfile>`: read
+// ssh_config(5) directives from the named file instead of
+// `~/.ssh/config`. `-F /dev/null` short-circuits lookup.
+// Issue #67.
+//
+// These are clap-acceptance tests pinning the parser surface
+// and the `-F /dev/null` short-circuit. The actual config-
+// matching and CLI > config precedence are exercised by the
+// `config::tests` unit tests in src/config.rs (which can pin
+// the resolved values byte-for-byte against fixture strings).
+// Integration tests against a real sshd would need network
+// setup beyond what `tests/08` does; tracked in
+// `tests/15_native_sshd_integration.rs` if/when added.
+
+use std::io::Write;
+
+fn write_temp_config(contents: &str) -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "passhrs-it-config-{}-{}.txt",
+        std::process::id(),
+        // Cheap uniqueness across parallel tests; leaks but
+        // tiny.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut f = std::fs::File::create(&path).expect("create temp config");
+    f.write_all(contents.as_bytes()).expect("write");
+    path
+}
+
+#[test]
+fn test_config_file_short() {
+    let path = write_temp_config("Host myhost\n  HostName real.example.com\n  User alice\n");
+    let path_str = path.to_str().unwrap();
+    let (_, _, stderr) = run_phr(&["-F", path_str, "user@myhost"]);
+    assert!(
+        !stderr.contains("error:"),
+        "parsing failed for `-F <file>`: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should recognize -F, but stderr complains: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_config_file_long() {
+    let path = write_temp_config("Host myhost\n  HostName real.example.com\n  User alice\n");
+    let (_, _, stderr) = run_phr(&["--config", path.to_str().unwrap(), "user@myhost"]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_config_file_dev_null() {
+    // `-F /dev/null` must short-circuit and not error.
+    // The runtime returns an empty ResolvedConfig and the
+    // connect attempt proceeds as if no config were present.
+    let (ok, _, stderr) = run_phr(&["-F", "/dev/null", "user@localhost"]);
+    // We can't assert ok=true (no sshd on the test box), but
+    // we can assert no clap error and no "failed to load"
+    // runtime error.
+    assert!(
+        !stderr.contains("error:") || stderr.contains("refused") || stderr.contains("Connection"),
+        "unexpected stderr for `-F /dev/null`: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_config_file_missing_exits_nonzero() {
+    // `-F /path/that/does/not/exist` must error out with a
+    // clear message (matches OpenSSH). Path won't exist
+    // because we use a UUID-style name.
+    let bogus = "/tmp/passhrs-no-such-config-12345-67890";
+    let _ = std::fs::remove_file(bogus);
+    let (ok, _, stderr) = run_phr(&["-F", bogus, "user@localhost"]);
+    assert!(
+        !ok,
+        "missing -F file must exit non-zero, got ok=true: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("failed to load")
+            || stderr.contains("ssh config")
+            || stderr.contains("Could not"),
+        "expected a runtime error about loading the config, got: {:?}",
+        stderr
+    );
+}
+
+#[test]
+fn test_config_file_combinable_with_other_flags() {
+    // `-F <file>` must compose with the rest of the CLI
+    // surface (port, user, key, etc.) without parser-level
+    // conflicts. Runtime resolution precedence (CLI > config)
+    // is pinned in src/config.rs unit tests.
+    let path =
+        write_temp_config("Host myhost\n  HostName real.example.com\n  User alice\n  Port 2222\n");
+    let (_, _, stderr) = run_phr(&[
+        "-F",
+        path.to_str().unwrap(),
+        "-p",
+        "3333",
+        "-l",
+        "carol",
+        "-C",
+        "user@myhost",
+    ]);
+    assert!(!stderr.contains("error:"), "parsing failed: {}", stderr);
+}
+
+#[test]
+fn test_config_file_combined_with_print_config() {
+    // `-F <file> -G <host>` — `-G` should be accepted; the
+    // actual config-aware `-G` walk is a follow-up (Issue
+    // #62 next-step), so we only pin the parser-level
+    // combinability here.
+    let path = write_temp_config("Host myhost\n  HostName real.example.com\n  User alice\n");
+    let (_, _, stderr) = run_phr(&["-F", path.to_str().unwrap(), "-G", "myhost"]);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "clap should accept -F + -G, but stderr complains: {}",
+        stderr
+    );
+}

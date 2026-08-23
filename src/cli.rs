@@ -17,6 +17,34 @@ const PKG_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) struct Cli {
     #[arg(short = 'p', long = "port", default_value_t = 22)]
     pub(crate) ssh_port: u16,
+    /// Use `<configfile>` instead of `$HOME/.ssh/config` for
+    /// ssh_config(5) lookups. Matches OpenSSH `-F` (Issue #67).
+    /// Pass `-F /dev/null` to skip config-file lookup entirely
+    /// (also matches OpenSSH: an explicit `-F /dev/null` short-
+    /// circuits the file lookup and ignores both user-level and
+    /// system-level config).
+    ///
+    /// Resolution precedence, applied in this order:
+    ///   1. `-o key=value` flags (already handled by `parse_ssh_options`)
+    ///   2. CLI flags (`-p`, `-l`, `-i`, `-J`, …)
+    ///   3. `Host` block matching against the destination string
+    ///      from this `-F <file>` (or `~/.ssh/config` if `-F`
+    ///      was not given)
+    ///   4. defaults (port 22, user `root`, no identity, no
+    ///      proxy jump)
+    ///
+    /// Only the keywords the upstream `russh-config` crate
+    /// recognizes are honored from the file: `User`, `Hostname`,
+    /// `Port`, `IdentityFile`, `ProxyJump`, `ProxyCommand`
+    /// (silently ignored in v1; requires fork+exec support),
+    /// `UserKnownHostsFile`, `StrictHostKeyChecking`,
+    /// `AddKeysToAgent`. Other directives (`ForwardX11`,
+    /// `ForwardAgent`, `Compression`, `LocalForward`,
+    /// `RemoteForward`, `Include`, `Match exec=`, etc.) are
+    /// silently dropped at parse time; users who need them
+    /// should pass `-o key=value` until follow-up lands.
+    #[arg(short = 'F', long = "config", value_name = "configfile")]
+    pub(crate) config_file: Option<PathBuf>,
     /// Introspect supported algorithms for one of: cipher, mac,
     /// kex, compression, key, help. Multiple `-Q` flags print
     /// each list in turn. Mirrors OpenSSH `-Q <what>` (no SSH

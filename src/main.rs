@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 #[cfg(unix)]
 mod control;
 mod forward;
@@ -300,7 +301,7 @@ async fn main() {
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(mut cli: Cli) -> Result<()> {
     if cli.fork {
         let args: Vec<String> = std::env::args()
             .filter(|a| a != "-f" && a != "--fork")
@@ -385,6 +386,20 @@ async fn run(cli: Cli) -> Result<()> {
     } else {
         parse_destination(dest_str)?
     };
+    // Resolve ssh_config(5) for `host` (the alias from the
+    // user's command). Honors `-F <file>` (or `~/.ssh/config`
+    // by default; `-F /dev/null` short-circuits). Returns
+    // default ResolvedConfig if no config applies. Issue #67.
+    let resolved = config::resolve_config(&cli, &host)?;
+    // Override the alias with config's `HostName` directive,
+    // if any. CLI doesn't have a "host" flag (the alias is
+    // always the dest string), so config can drive the
+    // connection target here.
+    let host = resolved.hostname.clone().unwrap_or(host);
+    // Layer config-derived values onto cli where the user
+    // didn't set them on the command line. CLI > config
+    // precedence (matches OpenSSH).
+    config::apply_resolved(&mut cli, &resolved);
     let user = cli
         .user
         .as_deref()
@@ -395,10 +410,19 @@ async fn run(cli: Cli) -> Result<()> {
     } else {
         port_from_dest
     };
+    // Config Port is consulted only when no other source
+    // supplied a non-default port (CLI -p, -o port=, dest
+    // port). Order: -o port= > -p > dest port > config Port
+    // > 22.
     let port = opts
         .get("port")
         .and_then(|v| v.parse().ok())
         .unwrap_or(port);
+    let port = if port == 22 {
+        resolved.port.unwrap_or(port)
+    } else {
+        port
+    };
     let password = if let Some(ref f) = cli.password_file {
         let val = std::fs::read_to_string(f)
             .with_context(|| format!("failed to read --password-file: {}", f))?;
@@ -445,10 +469,22 @@ async fn run(cli: Cli) -> Result<()> {
         .map(|s| parse_dynamic_spec(s, gateway_ports))
         .collect::<Result<Vec<_>>>()?;
 
-    let user_known_hosts = std::sync::Arc::new(opts.get("userknownhostsfile").cloned());
+    // ssh_config: `StrictHostKeyChecking` and `UserKnownHostsFile`
+    // are surfaced from the file when the user did not pass the
+    // equivalent `-o key=value`. CLI > config precedence. The
+    // existing -o parsing above is preserved; we only fall back
+    // to config when -o did not provide a value. Issue #67.
+    let user_known_hosts =
+        std::sync::Arc::new(opts.get("userknownhostsfile").cloned().or_else(|| {
+            resolved
+                .user_known_hosts_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+        }));
     let strict_check = opts
         .get("stricthostkeychecking")
         .map(|v| v == "yes" || v == "accept-new")
+        .or(resolved.strict_host_key_checking)
         .unwrap_or(false);
     let keepalive_interval = opts
         .get("serveraliveinterval")
