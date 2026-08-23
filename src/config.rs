@@ -214,13 +214,19 @@ Host test-host
         assert_eq!(cfg.hostname.as_deref(), Some("real-server.example.com"));
         assert_eq!(cfg.user.as_deref(), Some("alice"));
         assert_eq!(cfg.port, Some(2222));
-        assert_eq!(
-            cfg.identity_file.as_ref().map(|p| p.display().to_string()),
-            // ~ expands via russh-config
-            Some(format!(
-                "{}/.ssh/test_key",
-                std::env::home_dir().unwrap().display()
-            ))
+        // `~` expands via russh-config. Compare via suffix so the
+        // assertion holds on both Unix (home=/home/runner) and
+        // Windows (home=C:\Users\runneradmin, with mixed \ + /
+        // separators from russh-config's expansion).
+        let id = cfg
+            .identity_file
+            .as_ref()
+            .expect("identity_file must be resolved");
+        let id_str = id.to_string_lossy();
+        assert!(
+            id_str.ends_with(".ssh/test_key") || id_str.ends_with(".ssh\\test_key"),
+            "expected path to end with .ssh/test_key, got: {}",
+            id_str
         );
         assert_eq!(cfg.proxy_jump.as_deref(), Some("bastion@hop.internal"));
     }
