@@ -3189,7 +3189,7 @@ fn test_ssh_config_hostname_override_connects_to_alias() {
         "-F".to_string(),
         cfg.to_string_lossy().to_string(),
         "-o".to_string(),
-        format!("PasswordAuthentication=no"),
+        "PasswordAuthentication=no".to_string(),
         "-o".to_string(),
         "PreferredAuthentications=publickey".to_string(),
         "-o".to_string(),
