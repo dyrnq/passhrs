@@ -1104,9 +1104,7 @@ fn test_config_user_override_changes_destination() {
     // config — proves both HostName AND User apply together
     // without conflict (no parser crash, dial succeeds as
     // far as the network layer can get on port 1).
-    let path = write_temp_config(
-        "Host myalias\n  HostName 127.0.0.1\n  Port 1\n  User alice\n",
-    );
+    let path = write_temp_config("Host myalias\n  HostName 127.0.0.1\n  Port 1\n  User alice\n");
     let (ok, _, stderr) = run_phr(&[
         "-F",
         path.to_str().unwrap(),
@@ -1137,9 +1135,7 @@ fn test_dev_null_short_circuits_no_config_lookup() {
     // see a *different* failure shape (DNS / refused for the
     // literal alias name) — proof that /dev/null really did
     // bypass the resolver.
-    let fixture = write_temp_config(
-        "Host myalias\n  HostName 127.0.0.1\n  Port 1\n  User alice\n",
-    );
+    let fixture = write_temp_config("Host myalias\n  HostName 127.0.0.1\n  Port 1\n  User alice\n");
 
     // Sanity: with the fixture, myalias resolves to 127.0.0.1:1
     // and we get a TCP-level failure (refused or timeout).
@@ -1156,13 +1152,7 @@ fn test_dev_null_short_circuits_no_config_lookup() {
     // bypassed — `myalias` is dialed as-is. The failure
     // shape changes from "TCP-refused on 127.0.0.1:1" to
     // "DNS / literal-host failure on myalias".
-    let (ok_b, _, stderr_b) = run_phr(&[
-        "-F",
-        "/dev/null",
-        "-o",
-        "ConnectTimeout=2",
-        "myalias",
-    ]);
+    let (ok_b, _, stderr_b) = run_phr(&["-F", "/dev/null", "-o", "ConnectTimeout=2", "myalias"]);
     assert!(!ok_b, "/dev/null path should also fail: {}", stderr_b);
 
     let lower_b = stderr_b.to_lowercase();
@@ -1205,9 +1195,7 @@ fn test_config_port_override_overrides_dest_port() {
     // still see a connection failure, so this test mainly
     // proves the parse-path doesn't crash with the
     // combined flags).
-    let path = write_temp_config(
-        "Host myalias\n  HostName 127.0.0.1\n  Port 2222\n  User alice\n",
-    );
+    let path = write_temp_config("Host myalias\n  HostName 127.0.0.1\n  Port 2222\n  User alice\n");
     let (ok, _, stderr) = run_phr(&[
         "-F",
         path.to_str().unwrap(),
