@@ -1261,9 +1261,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.33"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "md5"
@@ -1801,9 +1801,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.62.7"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9decb68e4e44e1079700e54f17c8f23806ec53d7e0db73ab1c71d9dabc666812"
+checksum = "00cf00190c315093734a8d405225bd8773a219bc86538a9b73bfc51145b33995"
 dependencies = [
  "aes",
  "bitflags 2.13.1",

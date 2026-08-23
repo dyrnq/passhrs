@@ -161,7 +161,7 @@ impl Handler for SshHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &russh::keys::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         // OpenSSH `-y` override: unconditionally accept. Wins
         // over both `-o StrictHostKeyChecking=yes` (which would
@@ -177,12 +177,17 @@ impl Handler for SshHandler {
             );
             return Ok(true);
         }
+        // russh 0.63 wraps the server key in `PublicKeyOrCertificate`
+        // (regular key OR X.509/OpenSSH certificate). For known_hosts
+        // matching we want the bare `PublicKey`; the wrapper exposes
+        // it via `.public_key()` (cert case unwraps to the embedded key).
+        let server_public_key = server_public_key.public_key();
         if let Some(ref path) = self.known_hosts_path {
             if path != "/dev/null" && path != "nul" {
                 match russh::keys::known_hosts::check_known_hosts_path(
                     &self.host,
                     self.port,
-                    server_public_key,
+                    &server_public_key,
                     path,
                 ) {
                     Ok(true) => return Ok(true),
