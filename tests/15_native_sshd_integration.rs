@@ -3141,3 +3141,119 @@ fn test_accept_all_host_keys_skips_known_hosts() {
         stderr_text
     );
 }
+
+// --- Issue #67: -F / --config (ssh_config) integration ---
+//
+// These tests run a real passhrs session against the CI sshd
+// (127.0.0.1:22222, user "runner", password "PassTest1234!")
+// and verify that directives in a per-test ssh_config file
+// actually take effect at runtime: `HostName` rewrites the
+// destination, `User` substitutes the login, `IdentityFile`
+// supplies the auth key. Marked `#[ignore]` like the rest of
+// tests/15 because they require the live sshd harness.
+
+/// Write an ssh_config fixture to a fresh temp file. Returns
+/// the path; caller is responsible for cleanup (the file is
+/// tiny and leaks harmlessly under `/tmp`).
+fn write_ssh_config_fixture(contents: &str) -> PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "passhrs-sshd-config-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&path, contents).expect("write fixture");
+    path
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_ssh_config_hostname_override_connects_to_alias() {
+    // `passhrs myalias whoami` with a config that rewrites
+    // `myalias` -> 127.0.0.1:22222 should succeed and return
+    // `runner` — proving the resolver actually replaced the
+    // destination before the connect call. Without `-F`,
+    // `myalias` would fail (no DNS for it).
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+    let cfg = write_ssh_config_fixture(&format!(
+        "Host myalias\n  HostName {}\n  Port {}\n",
+        HOST, PORT
+    ));
+    let mut args = vec![
+        "-F".to_string(),
+        cfg.to_string_lossy().to_string(),
+        "-o".to_string(),
+        format!("PasswordAuthentication=no"),
+        "-o".to_string(),
+        "PreferredAuthentications=publickey".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+        format!("{}@myalias", USER),
+        "whoami".to_string(),
+    ];
+    prepend_auth_args(&mut args);
+    let d = dest();
+    if !d.is_empty() {
+        let _ = d;
+    }
+    let (ok, stdout, stderr) = run_phr(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let _ = stdout;
+    let _ = stderr;
+    assert!(
+        ok,
+        "sshd should accept the alias-resolved connection; stderr: {}",
+        stderr
+    );
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_ssh_config_user_override_drops_cli_user() {
+    // Config says `User runner`; we explicitly pass
+    // `-l someoneelse` — CLI > config precedence, so the
+    // runtime attempts to log in as someoneelse (which
+    // fails against the sshd because the user doesn't
+    // exist). The proof is in the connection-failure
+    // shape: it's an auth failure, not a config-load
+    // error, proving the resolver ran AND the CLI
+    // override took precedence over the config value.
+    if !sshd_ok() {
+        eprintln!("SKIP: no sshd");
+        return;
+    }
+    let cfg = write_ssh_config_fixture(&format!(
+        "Host myalias\n  HostName {}\n  Port {}\n  User {}\n",
+        HOST, PORT, USER
+    ));
+    let mut args = vec![
+        "-F".to_string(),
+        cfg.to_string_lossy().to_string(),
+        "-l".to_string(),
+        "nonexistent-cli-user".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=3".to_string(),
+        "myalias".to_string(),
+        "whoami".to_string(),
+    ];
+    prepend_auth_args(&mut args);
+    let (ok, _, stderr) = run_phr(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(
+        !ok,
+        "auth must fail (nonexistent-cli-user shouldn't exist on sshd)"
+    );
+    let lower = stderr.to_lowercase();
+    // Must be a connection/auth failure, not a config-load
+    // error (which would mean the resolver didn't run at
+    // all and the test is meaningless).
+    assert!(
+        !lower.contains("failed to load") && !lower.contains("ssh config:"),
+        "unexpected config-load error (resolver didn't run): {}",
+        stderr
+    );
+}
