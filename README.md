@@ -5,7 +5,7 @@
 ## Features
 
 ### SSH Standard Compatible Options
-`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-X` `-x` `-Y` `-W`
+`-p` `-l` `-i` `-L` `-R` `-D` `-J` `-N` `-f` `-C` `-t` `-n` `-v` `-q` `-E` `-o` `-4` `-6` `-A` `-a` `-S` `-G` `-X` `-x` `-Y` `-W` `-F`
 
 | Option    | Description                        |
 |:----------|:-----------------------------------|
@@ -32,6 +32,7 @@
 | `-X`      | Enable X11 forwarding (subject to X11 SECURITY extension; parser-accepted; channel pump lands in follow-up — Issue #59) |
 | `-x`      | Disable X11 forwarding (wins over `-X` and `-Y`; parser-accepted; channel pump lands in follow-up — Issue #59) |
 | `-Y`      | Trusted X11 forwarding (skips xauth cookie check; wins over `-X`, loses to `-x`; parser-accepted; channel pump lands in follow-up — Issue #59) |
+| `-F`      | ssh_config(5) file (`-F /dev/null` skips lookup; honors User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile; other directives silently ignored — Issue #67) |
 | `-o`      | SSH options (see below)            |
 
 ### Exclusive Features
@@ -153,6 +154,10 @@ passhrs --exec-env MYVAR=hello user@host "echo \$MYVAR"
 # OpenSSH compatible usage
 passhrs -p 12322 -C -o StrictHostKeyChecking=no user@host
 
+# Use your existing ~/.ssh/config (Host aliases, IdentityFile, ProxyJump, etc.)
+passhrs myalias
+passhrs -F /dev/null user@host       # skip config lookup entirely
+
 # Interactive shell
 passhrs user@host
 ```
@@ -191,13 +196,13 @@ ssh:   passhrs:   description
  -b    ✅  -b       Source bind address for SSH connection (or -o BindAddress=)
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ✅  -e       Escape character (`~` default, `none` disables, only with -t)
- -F    ❌  —        SSH config file
- -G    ✅  -G       Print resolved config for `<hostname>` and exit (CLI flags + `-o` overrides; `-F` parsing deferred)
+ -F    ✅  -F       ssh_config(5) file (User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile via russh-config 0.58; CLI > config precedence; -F /dev/null short-circuits; `Include`/`Match exec=`/`ForwardX11`/`ForwardAgent`/etc. silently ignored — Issue #67)
+ -G    ✅  -G       Print resolved config for `<hostname>` and exit (CLI flags + `-o` overrides; `-F` walking ssh_config Host blocks is a follow-up)
  -g    ✅  -g       Allow remote hosts to connect local forwards
  -I    ❌  —        PKCS#11
  -K    ❌  —        Enable GSSAPI delegation
  -k    ❌  —        Disable GSSAPI delegation
- -M    ❌  —        ControlMaster mode
+ -M    ❌  —        ControlMaster mode (passhrs has passhrs-native `-S`; OpenSSH-wire-compatible `-M` deferred)
  -m    ✅  -m       MAC algorithm (comma-separated, priority order)
  -O    ✅  -O       Control command (`check` / `exit` / `stop` on -S master)
  -Q    ✅  -Q       Query algorithms (cipher|mac|kex|compression|key|help)
@@ -205,8 +210,7 @@ ssh:   passhrs:   description
  -T    ✅  -T       Disable PTY allocation
  -V    ✅  -V       Version
  -W    ✅  -W       Forward stdio to host:port (via sshd's direct-tcpip; RDP/VNC tunneling through bastion; Issue #63)
--w    ❌  —        Tunnel device (TUN/TAP; not implemented — Linux-only, requires CAP_NET_ADMIN; follow-up)
- -w    ❌  —        Tunnel device
+ -w    ❌  —        Tunnel device (TUN/TAP; not implemented — Linux-only, requires CAP_NET_ADMIN; follow-up)
  -x    ✅  -x       Disable X11 forwarding (parser-only for now; channel pump lands in follow-up; Issue #59)
  -X    ✅  -X       Enable X11 forwarding (subject to X11 SECURITY extension; parser-only for now; channel pump lands in follow-up; Issue #59)
  -Y    ✅  -Y       Trusted X11 forwarding (skips xauth cookie check; wins over -X, loses to -x; parser-only for now; channel pump lands in follow-up; Issue #59)
@@ -218,20 +222,22 @@ ssh:   passhrs:   description
 | Category              | Count | Ratio |
 |:----------------------|:------|:------|
 | Total SSH short opts  | ~43   | 100%  |
-| **Implemented**       | **37**| **86%** |
+| **Implemented**       | **38**| **88%** |
 | Conflicting semantics | 1 (`-n`) | 2% |
-| Not implemented       | ~11   | 26%   |
+| Not implemented       | ~4    | ~9%   |
 
 ### Not Implemented — Notes
+
+**`-F` ssh_config caveat:** the resolver is built on `russh-config` 0.58 (same warp-tech monorepo as `russh` itself). russh-config's parser handles `User`, `Hostname`, `Port`, `IdentityFile` (first only), `ProxyJump`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `AddKeysToAgent`. Other directives (`ForwardX11`, `ForwardAgent`, `Compression`, `LocalForward`, `RemoteForward`, `DynamicForward`, `Include`, `Match exec=`, etc.) are silently dropped — users who need those should pass `-o key=value` until follow-up lands. Issue #67.
 
 **Can be added via russh (low effort):**
 - `-C` compression level: flate2 feature
 
-**Semantically not fitting:** `-D` (not a proxy tool), `-W` tunnel, `-G` debug, `-B`/`-b`/`-e`/`-s`/`-w` (rarely used)
+**Semantically not fitting:** `-s` (rarely used; passhrs does SFTP directly via `--push`/`--pull`/`--rsync`), `-w` (Linux-only, requires CAP_NET_ADMIN)
 
 **`-S` control socket caveat:** passhrs implements `-S <path>` as a **passhrs-native** master/resume protocol over a Unix-domain socket at `<path>` (mode `0o600`, removed automatically on master exit). It is **not wire-compatible with OpenSSH's** control protocol — an OpenSSH client cannot talk to a passhrs master and vice versa. Wire format: resume-to-master `<u32 BE length><UTF-8 command line>`; master-to-resume `<u32 BE length><tag 1=stdout / 2=stderr / 0=done><payload>`, where the done frame is `<u32 1><tag 0><u8 exit_code>` (length=1 so the reader picks up the exit code via the same `len`-byte payload read used for stdout/stderr). Unix-only in v1; Windows named-pipe equivalent is a separate follow-up.
 
-**Larger effort:** `-F` config file (needs full ssh_config parser)
+**Larger effort:** `-I` (PKCS#11 — needs C FFI), `-K`/`-k` (GSSAPI — needs krb5 dep), `-M` (OpenSSH-wire-compatible ControlMaster protocol — passhrs-native `-S` covers our use cases)
 
 ## Platform Support
 
