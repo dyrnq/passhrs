@@ -32,7 +32,7 @@
 | `-X`      | Enable X11 forwarding (subject to X11 SECURITY extension; parser-accepted; channel pump lands in follow-up — Issue #59) |
 | `-x`      | Disable X11 forwarding (wins over `-X` and `-Y`; parser-accepted; channel pump lands in follow-up — Issue #59) |
 | `-Y`      | Trusted X11 forwarding (skips xauth cookie check; wins over `-X`, loses to `-x`; parser-accepted; channel pump lands in follow-up — Issue #59) |
-| `-F`      | ssh_config(5) file (`-F /dev/null` skips lookup; honors User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile; other directives silently ignored — Issue #67) |
+| `-F`      | ssh_config(5) file (`-F /dev/null` skips lookup; honors User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile + `Include` with `~` / `%d` / `%u` / `%h` token expansion and glob fan-out — Issue #67) |
 | `-o`      | SSH options (see below)            |
 
 ### Exclusive Features
@@ -158,6 +158,14 @@ passhrs -p 12322 -C -o StrictHostKeyChecking=no user@host
 passhrs myalias
 passhrs -F /dev/null user@host       # skip config lookup entirely
 
+# Modular ssh_config with Include (single-level globs against
+# the containing file's directory, ~/%d/%u/%h token expansion,
+# cycle detection — Issue #69)
+# ~/.ssh/config:
+#     Include config.d/*.conf
+#     Host github.com
+    User git
+
 # Interactive shell
 passhrs user@host
 ```
@@ -196,7 +204,7 @@ ssh:   passhrs:   description
  -b    ✅  -b       Source bind address for SSH connection (or -o BindAddress=)
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ✅  -e       Escape character (`~` default, `none` disables, only with -t)
- -F    ✅  -F       ssh_config(5) file (User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile via russh-config 0.58; CLI > config precedence; -F /dev/null short-circuits; `Include`/`Match exec=`/`ForwardX11`/`ForwardAgent`/etc. silently ignored — Issue #67)
+ -F    ✅  -F       ssh_config(5) file (User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile via russh-config 0.58 + passhrs's `Include` pre-processor with `~` / `%d` / `%u` / `%h` token expansion, single-level glob fan-out, and cycle detection — Issues #67 + #69; CLI > config precedence; -F /dev/null short-circuits; `Match exec=`/`ForwardX11`/`ForwardAgent`/etc. still silently ignored)
  -G    ✅  -G       Print resolved config for `<hostname>` and exit (CLI flags + `-o` overrides; `-F` walking ssh_config Host blocks is a follow-up)
  -g    ✅  -g       Allow remote hosts to connect local forwards
  -I    ❌  —        PKCS#11
@@ -228,7 +236,7 @@ ssh:   passhrs:   description
 
 ### Not Implemented — Notes
 
-**`-F` ssh_config caveat:** the resolver is built on `russh-config` 0.58 (same warp-tech monorepo as `russh` itself). russh-config's parser handles `User`, `Hostname`, `Port`, `IdentityFile` (first only), `ProxyJump`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `AddKeysToAgent`. Other directives (`ForwardX11`, `ForwardAgent`, `Compression`, `LocalForward`, `RemoteForward`, `DynamicForward`, `Include`, `Match exec=`, etc.) are silently dropped — users who need those should pass `-o key=value` until follow-up lands. Issue #67.
+**`-F` ssh_config caveat:** the resolver is built on `russh-config` 0.58 (same warp-tech monorepo as `russh` itself) plus passhrs's own `Include` pre-processor. russh-config's parser handles `User`, `Hostname`, `Port`, `IdentityFile` (first only), `ProxyJump`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `AddKeysToAgent`. The pre-processor handles `Include` with single-level glob fan-out, tilde + `%d`/`%u`/`%h` token expansion, and cycle detection. Other directives (`ForwardX11`, `ForwardAgent`, `Compression`, `LocalForward`, `RemoteForward`, `DynamicForward`, `Match exec=`, etc.) are still silently dropped — users who need those should pass `-o key=value` until follow-up lands. Issues #67 + #69.
 
 **Can be added via russh (low effort):**
 - `-C` compression level: flate2 feature

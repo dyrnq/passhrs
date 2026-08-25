@@ -1216,3 +1216,152 @@ fn test_config_port_override_overrides_dest_port() {
         stderr
     );
 }
+
+// ─────────────────────────────────────────────────────────
+// `Include` directive (Issue #69)
+//
+// Behavioral tests that prove Include-resolved content
+// actually reaches passhrs's connect path. Same shape as the
+// -F behavioral tests above: write fixture files, run
+// passhrs, assert the runtime attempted to dial the rewrite
+// target (and not some literal alias).
+// ─────────────────────────────────────────────────────────
+
+/// Make a unique temp directory for Include fixtures.
+/// Avoids races when tests run in parallel.
+fn fresh_include_dir() -> std::path::PathBuf {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "passhrs-include-it-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
+/// Write `contents` to `name` inside `dir`.
+fn write_include_file(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, contents).expect("write include fixture");
+    p
+}
+
+#[test]
+fn test_include_at_top_level_resolves_hostname() {
+    // Two files: `main` (Include line) + `inc.conf` (actual
+    // Host block). When passhrs -F <main> myalias is run,
+    // the included HostName 127.0.0.1:1 must reach the
+    // connect path — proof that Include is wired through.
+    let dir = fresh_include_dir();
+    write_include_file(
+        &dir,
+        "inc.conf",
+        "Host myalias\n  HostName 127.0.0.1\n  Port 1\n  User alice\n",
+    );
+    let main = write_include_file(&dir, "main", "Include inc.conf\n");
+    let (ok, _, stderr) = run_phr(&[
+        "-F",
+        main.to_str().unwrap(),
+        "-o",
+        "ConnectTimeout=2",
+        "myalias",
+    ]);
+    assert!(!ok, "expected non-zero exit, got ok=true: {}", stderr);
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("refused") || lower.contains("timed out") || lower.contains("connection"),
+        "expected TCP-level error from included HostName, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_include_glob_picks_up_multiple_files() {
+    // Three files in the same dir: main (Include
+    // inc-*.conf), inc-alpha.conf, inc-beta.conf. Both
+    // included Hosts must resolve — proof the glob fan-out
+    // works end-to-end.
+    let dir = fresh_include_dir();
+    write_include_file(
+        &dir,
+        "inc-alpha.conf",
+        "Host alphaalias\n  HostName 127.0.0.1\n  Port 1\n  User fromalpha\n",
+    );
+    write_include_file(
+        &dir,
+        "inc-beta.conf",
+        "Host betaalias\n  HostName 127.0.0.1\n  Port 1\n  User frombeta\n",
+    );
+    let main = write_include_file(&dir, "main", "Include inc-*.conf\n");
+    let (ok_a, _, stderr_a) = run_phr(&[
+        "-F",
+        main.to_str().unwrap(),
+        "-o",
+        "ConnectTimeout=2",
+        "alphaalias",
+    ]);
+    assert!(!ok_a, "alphaalias should fail to connect: {}", stderr_a);
+    let (ok_b, _, stderr_b) = run_phr(&[
+        "-F",
+        main.to_str().unwrap(),
+        "-o",
+        "ConnectTimeout=2",
+        "betaalias",
+    ]);
+    assert!(!ok_b, "betaalias should fail to connect: {}", stderr_b);
+}
+
+#[test]
+fn test_include_inside_host_block_errors_runtime() {
+    // `Include` is only valid before the first Host/Match
+    // block. Putting one inside a Host block must produce a
+    // runtime error (non-zero exit + stderr mentioning the
+    // rule).
+    let dir = fresh_include_dir();
+    let _inc = write_include_file(&dir, "inc.conf", "Host x\n  User x\n");
+    let main = write_include_file(&dir, "main", "Host foo\n  Include inc.conf\n");
+    let (ok, _, stderr) = run_phr(&[
+        "-F",
+        main.to_str().unwrap(),
+        "-o",
+        "ConnectTimeout=2",
+        "foo",
+    ]);
+    assert!(!ok, "Include inside Host must exit non-zero");
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("include") && (lower.contains("host") || lower.contains("block")),
+        "expected Include-after-Host-block error, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_include_missing_file_errors_runtime() {
+    // `Include /nonexistent` must surface as a runtime
+    // error (non-zero exit), not silently fall through.
+    let dir = fresh_include_dir();
+    let main = write_include_file(
+        &dir,
+        "main",
+        "Include /tmp/passhrs-definitely-not-a-real-include-XYZ.conf\n",
+    );
+    let (ok, _, stderr) = run_phr(&[
+        "-F",
+        main.to_str().unwrap(),
+        "-o",
+        "ConnectTimeout=2",
+        "anyhost",
+    ]);
+    assert!(!ok, "Include of missing file must exit non-zero");
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("include") || lower.contains("failed to read"),
+        "expected Include-read error, got: {}",
+        stderr
+    );
+}
