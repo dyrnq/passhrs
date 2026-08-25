@@ -139,9 +139,7 @@ pub(crate) fn resolve_config(cli: &Cli, destination: &str) -> Result<ResolvedCon
     // Base dir for top-level ~/.ssh/config is ~/.ssh, so
     // `Include ~/.ssh/config.d/*` expands correctly relative
     // to the file's own directory.
-    let base_dir = ssh_config
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let base_dir = ssh_config.parent().unwrap_or_else(|| Path::new("."));
     load_and_parse(&content, base_dir, destination)
 }
 
@@ -217,10 +215,7 @@ fn preprocess_includes(
                 // and let russh_config decide what to do with
                 // a directive that has no value.
                 if trimmed.eq_ignore_ascii_case("include") {
-                    return Err(anyhow!(
-                        "Include directive missing pattern: {}",
-                        line
-                    ));
+                    return Err(anyhow!("Include directive missing pattern: {}", line));
                 }
                 output.push_str(line);
                 output.push('\n');
@@ -243,10 +238,7 @@ fn preprocess_includes(
                     ));
                 }
                 if value.is_empty() {
-                    return Err(anyhow!(
-                        "Include directive missing pattern: {}",
-                        line
-                    ));
+                    return Err(anyhow!("Include directive missing pattern: {}", line));
                 }
                 // Expand percent-token (suffix) and tilde
                 // (prefix). Pattern is then resolved against
@@ -283,26 +275,17 @@ fn preprocess_includes(
                     // `..` don't defeat the set.
                     let canonical = m.canonicalize().unwrap_or_else(|_| m.clone());
                     if !seen.insert(canonical.clone()) {
-                        return Err(anyhow!(
-                            "Include cycle detected: {}",
-                            canonical.display()
-                        ));
+                        return Err(anyhow!("Include cycle detected: {}", canonical.display()));
                     }
 
-                    let nested_content = std::fs::read_to_string(&m).with_context(|| {
-                        format!("Include: failed to read {}", m.display())
-                    })?;
+                    let nested_content = std::fs::read_to_string(&m)
+                        .with_context(|| format!("Include: failed to read {}", m.display()))?;
                     // For nested files, base_dir becomes the
                     // included file's directory — relative
                     // Includes inside resolve there.
                     let nested_base = m.parent().unwrap_or(base_dir);
-                    let merged = preprocess_includes(
-                        &nested_content,
-                        nested_base,
-                        host,
-                        seen,
-                        depth + 1,
-                    )?;
+                    let merged =
+                        preprocess_includes(&nested_content, nested_base, host, seen, depth + 1)?;
                     output.push_str(&merged);
                 }
             }
@@ -509,11 +492,7 @@ mod tests {
     fn fresh_dir() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let mut path = std::env::temp_dir();
-        path.push(format!(
-            "passhrs-include-test-{}-{}",
-            std::process::id(),
-            n,
-        ));
+        path.push(format!("passhrs-include-test-{}-{}", std::process::id(), n,));
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -764,10 +743,7 @@ Host test-host
             "extra.conf",
             "Host pulled-in\n  HostName pulled.example.com\n  User frominclude\n",
         );
-        let main_path = write_fixture(&format!(
-            "Include {}\n",
-            included.to_string_lossy()
-        ));
+        let main_path = write_fixture(&format!("Include {}\n", included.to_string_lossy()));
         let mut cli = Cli::parse_from(["passhrs", "pulled-in"]);
         cli.config_file = Some(main_path);
         let resolved = resolve_config(&cli, "pulled-in").expect("include must succeed");
@@ -790,11 +766,7 @@ Host test-host
         write_in(&dir, "inc-a.conf", "Host alpha\n  User alpha-user\n");
         write_in(&dir, "inc-b.conf", "Host beta\n  User beta-user\n");
         write_in(&dir, "ignored.txt", "Host ignored\n  User ignored\n");
-        let main = write_in(
-            &dir,
-            "main",
-            "Include inc-*.conf\n",
-        );
+        let main = write_in(&dir, "main", "Include inc-*.conf\n");
         let mut cli = Cli::parse_from(["passhrs", "alpha"]);
         cli.config_file = Some(main);
         let r1 = resolve_config(&cli, "alpha").unwrap();
@@ -844,11 +816,7 @@ Host test-host
     fn include_inside_host_block_is_error() {
         let dir = fresh_dir();
         let _extra = write_in(&dir, "extra.conf", "Host x\n  User x\n");
-        let main = write_in(
-            &dir,
-            "main.conf",
-            "Host foo\n  Include extra.conf\n",
-        );
+        let main = write_in(&dir, "main.conf", "Host foo\n  Include extra.conf\n");
         let mut cli = Cli::parse_from(["passhrs", "foo"]);
         cli.config_file = Some(main);
         let err = resolve_config(&cli, "foo").expect_err("Include in Host must error");
@@ -866,11 +834,7 @@ Host test-host
     #[test]
     fn include_with_no_matches_is_error() {
         let dir = fresh_dir();
-        let main = write_in(
-            &dir,
-            "main.conf",
-            "Include *.does-not-exist\n",
-        );
+        let main = write_in(&dir, "main.conf", "Include *.does-not-exist\n");
         let mut cli = Cli::parse_from(["passhrs", "any"]);
         cli.config_file = Some(main);
         let err = resolve_config(&cli, "any").expect_err("empty match must error");
@@ -885,9 +849,7 @@ Host test-host
     /// glob) is a hard error.
     #[test]
     fn include_missing_file_is_error() {
-        let main = write_fixture(
-            "Include /tmp/passhrs-definitely-not-a-real-config-XYZ.conf\n",
-        );
+        let main = write_fixture("Include /tmp/passhrs-definitely-not-a-real-config-XYZ.conf\n");
         let mut cli = Cli::parse_from(["passhrs", "any"]);
         cli.config_file = Some(main);
         let err = resolve_config(&cli, "any").expect_err("missing Include must error");
@@ -919,12 +881,12 @@ Host test-host
     #[test]
     fn include_percent_h_expands_to_target_host() {
         let dir = fresh_dir();
-        write_in(&dir, "myspecialhost.conf", "Host myspecialhost\n  User h-expansion\n");
-        let main = write_in(
+        write_in(
             &dir,
-            "main.conf",
-            "Include %h.conf\n",
+            "myspecialhost.conf",
+            "Host myspecialhost\n  User h-expansion\n",
         );
+        let main = write_in(&dir, "main.conf", "Include %h.conf\n");
         let mut cli = Cli::parse_from(["passhrs", "myspecialhost"]);
         cli.config_file = Some(main);
         let resolved = resolve_config(&cli, "myspecialhost").unwrap();
@@ -963,11 +925,7 @@ Host test-host
     #[test]
     fn include_nested_layers_all_apply() {
         let dir = fresh_dir();
-        write_in(
-            &dir,
-            "b.conf",
-            "Host fromb\n  User from-b\n",
-        );
+        write_in(&dir, "b.conf", "Host fromb\n  User from-b\n");
         let a = write_in(
             &dir,
             "a.conf",

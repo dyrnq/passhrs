@@ -1273,9 +1273,7 @@ fn test_include_at_top_level_resolves_hostname() {
     assert!(!ok, "expected non-zero exit, got ok=true: {}", stderr);
     let lower = stderr.to_lowercase();
     assert!(
-        lower.contains("refused")
-            || lower.contains("timed out")
-            || lower.contains("connection"),
+        lower.contains("refused") || lower.contains("timed out") || lower.contains("connection"),
         "expected TCP-level error from included HostName, got: {}",
         stderr
     );
