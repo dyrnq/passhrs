@@ -331,7 +331,10 @@ fn expand_include_tokens(pattern: &str, host: &str) -> String {
                 }
                 Some('u') => {
                     chars.next();
-                    out.push_str(&whoami::username());
+                    // whoami 2.x returns Result<String, Error>; on failure
+                    // expand to empty (matching the `%d` branch above and
+                    // OpenSSH's "leave token unexpanded" behavior).
+                    out.push_str(&whoami::username().unwrap_or_default());
                 }
                 Some('h') => {
                     chars.next();

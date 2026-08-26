@@ -35,8 +35,14 @@ globset = "0.4"
 # patterns. russh-config already pulls this in; declaring it
 # directly avoids going through `std::env::var("USER")` which
 # is unset on some Linux setups (e.g. systemd services).
-whoami = "1.2"
-copia = { version = "0.2", features = ["async"] }
+#
+# whoami 2.x made `username()` fallible (returns
+# `Result<String, Error>` instead of `String`). Call sites use
+# `.unwrap_or_default()` to mirror the `%d` branch's silent
+# empty-on-failure style — OpenSSH similarly leaves the token
+# unexpanded when the value is unavailable.
+whoami = "2"
+copia = { version = "0.3", features = ["async"] }
 crossterm = "0.29.0"
 # `libc` provides the SOL_SOCKET / SO_BINDTODEVICE constants and
 # `setsockopt` symbol used by `apply_bind_interface` (Linux-only).
