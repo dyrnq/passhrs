@@ -212,7 +212,7 @@ fn format_user_error(err: &anyhow::Error) -> String {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     if cli.help {
         print_help();
         return;
@@ -277,8 +277,35 @@ async fn main() {
     // to the `-Q` / `-O` early-exits for the same reason: we
     // don't want the empty-destination print-help fallback
     // below to trap a bare `passhrs -G foo`. Issue #62.
+    //
+    // Honors `-F <file>`: resolve the ssh_config Host block
+    // first so the `-G` output reflects IdentityFile chain
+    // ordering (CLI `-i` first, config `IdentityFile` second)
+    // and any other merged-in directives. Issue #71.
     if let Some(host) = cli.print_config.as_deref() {
-        match cli::print_resolved_config(&cli, host) {
+        let host_arg = host.to_string();
+        // Strip the user@ prefix so resolve_config sees the bare
+        // host label (matches `Host <alias>` blocks in the
+        // ssh_config). `parse_destination` does the same for the
+        // runtime path; we mirror it here so `-G` correctly
+        // resolves `-F <file>` directives like User/IdentityFile.
+        let bare_host = match cli::parse_destination(&host_arg) {
+            Ok((h, _, _)) => h,
+            Err(e) => {
+                eprintln!("passhrs: invalid -G argument: {}", e);
+                std::process::exit(1);
+            }
+        };
+        match config::resolve_config(&cli, &bare_host) {
+            Ok(resolved) => {
+                config::apply_resolved(&mut cli, &resolved);
+            }
+            Err(e) => {
+                eprintln!("passhrs: invalid -G argument: {}", e);
+                std::process::exit(1);
+            }
+        }
+        match cli::print_resolved_config(&cli, &host_arg) {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 eprintln!("passhrs: invalid -G argument: {}", e);

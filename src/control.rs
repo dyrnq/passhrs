@@ -70,7 +70,7 @@ use crate::ssh::SshHandler;
 /// (which the resume doesn't supply) and would always be set only
 /// when a master is also configured to decrypt that key.
 pub(crate) fn has_no_fresh_auth(cli: &Cli) -> bool {
-    cli.identity_file.is_none() && cli.password.is_none() && cli.password_file.is_none()
+    cli.identity_file.is_empty() && cli.password.is_none() && cli.password_file.is_none()
 }
 
 // ----- Binding + cleanup -----
@@ -684,7 +684,7 @@ mod tests {
         ]);
         assert!(cli.passphrase.is_some());
         assert!(cli.passphrase_file.is_none());
-        assert!(cli.identity_file.is_none());
+        assert!(cli.identity_file.is_empty());
         assert!(cli.password.is_none());
         assert!(cli.password_file.is_none());
         assert!(cli.control_path.is_some());
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn has_no_fresh_auth_suppresses_when_identity_present() {
         let cli = Cli::parse_from(["passhrs", "-i", "/tmp/key", "user@host", "true"]);
-        assert!(cli.identity_file.is_some());
+        assert!(!cli.identity_file.is_empty());
         assert!(!has_no_fresh_auth(&cli));
     }
 
@@ -718,7 +718,7 @@ mod tests {
         // all. The resume predicate returns true so the client
         // tries the master UDS first.
         let cli = Cli::parse_from(["passhrs", "user@host", "echo", "hi"]);
-        assert!(cli.identity_file.is_none());
+        assert!(cli.identity_file.is_empty());
         assert!(cli.password.is_none());
         assert!(cli.password_file.is_none());
         assert!(has_no_fresh_auth(&cli));

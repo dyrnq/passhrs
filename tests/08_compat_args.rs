@@ -686,6 +686,79 @@ fn test_print_config_long() {
 }
 
 #[test]
+fn test_print_config_multiple_identity_files_join_with_comma() {
+    // `-G user@host -i a -i b -i c` must render all three as a
+    // single `identityfile a,b,c` line so OpenSSH's parser can
+    // round-trip it — Issue #71 (IdentityFile chain).
+    let (ok, stdout, stderr) = run_phr(&[
+        "-G",
+        "user@jumpbox",
+        "-i",
+        "/tmp/id_a",
+        "-i",
+        "/tmp/id_b",
+        "-i",
+        "/tmp/id_c",
+    ]);
+    assert!(ok, "-G with multiple -i must exit 0: {}", stderr);
+    assert!(
+        stdout.contains("identityfile /tmp/id_a,/tmp/id_b,/tmp/id_c"),
+        "`-G` must emit comma-joined identityfile line, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn test_print_config_cli_identity_chain_wins_over_config_identity() {
+    // CLI `-i` flags must precede config-file `IdentityFile`
+    // directives. Two CLI `-i` entries followed by one config
+    // entry yields three in the resolved `-G` output.
+    let path = write_temp_config("Host myhost\n  IdentityFile /tmp/key_from_config\n");
+    let (ok, stdout, stderr) = run_phr(&[
+        "-G",
+        "user@myhost",
+        "-F",
+        path.to_str().unwrap(),
+        "-i",
+        "/tmp/key_cli_a",
+        "-i",
+        "/tmp/key_cli_b",
+    ]);
+    assert!(ok, "-G must exit 0: {}", stderr);
+    assert!(
+        stdout.contains("identityfile /tmp/key_cli_a,/tmp/key_cli_b,/tmp/key_from_config"),
+        "CLI -i must precede config IdentityFile, got: {:?}",
+        stdout
+    );
+}
+
+#[test]
+fn test_multiple_short_i_flags_accepted_by_clap() {
+    // Multiple `-i` flags must be accepted at the parser level
+    // (regression guard: clap derive previously rejected repeat
+    // flags when the field was Option<PathBuf>; Issue #71).
+    let (_, _, stderr) = run_phr(&[
+        "-F",
+        "/dev/null",
+        "-i",
+        "/tmp/k1",
+        "-i",
+        "/tmp/k2",
+        "user@localhost",
+    ]);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "double `-i` must not be a clap error, stderr: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("cannot be used multiple times") && !stderr.contains("wasn't expected"),
+        "clap rejected repeat `-i`, stderr: {}",
+        stderr
+    );
+}
+
+#[test]
 fn test_print_config_with_p_flag_wins() {
     // `-G host -p 9999` (no dest port) — `-p` flag must be
     // reflected as the resolved port.

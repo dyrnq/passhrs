@@ -53,8 +53,13 @@ pub(crate) struct Cli {
     pub(crate) query: Vec<String>,
     #[arg(short = 'l', long = "user")]
     pub(crate) user: Option<String>,
+    /// One or more identity files. Multiple `-i` flags OR
+    /// multiple `IdentityFile` ssh_config directives are
+    /// tried in order until one authenticates — matches
+    /// OpenSSH's IdentityFile chain semantics (Issue #71).
+    /// CLI occurrences precede config-file entries.
     #[arg(short = 'i', long = "key")]
-    pub(crate) identity_file: Option<PathBuf>,
+    pub(crate) identity_file: Vec<PathBuf>,
     #[arg(short = 'J', long = "proxy-jump")]
     pub(crate) proxy_jump: Option<String>,
     #[arg(short = '4', long = "ipv4")]
@@ -819,9 +824,10 @@ pub(crate) fn write_resolved_config<W: std::io::Write>(
     let user = cli.user.clone().or(user_from_dest).unwrap_or_default();
     let identity = cli
         .identity_file
-        .as_ref()
+        .iter()
         .map(|p| p.display().to_string())
-        .unwrap_or_default();
+        .collect::<Vec<_>>()
+        .join(",");
     writeln!(out, "host {}", alias)?;
     writeln!(out, "hostname {}", host)?;
     writeln!(out, "port {}", port)?;
@@ -887,7 +893,7 @@ mod print_config_tests {
         ]);
         assert_eq!(cli.print_config.as_deref(), Some("user@jumpbox:2222"));
         assert_eq!(
-            cli.identity_file.as_ref().map(|p| p.display().to_string()),
+            cli.identity_file.first().map(|p| p.display().to_string()),
             Some("/tmp/k".to_string())
         );
     }

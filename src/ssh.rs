@@ -792,22 +792,30 @@ pub(crate) async fn authenticate_fwd(
     user: &str,
     password: Option<&str>,
     passphrase: Option<&str>,
-    identity_file: Option<&std::path::Path>,
+    identity_files: &[std::path::PathBuf],
 ) -> Result<()> {
     let u = user.to_string();
-    if let Some(k) = identity_file {
-        if let Ok(pk) = load_secret_key(k, passphrase) {
-            let algos: &[Option<HashAlg>] = if pk.algorithm().is_rsa() {
-                &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
-            } else {
-                &[None]
-            };
-            for &algo in algos {
-                let key = PrivateKeyWithHashAlg::new(Arc::new(pk.clone()), algo);
-                let result = handle.authenticate_publickey(u.clone(), key).await?;
-                if result.success() {
-                    return Ok(());
+    // OpenSSH-style IdentityFile chain: try each key in order
+    // until one authenticates, then fall through to password /
+    // none. -L/-D/-H forwarders reuse this same chain.
+    for k in identity_files {
+        match load_secret_key(k, passphrase) {
+            Ok(pk) => {
+                let algos: &[Option<HashAlg>] = if pk.algorithm().is_rsa() {
+                    &[Some(HashAlg::Sha512), Some(HashAlg::Sha256), None]
+                } else {
+                    &[None]
+                };
+                for &algo in algos {
+                    let key = PrivateKeyWithHashAlg::new(Arc::new(pk.clone()), algo);
+                    let result = handle.authenticate_publickey(u.clone(), key).await?;
+                    if result.success() {
+                        return Ok(());
+                    }
                 }
+            }
+            Err(e) => {
+                warn!("Failed to load key {:?}: {}", k, e);
             }
         }
     }
@@ -830,7 +838,11 @@ pub(crate) async fn authenticate(
     passphrase: Option<&str>,
 ) -> Result<()> {
     let u = user.to_string();
-    if let Some(ref k) = cli.identity_file {
+    // OpenSSH-style IdentityFile chain: try each -i / IdentityFile
+    // entry in declaration order until one authenticates, then
+    // fall through to password (Issue #71). Matches `ssh -i a -i
+    // b host` semantics where b is appended after a.
+    for k in &cli.identity_file {
         info!("Loading key: {:?}", k);
         match load_secret_key(k, passphrase) {
             Ok(pk) => {

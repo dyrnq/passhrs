@@ -56,12 +56,13 @@ pub(crate) struct ResolvedConfig {
     /// `Port <n>` — wins over destination port when CLI `-p`
     /// was not passed.
     pub port: Option<u16>,
-    /// First `IdentityFile <path>` from the matching block.
-    /// `russh-config` exposes a `Vec<PathBuf>` (multiple
-    /// IdentityFile directives accumulate); passhrs consumes
-    /// only the first today — subsequent ones would need a
-    /// fallback chain.
-    pub identity_file: Option<PathBuf>,
+    /// All `IdentityFile <path>` entries from the matching
+    /// block, in the order they appear. `russh-config`
+    /// exposes a `Vec<PathBuf>` (multiple directives
+    /// accumulate); passhrs surfaces the full chain so the
+    /// auth loop can try each key until one authenticates
+    /// (Issue #71 — matches OpenSSH semantics).
+    pub identity_file: Vec<PathBuf>,
     /// `ProxyJump <user@host[:port]>` — wins over `-J` when
     /// the user did not pass `-J` on the command line.
     pub proxy_jump: Option<String>,
@@ -81,10 +82,11 @@ impl From<russh_config::Config> for ResolvedConfig {
             hostname: hc.hostname,
             user: hc.user,
             port: hc.port,
-            // russh-config exposes Vec; passhrs v1 only honors
-            // the first IdentityFile. Subsequent ones would
-            // require a fallback chain that's not implemented.
-            identity_file: hc.identity_file.and_then(|mut v| v.pop()),
+            // Preserve every IdentityFile in order — the
+            // auth loop tries each in turn until one
+            // succeeds (Issue #71). An empty Vec means
+            // "no IdentityFile in this Host block".
+            identity_file: hc.identity_file.unwrap_or_default(),
             proxy_jump: hc.proxy_jump,
             strict_host_key_checking: hc.strict_host_key_checking,
             user_known_hosts_file: hc.user_known_hosts_file,
@@ -442,9 +444,15 @@ pub(crate) fn apply_resolved(cli: &mut Cli, resolved: &ResolvedConfig) {
             cli.user = Some(u.clone());
         }
     }
-    if cli.identity_file.is_none() {
-        if let Some(ref p) = resolved.identity_file {
-            cli.identity_file = Some(p.clone());
+    if !resolved.identity_file.is_empty() {
+        if cli.identity_file.is_empty() {
+            cli.identity_file = resolved.identity_file.clone();
+        } else {
+            // OpenSSH chain semantics: CLI `-i` flags precede
+            // config-file `IdentityFile` entries; both are tried
+            // in order until one authenticates (Issue #71).
+            cli.identity_file
+                .extend(resolved.identity_file.iter().cloned());
         }
     }
     if cli.proxy_jump.is_none() {
@@ -541,7 +549,7 @@ Host test-host
         // separators from russh-config's expansion).
         let id = cfg
             .identity_file
-            .as_ref()
+            .first()
             .expect("identity_file must be resolved");
         let id_str = id.to_string_lossy();
         assert!(
@@ -630,9 +638,87 @@ Host test-host
         let resolved = resolve_config(&cli, "test-host").unwrap();
         apply_resolved(&mut cli, &resolved);
         assert_eq!(
-            cli.identity_file.as_ref().map(|p| p.display().to_string()),
+            cli.identity_file.first().map(|p| p.display().to_string()),
             Some("/tmp/key_b".to_string())
         );
+    }
+
+    #[test]
+    fn identity_file_chain_cli_then_config_in_order() {
+        // OpenSSH chain semantics: `passhrs -i A -i B -F <conf>`
+        // with `IdentityFile C` in <conf> must produce
+        // [A, B, C] in that order, with CLI flags preceding
+        // config entries. Issue #71.
+        let path = write_fixture(
+            r#"
+Host chain-host
+  IdentityFile /tmp/key_c
+  IdentityFile /tmp/key_d
+"#,
+        );
+        let mut cli = Cli::parse_from([
+            "passhrs",
+            "-i",
+            "/tmp/key_a",
+            "-i",
+            "/tmp/key_b",
+            "chain-host",
+        ]);
+        cli.config_file = Some(path);
+        let resolved = resolve_config(&cli, "chain-host").unwrap();
+        apply_resolved(&mut cli, &resolved);
+        assert_eq!(
+            cli.identity_file
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "/tmp/key_a".to_string(),
+                "/tmp/key_b".to_string(),
+                "/tmp/key_c".to_string(),
+                "/tmp/key_d".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_file_chain_config_alone_preserves_order() {
+        // With no CLI `-i`, the config-file chain alone must be
+        // preserved in declaration order. Issue #71.
+        let path = write_fixture(
+            r#"
+Host chain-host
+  IdentityFile /tmp/key_first
+  IdentityFile /tmp/key_second
+  IdentityFile /tmp/key_third
+"#,
+        );
+        let mut cli = Cli::parse_from(["passhrs", "chain-host"]);
+        cli.config_file = Some(path);
+        let resolved = resolve_config(&cli, "chain-host").unwrap();
+        apply_resolved(&mut cli, &resolved);
+        assert_eq!(
+            cli.identity_file
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "/tmp/key_first".to_string(),
+                "/tmp/key_second".to_string(),
+                "/tmp/key_third".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn identity_file_chain_empty_when_neither_cli_nor_config() {
+        // No -i and no IdentityFile => empty Vec. Issue #71.
+        let cli = Cli::parse_from(["passhrs", "bare-host"]);
+        let resolved = resolve_config(&cli, "bare-host").unwrap();
+        let mut cli = cli;
+        apply_resolved(&mut cli, &resolved);
+        assert!(cli.identity_file.is_empty());
+        assert!(resolved.identity_file.is_empty());
     }
 
     #[test]
@@ -662,7 +748,7 @@ Host test-host
         assert!(resolved.hostname.is_none());
         assert!(resolved.user.is_none());
         assert!(resolved.port.is_none());
-        assert!(resolved.identity_file.is_none());
+        assert!(resolved.identity_file.is_empty());
         assert!(resolved.proxy_jump.is_none());
     }
 

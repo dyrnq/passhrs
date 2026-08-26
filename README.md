@@ -11,7 +11,7 @@
 |:----------|:-----------------------------------|
 | `-p`      | Port                               |
 | `-l`      | Login user                         |
-| `-i`      | Identity file (supports passphrase) |
+| `-i`      | Identity file (supports passphrase; chainable — multiple `-i` flags OR multiple `IdentityFile` ssh_config directives are tried in order until one authenticates — Issue #71) |
 | `-L`      | Local port forwarding              |
 | `-R`      | Remote port forwarding             |
 | `-D`      | SOCKS5 dynamic forwarding          |
@@ -166,6 +166,16 @@ passhrs -F /dev/null user@host       # skip config lookup entirely
 #     Host github.com
     User git
 
+# IdentityFile chain (multiple `-i` flags OR multiple
+# `IdentityFile` ssh_config directives are tried in order until
+# one authenticates; CLI `-i` entries precede config-file entries
+# — Issue #71).
+passhrs -i ~/.ssh/id_ed25519 -i ~/.ssh/id_rsa user@host
+# ssh_config:
+#     Host work
+#       IdentityFile ~/.ssh/work_ed25519
+#       IdentityFile ~/.ssh/work_rsa
+
 # Interactive shell
 passhrs user@host
 ```
@@ -186,7 +196,6 @@ ssh:   passhrs:   description
  -E    ✅  -E       Log to file
  -f    ✅  -f       Fork to background
  -H    ⭐  —        HTTP CONNECT proxy (passhrs unique, OpenSSH has no -H)
- -i    ✅  -i       Identity file (supports passphrase)
  -J    ✅  -J       ProxyJump
  -L    ✅  -L       Local port forwarding
  -l    ✅  -l       Login name
@@ -205,7 +214,8 @@ ssh:   passhrs:   description
  -c    ✅  -c       Cipher spec (comma-separated, priority order)
  -e    ✅  -e       Escape character (`~` default, `none` disables, only with -t)
  -F    ✅  -F       ssh_config(5) file (User/Hostname/Port/IdentityFile/ProxyJump/StrictHostKeyChecking/UserKnownHostsFile via russh-config 0.58 + passhrs's `Include` pre-processor with `~` / `%d` / `%u` / `%h` token expansion, single-level glob fan-out, and cycle detection — Issues #67 + #69; CLI > config precedence; -F /dev/null short-circuits; `Match exec=`/`ForwardX11`/`ForwardAgent`/etc. still silently ignored)
- -G    ✅  -G       Print resolved config for `<hostname>` and exit (CLI flags + `-o` overrides; `-F` walking ssh_config Host blocks is a follow-up)
+ -G    ✅  -G       Print resolved config for `<hostname>` and exit (CLI flags + `-o` overrides + `-F` ssh_config Host block: User/IdentityFile chain resolved in CLI-then-config order — Issue #71)
+ -i    ✅  -i       Identity file (supports passphrase; chainable — multiple `-i` flags OR multiple `IdentityFile` ssh_config directives are tried in order until one authenticates — Issue #71)
  -g    ✅  -g       Allow remote hosts to connect local forwards
  -I    ❌  —        PKCS#11
  -K    ❌  —        Enable GSSAPI delegation
@@ -236,7 +246,7 @@ ssh:   passhrs:   description
 
 ### Not Implemented — Notes
 
-**`-F` ssh_config caveat:** the resolver is built on `russh-config` 0.58 (same warp-tech monorepo as `russh` itself) plus passhrs's own `Include` pre-processor. russh-config's parser handles `User`, `Hostname`, `Port`, `IdentityFile` (first only), `ProxyJump`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `AddKeysToAgent`. The pre-processor handles `Include` with single-level glob fan-out, tilde + `%d`/`%u`/`%h` token expansion, and cycle detection. Other directives (`ForwardX11`, `ForwardAgent`, `Compression`, `LocalForward`, `RemoteForward`, `DynamicForward`, `Match exec=`, etc.) are still silently dropped — users who need those should pass `-o key=value` until follow-up lands. Issues #67 + #69.
+**`-F` ssh_config caveat:** the resolver is built on `russh-config` 0.58 (same warp-tech monorepo as `russh` itself) plus passhrs's own `Include` pre-processor. russh-config's parser handles `User`, `Hostname`, `Port`, `IdentityFile` (full chain — multiple entries tried in order, CLI `-i` precedes config — Issue #71), `ProxyJump`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `AddKeysToAgent`. The pre-processor handles `Include` with single-level glob fan-out, tilde + `%d`/`%u`/`%h` token expansion, and cycle detection. Other directives (`ForwardX11`, `ForwardAgent`, `Compression`, `LocalForward`, `RemoteForward`, `DynamicForward`, `Match exec=`, etc.) are still silently dropped — users who need those should pass `-o key=value` until follow-up lands. Issues #67 + #69 + #71.
 
 **Can be added via russh (low effort):**
 - `-C` compression level: flate2 feature

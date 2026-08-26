@@ -100,7 +100,7 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
     user: &str,
     password: &Option<String>,
     passphrase: &Option<String>,
-    identity_file: &Option<std::path::PathBuf>,
+    identity_file: &[std::path::PathBuf],
     user_known_hosts: &std::sync::Arc<Option<String>>,
     strict_check: bool,
     accept_all_host_keys: bool,
@@ -119,7 +119,7 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
     let fwd_user = user.to_string();
     let fwd_pw = password.clone();
     let fwd_pp = passphrase.clone();
-    let fwd_key = identity_file.clone();
+    let fwd_key = identity_file.to_vec();
     let uk = user_known_hosts.clone();
     tokio::spawn(async move {
         for spec in fw {
@@ -162,7 +162,7 @@ pub(crate) fn spawn_forward_tasks<Spec, Fut>(
                 &fwd_user,
                 fwd_pw.as_deref(),
                 fwd_pp.as_deref(),
-                fwd_key.as_deref(),
+                &fwd_key,
             )
             .await
             .ok();
