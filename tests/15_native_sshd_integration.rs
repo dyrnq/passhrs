@@ -1235,6 +1235,25 @@ fn test_atomic_rsync_delta_no_litter() {
     // because we want a clean baseline, not anything that
     // has gone through the atomic helper itself.
     std::fs::write(format!("{}/file.bin", remote_dir), &original).unwrap();
+    // Force the remote mtime to 1 hour in the past so the
+    // rsync's mtime+size short-circuit (`skip (same)` in
+    // sftp.rs) can't fire and we always exercise the delta
+    // branch. Without this, fast CI runners can pre-seed
+    // and write the local file within the same nanosecond,
+    // and the rsync would skip the file as "already in
+    // sync" — which then leaves the original bytes at the
+    // remote and trips the assert_eq! below.
+    {
+        use std::time::Duration;
+        let remote_file = format!("{}/file.bin", remote_dir);
+        let past = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&remote_file)
+            .and_then(|f| f.set_modified(past));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
