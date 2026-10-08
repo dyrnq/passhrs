@@ -22,12 +22,11 @@ use crate::types::RemoteFileInfo;
 /// nanosecond clock via a `DefaultHasher` (FNV-style) so two
 /// calls within the same nanosecond still produce distinct
 /// suffixes. With ~57B possible 6-char values, collisions are
-/// negligible; `CREATE|EXCL` on the temp file still catches
+/// negligible; `CREATE|EXCLUDE` on the temp file still catches
 /// the rare duplicate and surfaces it as an error rather than
 /// silently clobbering a sibling.
 fn random_tmp_suffix() -> String {
-    const ALPHABET: &[u8; 62] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -65,11 +64,7 @@ fn random_tmp_suffix() -> String {
 /// On any error the temp file is best-effort removed so
 /// interrupted runs don't leave `.tmp.XXXXXX` litter in the
 /// remote directory.
-pub(crate) async fn atomic_write_remote(
-    sftp: &SftpSession,
-    path: &str,
-    data: &[u8],
-) -> Result<()> {
+pub(crate) async fn atomic_write_remote(sftp: &SftpSession, path: &str, data: &[u8]) -> Result<()> {
     let tmp = format!("{}.tmp.{}", path, random_tmp_suffix());
     let write_res = async {
         let mut file = sftp
@@ -137,19 +132,17 @@ pub(crate) async fn atomic_write_local(path: &Path, data: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to fsync local temp file: {}", tmp.display()))?;
         tokio::fs::rename(&tmp, path)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to rename {} -> {}",
-                    tmp.display(),
-                    path.display()
-                )
-            })?;
+            .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
     if write_res.is_err() {
         if let Err(e) = tokio::fs::remove_file(&tmp).await {
-            warn!("failed to clean up local temp file {}: {}", tmp.display(), e);
+            warn!(
+                "failed to clean up local temp file {}: {}",
+                tmp.display(),
+                e
+            );
         }
     }
     write_res
@@ -586,7 +579,9 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let target = dir.join("file.bin");
         tokio::fs::write(&target, b"v1").await.unwrap();
-        atomic_write_local(&target, b"v2-new-content").await.unwrap();
+        atomic_write_local(&target, b"v2-new-content")
+            .await
+            .unwrap();
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"v2-new-content");
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
