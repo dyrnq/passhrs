@@ -66,7 +66,7 @@ fn random_tmp_suffix() -> String {
 /// remote directory.
 pub(crate) async fn atomic_write_remote(sftp: &SftpSession, path: &str, data: &[u8]) -> Result<()> {
     let tmp = format!("{}.tmp.{}", path, random_tmp_suffix());
-    let write_res = async {
+    let write_res: Result<()> = async {
         let mut file = sftp
             .open_with_flags(
                 &tmp,
@@ -83,9 +83,50 @@ pub(crate) async fn atomic_write_remote(sftp: &SftpSession, path: &str, data: &[
         // server doesn't advertise the extension (older sshd,
         // some embedded servers).
         let _ = file.sync_all().await;
-        sftp.rename(&tmp, path)
-            .await
-            .with_context(|| format!("failed to rename {} -> {}", tmp, path))?;
+        // Explicitly close the file handle and await the
+        // close response before the rename. Two reasons:
+        //   1. `russh_sftp::client::fs::File`'s `Drop` is
+        //      fire-and-forget (the close request is sent
+        //      without awaiting the response), so without an
+        //      explicit close the SFTP server may still have
+        //      the handle open when the rename request
+        //      arrives. Most servers (Linux + OpenSSH) accept
+        //      rename-of-open-file fine, but at least one
+        //      regression we hit on Ubuntu 24.04 OpenSSH 9.6p1
+        //      refused to rename onto an existing target while
+        //      a write handle was still open against the temp.
+        //   2. `close()` returning Ok means the server
+        //      acknowledged the close — at that point the
+        //      temp's bytes are fully on disk and the rename
+        //      is the only remaining side effect.
+        let _ = file.close().await;
+        // Primary path: atomic replace. Linux rename(2) (and
+        // OpenSSH sftp-server) replaces an existing target in
+        // one observable step, so other processes see either
+        // the old bytes or the new bytes — never partial.
+        if let Err(e) = sftp.rename(&tmp, path).await {
+            // Fallback: some sftp-server implementations
+            // (or sftp-server front-ends) refuse to rename
+            // onto an existing path and return an error
+            // instead. Detect that and degrade to explicit
+            // unlink + rename. The window where the target
+            // doesn't exist is tiny (single round-trip) and
+            // any concurrent reader on a same-host system
+            // will get a clear "no such file" rather than a
+            // torn read — better than failing the whole
+            // transfer.
+            warn!(
+                "atomic rename {} -> {} failed ({}); retrying with explicit unlink",
+                tmp, path, e
+            );
+            // Best-effort unlink. If the target doesn't
+            // exist (first push) this is a no-op-style
+            // failure that we just ignore.
+            let _ = sftp.remove_file(path).await;
+            sftp.rename(&tmp, path)
+                .await
+                .with_context(|| format!("failed to rename {} -> {}", tmp, path))?;
+        }
         Ok::<(), anyhow::Error>(())
     }
     .await;
