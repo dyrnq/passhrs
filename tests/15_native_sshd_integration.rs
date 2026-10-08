@@ -768,6 +768,541 @@ fn test_rsync_with_exclude() {
 }
 
 // ======================================================================
+// 原子写入集成测试（`--push` / `--pull` / `--rsync` 走
+// `{path}.tmp.XXXXXX` + `fsync` + `rename(2)` 流程，目录里不应该
+// 残留任何 `*.tmp.*` 文件）
+// ======================================================================
+
+/// Walk a directory (any depth) and return every entry whose
+/// filename contains a `.tmp.` segment. The atomic-write helpers
+/// use `{name}.tmp.XXXXXX` as the temp pattern, so any match is
+/// a real bug: either the temp was leaked (e.g. the rename
+/// failed silently) or a sibling process has the same name
+/// pattern.
+fn find_tmp_litter(dir: &Path) -> Vec<PathBuf> {
+    let mut hits = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                if name.contains(".tmp.") {
+                    hits.push(p);
+                }
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_push_no_temp_litter() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let local = format!("{}/phr_atomic_push_src.txt", tmp_root().display());
+    let remote = format!("{}/phr_atomic_push_dst.txt", tmp_root().display());
+    std::fs::write(&local, b"first atomic push content\n").unwrap();
+
+    let d = dest();
+    let spec = format!("{}:{}", local, remote);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--push",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "atomic push failed: {}", stderr);
+
+    // 1. Content landed at the target (no .tmp.X leftover path).
+    let out = std::fs::read_to_string(&remote).expect("remote target missing");
+    assert!(out.contains("first atomic push content"));
+
+    // 2. The remote dir has no .tmp.* litter. Scan a window
+    //    that includes the file's parent (since the temp sits
+    //    next to the target, the parent of `remote` is what
+    //    matters — but we also walk up to tmp_root() to be
+    //    defensive against future path-layout changes).
+    let litter = find_tmp_litter(&tmp_root());
+    assert!(
+        litter.is_empty(),
+        "atomic push leaked temp files: {:?}",
+        litter
+    );
+
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&remote);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_push_overwrites_existing() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let local_v1 = format!("{}/phr_atomic_push_overwrite_v1.txt", tmp_root().display());
+    let local_v2 = format!("{}/phr_atomic_push_overwrite_v2.txt", tmp_root().display());
+    let remote = format!("{}/phr_atomic_push_overwrite_dst.txt", tmp_root().display());
+    std::fs::write(&local_v1, b"VERSION ONE CONTENT\n").unwrap();
+
+    let d = dest();
+    let spec1 = format!("{}:{}", local_v1, remote);
+    let a1 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--push",
+        &spec1,
+        &d,
+        "id",
+    ];
+    let (ok1, _, e1) = run_phr(&a1);
+    assert!(ok1, "first push failed: {}", e1);
+    assert!(std::fs::read_to_string(&remote)
+        .unwrap()
+        .contains("VERSION ONE"));
+
+    // Now overwrite via a second push with different content.
+    // Pre-existing the target (i.e. v1's bytes) exercises the
+    // rename-over-existing-file path that O_TRUNC previously
+    // owned. The atomic helper should leave v1's inode
+    // detached (so the new content is what readers see) and
+    // land the new bytes.
+    std::fs::write(&local_v2, b"VERSION TWO CONTENT\n").unwrap();
+    let spec2 = format!("{}:{}", local_v2, remote);
+    let a2 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--push",
+        &spec2,
+        &d,
+        "id",
+    ];
+    let (ok2, _, e2) = run_phr(&a2);
+    assert!(ok2, "second (overwrite) push failed: {}", e2);
+
+    let final_content = std::fs::read_to_string(&remote).expect("remote target gone");
+    assert!(
+        final_content.contains("VERSION TWO"),
+        "second push did not win, got: {:?}",
+        final_content
+    );
+    assert!(
+        !final_content.contains("VERSION ONE"),
+        "first content leaked into final, got: {:?}",
+        final_content
+    );
+
+    let litter = find_tmp_litter(&tmp_root());
+    assert!(
+        litter.is_empty(),
+        "atomic push overwrite leaked temp files: {:?}",
+        litter
+    );
+
+    let _ = std::fs::remove_file(&local_v1);
+    let _ = std::fs::remove_file(&local_v2);
+    let _ = std::fs::remove_file(&remote);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_pull_no_temp_litter() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let remote = format!("{}/phr_atomic_pull_src.txt", tmp_root().display());
+    let local = format!("{}/phr_atomic_pull_dst.txt", tmp_root().display());
+    std::fs::write(&remote, b"remote content for atomic pull\n").unwrap();
+
+    let d = dest();
+    let spec = format!("{}:{}", remote, local);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--pull",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "atomic pull failed: {}", stderr);
+
+    let out = std::fs::read_to_string(&local).expect("local target missing");
+    assert!(out.contains("remote content for atomic pull"));
+
+    let litter = find_tmp_litter(&tmp_root());
+    assert!(
+        litter.is_empty(),
+        "atomic pull leaked temp files: {:?}",
+        litter
+    );
+
+    let _ = std::fs::remove_file(&remote);
+    let _ = std::fs::remove_file(&local);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_pull_overwrites_existing() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let remote_v1 = format!("{}/phr_atomic_pull_overwrite_v1.txt", tmp_root().display());
+    let remote_v2 = format!("{}/phr_atomic_pull_overwrite_v2.txt", tmp_root().display());
+    let local = format!("{}/phr_atomic_pull_overwrite_dst.txt", tmp_root().display());
+    std::fs::write(&remote_v1, b"REMOTE VERSION ONE\n").unwrap();
+    std::fs::write(&remote_v2, b"REMOTE VERSION TWO\n").unwrap();
+
+    let d = dest();
+    // Pre-create the local target so the second pull has to
+    // rename-over-existing, exactly like a config-deploy
+    // script that pulls a newer build over an older one.
+    std::fs::write(&local, b"STALE LOCAL CONTENT\n").unwrap();
+
+    let spec1 = format!("{}:{}", remote_v1, local);
+    let a1 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--pull",
+        &spec1,
+        &d,
+        "id",
+    ];
+    let (ok1, _, e1) = run_phr(&a1);
+    assert!(ok1, "first pull failed: {}", e1);
+    assert!(std::fs::read_to_string(&local)
+        .unwrap()
+        .contains("REMOTE VERSION ONE"));
+
+    let spec2 = format!("{}:{}", remote_v2, local);
+    let a2 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--pull",
+        &spec2,
+        &d,
+        "id",
+    ];
+    let (ok2, _, e2) = run_phr(&a2);
+    assert!(ok2, "second (overwrite) pull failed: {}", e2);
+
+    let final_content = std::fs::read_to_string(&local).expect("local target gone");
+    assert!(
+        final_content.contains("REMOTE VERSION TWO"),
+        "second pull did not win, got: {:?}",
+        final_content
+    );
+    assert!(
+        !final_content.contains("REMOTE VERSION ONE"),
+        "first content leaked into final, got: {:?}",
+        final_content
+    );
+
+    let litter = find_tmp_litter(&tmp_root());
+    assert!(
+        litter.is_empty(),
+        "atomic pull overwrite leaked temp files: {:?}",
+        litter
+    );
+
+    let _ = std::fs::remove_file(&remote_v1);
+    let _ = std::fs::remove_file(&remote_v2);
+    let _ = std::fs::remove_file(&local);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_rsync_no_temp_litter() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    let dir = format!("{}/phr_atomic_rsync_src", tmp_root().display());
+    let remote_dir = format!("{}/phr_atomic_rsync_dst", tmp_root().display());
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(format!("{}/a.txt", dir), b"atomic rsync a\n").unwrap();
+    std::fs::write(format!("{}/b.txt", dir), b"atomic rsync b\n").unwrap();
+    setup_rsync_remote(remote_dir.as_str());
+
+    let d = dest();
+    let spec = format!("{}/:{}", dir, remote_dir);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "atomic rsync failed: {}", stderr);
+
+    // Both ends of the rsync should be clean of `.tmp.*`.
+    let local_litter = find_tmp_litter(Path::new(&dir));
+    let remote_litter = find_tmp_litter(Path::new(&remote_dir));
+    assert!(
+        local_litter.is_empty(),
+        "rsync left temp in local src dir: {:?}",
+        local_litter
+    );
+    assert!(
+        remote_litter.is_empty(),
+        "rsync left temp in remote dst dir: {:?}",
+        remote_litter
+    );
+
+    // Sanity: the files actually landed.
+    assert!(std::path::Path::new(&format!("{}/a.txt", remote_dir)).exists());
+    assert!(std::path::Path::new(&format!("{}/b.txt", remote_dir)).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_rsync_overwrites_existing() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // The first rsync lands the file via the full-upload
+    // path. The second rsync changes the source content
+    // (different size, so the size-mismatch branch fires,
+    // not the delta branch) and verifies that overwrite
+    // goes through the same atomic helper as --push.
+    let dir_v1 = format!("{}/phr_atomic_rsync_overwrite_v1", tmp_root().display());
+    let dir_v2 = format!("{}/phr_atomic_rsync_overwrite_v2", tmp_root().display());
+    let remote_dir = format!("{}/phr_atomic_rsync_overwrite_dst", tmp_root().display());
+    setup_rsync_remote(remote_dir.as_str());
+
+    let _ = std::fs::create_dir_all(&dir_v1);
+    std::fs::write(format!("{}/file.txt", dir_v1), b"RSYNC V1 CONTENT\n").unwrap();
+    let spec1 = format!("{}/:{}/", dir_v1, remote_dir);
+    let d = dest();
+    let a1 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec1,
+        &d,
+        "id",
+    ];
+    let (ok1, _, e1) = run_phr(&a1);
+    assert!(ok1, "first rsync failed: {}", e1);
+    let remote_file = format!("{}/file.txt", remote_dir);
+    assert!(std::fs::read_to_string(&remote_file)
+        .unwrap()
+        .contains("RSYNC V1"));
+
+    // Second rsync — different size, so rsync_upload goes
+    // through the size-mismatch branch and rewrites via
+    // atomic_write_remote. Verifies the overwrite path.
+    let _ = std::fs::create_dir_all(&dir_v2);
+    std::fs::write(
+        format!("{}/file.txt", dir_v2),
+        b"RSYNC V2 OVERWRITE CONTENT\n",
+    )
+    .unwrap();
+    let spec2 = format!("{}/:{}/", dir_v2, remote_dir);
+    let a2 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec2,
+        &d,
+        "id",
+    ];
+    let (ok2, _, e2) = run_phr(&a2);
+    assert!(ok2, "second (overwrite) rsync failed: {}", e2);
+
+    let final_content = std::fs::read_to_string(&remote_file).expect("remote file gone");
+    assert!(
+        final_content.contains("RSYNC V2 OVERWRITE"),
+        "second rsync did not win, got: {:?}",
+        final_content
+    );
+    assert!(
+        !final_content.contains("RSYNC V1"),
+        "first content leaked into final, got: {:?}",
+        final_content
+    );
+
+    let local_litter = find_tmp_litter(Path::new(&dir_v2));
+    let remote_litter = find_tmp_litter(Path::new(&remote_dir));
+    assert!(
+        local_litter.is_empty(),
+        "rsync overwrite left temp in local: {:?}",
+        local_litter
+    );
+    assert!(
+        remote_litter.is_empty(),
+        "rsync overwrite left temp in remote: {:?}",
+        remote_litter
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_v1);
+    let _ = std::fs::remove_dir_all(&dir_v2);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_rsync_delta_no_litter() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // Same size, different content — this is the only way
+    // the rsync delta branch fires (line 368 in sftp.rs:
+    // `Some(ri) if ri.size == info.size`). The delta is
+    // reconstructed on the receiver side via copia and then
+    // written through atomic_write_remote, so this test
+    // verifies that the delta-patch write path also lands
+    // via temp + rename with no .tmp.* litter.
+    //
+    // We pad both files to exactly 1024 bytes so the size
+    // matches and copia's block-level diff is exercised;
+    // the random padding ensures delta_size < full_size
+    // (copia will emit mostly Copy ops referencing the
+    // unchanged padding).
+    let dir = format!("{}/phr_atomic_rsync_delta_src", tmp_root().display());
+    let remote_dir = format!("{}/phr_atomic_rsync_delta_dst", tmp_root().display());
+    setup_rsync_remote(remote_dir.as_str());
+
+    let _ = std::fs::create_dir_all(&dir);
+    let original: Vec<u8> = (b'a'..=b'z').cycle().take(1024).collect();
+    let mut modified = original.clone();
+    // Flip a few bytes in the middle to make sure copia's
+    // delta has some literal+copy ops (not pure-copy).
+    for byte in modified.iter_mut().skip(400).take(20) {
+        *byte = b'!';
+    }
+    std::fs::write(format!("{}/file.bin", dir), &modified).unwrap();
+
+    // Pre-seed the remote with `original` so the rsync
+    // sees matching size and goes through the delta
+    // branch. Pre-creating via std::fs (not --push)
+    // because we want a clean baseline, not anything that
+    // has gone through the atomic helper itself.
+    std::fs::write(format!("{}/file.bin", remote_dir), &original).unwrap();
+    // Force the remote mtime to 1 hour in the past so the
+    // rsync's mtime+size short-circuit (`skip (same)` in
+    // sftp.rs) can't fire and we always exercise the delta
+    // branch. Without this, fast CI runners can pre-seed
+    // and write the local file within the same nanosecond,
+    // and the rsync would skip the file as "already in
+    // sync" — which then leaves the original bytes at the
+    // remote and trips the assert_eq! below.
+    {
+        use std::time::Duration;
+        let remote_file = format!("{}/file.bin", remote_dir);
+        let past = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&remote_file)
+            .and_then(|f| f.set_modified(past));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let remote_file = format!("{}/file.bin", remote_dir);
+        let _ = std::fs::set_permissions(&remote_file, std::fs::Permissions::from_mode(0o666));
+    }
+
+    let d = dest();
+    let spec = format!("{}/:{}/", dir, remote_dir);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "atomic rsync delta failed: {}", stderr);
+
+    // Verify the patched bytes actually landed.
+    let final_bytes = std::fs::read(format!("{}/file.bin", remote_dir)).expect("remote gone");
+    assert_eq!(
+        final_bytes, modified,
+        "delta-patched bytes don't match the local source"
+    );
+
+    let local_litter = find_tmp_litter(Path::new(&dir));
+    let remote_litter = find_tmp_litter(Path::new(&remote_dir));
+    assert!(
+        local_litter.is_empty(),
+        "rsync delta left temp in local: {:?}",
+        local_litter
+    );
+    assert!(
+        remote_litter.is_empty(),
+        "rsync delta left temp in remote: {:?}",
+        remote_litter
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+// ======================================================================
 // 环境变量测试
 // ======================================================================
 

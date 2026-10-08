@@ -89,6 +89,38 @@ passhrs --push script.sh:/tmp/s.sh user@host bash /tmp/s.sh
 passhrs --rsync /local/dir/:/remote/dir/ --rsync-opt delete user@host
 ```
 
+#### Atomic writes (default)
+
+`--push`, `--pull`, and `--rsync` write the destination **atomically** by
+default — the new bytes land in a sibling temp file (e.g.
+`/etc/nginx.conf.tmp.a1B2c3`) with `O_CREAT|O_EXCL`, get `fsync`-ed
+(`fsync@openssh.com` on the remote side, `fsync(2)` locally), and are
+then `rename(2)`-d over the target. Other processes see either the
+old contents or the new contents — never a half-written file.
+
+Why this matters in practice:
+
+- **Overwrite-in-place of running binaries works.** A running nginx
+  binary mapped into memory would block `O_TRUNC` with `ETXTBSY` (the
+  kernel protects text segments from being modified under a live
+  process), but `rename(2)` only checks the inode's link count, not
+  the executable-mappings bit, so the swap goes through. The running
+  process keeps executing the old inode; the new binary takes over
+  the path for the *next* `execve(2)`.
+- **No torn writes on crash.** A power loss mid-upload can't leave
+  the target in a half-written state — either the rename happened
+  (new bytes) or it didn't (old bytes still there).
+- **Concurrent passhrs invocations don't clobber each other.** The
+  `O_EXCL` on the temp file guarantees a fresh, never-before-used
+  path per call (the 6-char random suffix has ~5.7 × 10¹⁰
+  possibilities).
+
+To opt back into the legacy truncate-in-place behavior, drop an
+`O_TRUNC` directly — there is intentionally no CLI flag for this
+yet, because the only legitimate use case (rsync's `--inplace` block
+rewrite on a sparse file) doesn't apply to passhrs's whole-file
+transfers.
+
 ### Environment Variables
 ```bash
 passhrs --exec-env MYVAR=hello --exec-env PATH=/custom/bin user@host 'echo $MYVAR'
