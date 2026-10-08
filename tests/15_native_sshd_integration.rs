@@ -1100,6 +1100,189 @@ fn test_atomic_rsync_no_temp_litter() {
     let _ = std::fs::remove_dir_all(&remote_dir);
 }
 
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_rsync_overwrites_existing() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // The first rsync lands the file via the full-upload
+    // path. The second rsync changes the source content
+    // (different size, so the size-mismatch branch fires,
+    // not the delta branch) and verifies that overwrite
+    // goes through the same atomic helper as --push.
+    let dir_v1 = format!("{}/phr_atomic_rsync_overwrite_v1", tmp_root().display());
+    let dir_v2 = format!("{}/phr_atomic_rsync_overwrite_v2", tmp_root().display());
+    let remote_dir = format!("{}/phr_atomic_rsync_overwrite_dst", tmp_root().display());
+    setup_rsync_remote(remote_dir.as_str());
+
+    let _ = std::fs::create_dir_all(&dir_v1);
+    std::fs::write(format!("{}/file.txt", dir_v1), b"RSYNC V1 CONTENT\n").unwrap();
+    let spec1 = format!("{}/:{}/", dir_v1, remote_dir);
+    let d = dest();
+    let a1 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec1,
+        &d,
+        "id",
+    ];
+    let (ok1, _, e1) = run_phr(&a1);
+    assert!(ok1, "first rsync failed: {}", e1);
+    let remote_file = format!("{}/file.txt", remote_dir);
+    assert!(std::fs::read_to_string(&remote_file)
+        .unwrap()
+        .contains("RSYNC V1"));
+
+    // Second rsync — different size, so rsync_upload goes
+    // through the size-mismatch branch and rewrites via
+    // atomic_write_remote. Verifies the overwrite path.
+    let _ = std::fs::create_dir_all(&dir_v2);
+    std::fs::write(
+        format!("{}/file.txt", dir_v2),
+        b"RSYNC V2 OVERWRITE CONTENT\n",
+    )
+    .unwrap();
+    let spec2 = format!("{}/:{}/", dir_v2, remote_dir);
+    let a2 = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec2,
+        &d,
+        "id",
+    ];
+    let (ok2, _, e2) = run_phr(&a2);
+    assert!(ok2, "second (overwrite) rsync failed: {}", e2);
+
+    let final_content = std::fs::read_to_string(&remote_file).expect("remote file gone");
+    assert!(
+        final_content.contains("RSYNC V2 OVERWRITE"),
+        "second rsync did not win, got: {:?}",
+        final_content
+    );
+    assert!(
+        !final_content.contains("RSYNC V1"),
+        "first content leaked into final, got: {:?}",
+        final_content
+    );
+
+    let local_litter = find_tmp_litter(Path::new(&dir_v2));
+    let remote_litter = find_tmp_litter(Path::new(&remote_dir));
+    assert!(
+        local_litter.is_empty(),
+        "rsync overwrite left temp in local: {:?}",
+        local_litter
+    );
+    assert!(
+        remote_litter.is_empty(),
+        "rsync overwrite left temp in remote: {:?}",
+        remote_litter
+    );
+
+    let _ = std::fs::remove_dir_all(&dir_v1);
+    let _ = std::fs::remove_dir_all(&dir_v2);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_atomic_rsync_delta_no_litter() {
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // Same size, different content — this is the only way
+    // the rsync delta branch fires (line 368 in sftp.rs:
+    // `Some(ri) if ri.size == info.size`). The delta is
+    // reconstructed on the receiver side via copia and then
+    // written through atomic_write_remote, so this test
+    // verifies that the delta-patch write path also lands
+    // via temp + rename with no .tmp.* litter.
+    //
+    // We pad both files to exactly 1024 bytes so the size
+    // matches and copia's block-level diff is exercised;
+    // the random padding ensures delta_size < full_size
+    // (copia will emit mostly Copy ops referencing the
+    // unchanged padding).
+    let dir = format!("{}/phr_atomic_rsync_delta_src", tmp_root().display());
+    let remote_dir = format!("{}/phr_atomic_rsync_delta_dst", tmp_root().display());
+    setup_rsync_remote(remote_dir.as_str());
+
+    let _ = std::fs::create_dir_all(&dir);
+    let original: Vec<u8> = (b'a'..=b'z').cycle().take(1024).collect();
+    let mut modified = original.clone();
+    // Flip a few bytes in the middle to make sure copia's
+    // delta has some literal+copy ops (not pure-copy).
+    for byte in modified.iter_mut().skip(400).take(20) {
+        *byte = b'!';
+    }
+    std::fs::write(format!("{}/file.bin", dir), &modified).unwrap();
+
+    // Pre-seed the remote with `original` so the rsync
+    // sees matching size and goes through the delta
+    // branch. Pre-creating via std::fs (not --push)
+    // because we want a clean baseline, not anything that
+    // has gone through the atomic helper itself.
+    std::fs::write(format!("{}/file.bin", remote_dir), &original).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let remote_file = format!("{}/file.bin", remote_dir);
+        let _ = std::fs::set_permissions(&remote_file, std::fs::Permissions::from_mode(0o666));
+    }
+
+    let d = dest();
+    let spec = format!("{}/:{}/", dir, remote_dir);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "atomic rsync delta failed: {}", stderr);
+
+    // Verify the patched bytes actually landed.
+    let final_bytes = std::fs::read(format!("{}/file.bin", remote_dir)).expect("remote gone");
+    assert_eq!(
+        final_bytes, modified,
+        "delta-patched bytes don't match the local source"
+    );
+
+    let local_litter = find_tmp_litter(Path::new(&dir));
+    let remote_litter = find_tmp_litter(Path::new(&remote_dir));
+    assert!(
+        local_litter.is_empty(),
+        "rsync delta left temp in local: {:?}",
+        local_litter
+    );
+    assert!(
+        remote_litter.is_empty(),
+        "rsync delta left temp in remote: {:?}",
+        remote_litter
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
 // ======================================================================
 // 环境变量测试
 // ======================================================================
