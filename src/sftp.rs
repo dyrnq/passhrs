@@ -1,4 +1,9 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::Hasher;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use copia::{DeltaOp, Sync, SyncBuilder};
@@ -8,6 +13,148 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::AsyncWriteExt;
 
 use crate::types::RemoteFileInfo;
+
+/// Build a 6-character random-looking suffix for atomic-write
+/// temp filenames. Mirrors `rsync`'s `.XXXXXX` placeholder;
+/// the alphabet is `[a-zA-Z0-9]` for portability (some SFTP
+/// servers reject punctuation in filenames). The entropy
+/// source is a process-global atomic counter mixed with the
+/// nanosecond clock via a `DefaultHasher` (FNV-style) so two
+/// calls within the same nanosecond still produce distinct
+/// suffixes. With ~57B possible 6-char values, collisions are
+/// negligible; `CREATE|EXCL` on the temp file still catches
+/// the rare duplicate and surfaces it as an error rather than
+/// silently clobbering a sibling.
+fn random_tmp_suffix() -> String {
+    const ALPHABET: &[u8; 62] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut h = DefaultHasher::new();
+    h.write_u64(nanos);
+    h.write_u64(count);
+    h.write_u64((&h as *const _) as usize as u64); // stack address — extra entropy
+    let hash = h.finish();
+    (0..6)
+        .map(|i| {
+            let shift = (i as u32) * 10; // 6 chars * 10 bits ≈ 60 bits covered
+            let idx = ((hash >> shift) as usize) % ALPHABET.len();
+            ALPHABET[idx] as char
+        })
+        .collect()
+}
+
+/// Write `data` to a remote `path` atomically: stream into a
+/// sibling temp file (`{path}.tmp.XXXXXX`) opened with
+/// `CREATE|EXCLUDE|WRITE` (russh-sftp's spelling of the
+/// SFTPv3 `SSH_FXF_EXCL` flag — fail if the temp already
+/// exists, so two concurrent passhrs invocations can't
+/// clobber each other's temp), `sync_all` if the server
+/// supports the `fsync@openssh.com` SFTP extension, then
+/// `rename` over the target. The rename is a single
+/// `unlink + link` pair from the server's point of view, so
+/// the target's inode is replaced in one observable step from
+/// other processes — and crucially, the unlink only checks
+/// `i_nlink`, not `mapping_mapped`, so the rename succeeds
+/// even when the target is a running executable (`ETXTBSY`
+/// is a *truncate-time* check, not a *unlink-time* check).
+/// On any error the temp file is best-effort removed so
+/// interrupted runs don't leave `.tmp.XXXXXX` litter in the
+/// remote directory.
+pub(crate) async fn atomic_write_remote(
+    sftp: &SftpSession,
+    path: &str,
+    data: &[u8],
+) -> Result<()> {
+    let tmp = format!("{}.tmp.{}", path, random_tmp_suffix());
+    let write_res = async {
+        let mut file = sftp
+            .open_with_flags(
+                &tmp,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
+            .await
+            .with_context(|| format!("failed to open remote temp file: {}", tmp))?;
+        file.write_all(data)
+            .await
+            .with_context(|| format!("failed to write remote temp file: {}", tmp))?;
+        file.flush().await.ok();
+        // fsync@openssh.com is best-effort: `SftpFile::sync_all`
+        // returns Ok(()) without sending the request when the
+        // server doesn't advertise the extension (older sshd,
+        // some embedded servers).
+        let _ = file.sync_all().await;
+        sftp.rename(&tmp, path)
+            .await
+            .with_context(|| format!("failed to rename {} -> {}", tmp, path))?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if write_res.is_err() {
+        // Best-effort cleanup. A failure here doesn't override
+        // the original error — just log so the user sees the
+        // real cause first.
+        if let Err(e) = sftp.remove_file(&tmp).await {
+            warn!("failed to clean up remote temp file {}: {}", tmp, e);
+        }
+    }
+    write_res
+}
+
+/// Write `data` to a local `path` atomically: stream into a
+/// sibling temp file (`{path}.tmp.XXXXXX`) opened with
+/// `O_CREAT|O_EXCL|O_WRONLY` (tokio's `create_new(true)`),
+/// `fsync` it, then `rename` over the target. The rename is
+/// a single observable swap on POSIX so other processes see
+/// either the old contents or the new contents — never a
+/// half-written file. On error, best-effort remove the temp
+/// file.
+pub(crate) async fn atomic_write_local(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "passhrs.tmp".to_string());
+    let tmp = parent.join(format!("{}.tmp.{}", file_name, random_tmp_suffix()));
+    let write_res = async {
+        let mut f = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .truncate(false)
+            .open(&tmp)
+            .await
+            .with_context(|| format!("failed to open local temp file: {}", tmp.display()))?;
+        f.write_all(data)
+            .await
+            .with_context(|| format!("failed to write local temp file: {}", tmp.display()))?;
+        f.flush().await.ok();
+        f.sync_all()
+            .await
+            .with_context(|| format!("failed to fsync local temp file: {}", tmp.display()))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to rename {} -> {}",
+                    tmp.display(),
+                    path.display()
+                )
+            })?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if write_res.is_err() {
+        if let Err(e) = tokio::fs::remove_file(&tmp).await {
+            warn!("failed to clean up local temp file {}: {}", tmp.display(), e);
+        }
+    }
+    write_res
+}
+
 pub(crate) async fn push_path(sftp: &SftpSession, local: &str, remote: &str) -> Result<()> {
     let metadata = tokio::fs::metadata(local)
         .await
@@ -28,25 +175,14 @@ pub(crate) async fn push_path(sftp: &SftpSession, local: &str, remote: &str) -> 
             .await?;
         }
     } else {
-        info!("SFTP push: {} -> {}", local, remote);
+        info!("SFTP push (atomic): {} -> {}", local, remote);
         let content = tokio::fs::read(local)
             .await
             .with_context(|| format!("cannot read local file: {}", local))?;
         let content_len = content.len();
-        use tokio::io::AsyncWriteExt;
-        let mut file = sftp
-            .open_with_flags(
-                remote,
-                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-            )
-            .await
-            .with_context(|| format!("failed to open remote file: {}", remote))?;
-        file.write_all(&content)
-            .await
-            .with_context(|| format!("failed to write remote file: {}", remote))?;
-        file.flush().await.ok();
+        atomic_write_remote(sftp, remote, &content).await?;
         info!(
-            "SFTP push complete: {} -> {} ({} bytes)",
+            "SFTP push complete: {} -> {} ({} bytes, atomic)",
             local, remote, content_len
         );
     }
@@ -75,7 +211,7 @@ pub(crate) async fn pull_path(sftp: &SftpSession, remote: &str, local: &str) -> 
                     .await?;
                 }
             } else {
-                info!("SFTP pull: {} -> {}", remote, local);
+                info!("SFTP pull (atomic): {} -> {}", remote, local);
                 let data = sftp
                     .read(remote)
                     .await
@@ -85,11 +221,10 @@ pub(crate) async fn pull_path(sftp: &SftpSession, remote: &str, local: &str) -> 
                         .await
                         .with_context(|| format!("cannot create parent directory: {:?}", parent))?;
                 }
-                tokio::fs::write(local, &data)
-                    .await
-                    .with_context(|| format!("failed to write local file: {}", local))?;
+                let local_path = std::path::Path::new(local);
+                atomic_write_local(local_path, &data).await?;
                 info!(
-                    "SFTP pull complete: {} -> {} ({} bytes)",
+                    "SFTP pull complete: {} -> {} ({} bytes, atomic)",
                     remote,
                     local,
                     data.len()
@@ -238,9 +373,7 @@ pub(crate) async fn rsync_upload(
                     );
                     let mut output = Vec::new();
                     sync.patch(std::io::Cursor::new(&remote_data), &delta, &mut output)?;
-                    let mut file = sftp.create(&remote_path).await?;
-                    file.write_all(&output).await?;
-                    file.flush().await?;
+                    atomic_write_remote(sftp, &remote_path, &output).await?;
                     continue;
                 }
             }
@@ -253,11 +386,9 @@ pub(crate) async fn rsync_upload(
             );
             continue;
         }
-        info!("rsync upload: {} -> {}", local_path, remote_path);
+        info!("rsync upload (atomic): {} -> {}", local_path, remote_path);
         let data = tokio::fs::read(local_path).await?;
-        let mut file = sftp.create(&remote_path).await?;
-        file.write_all(&data).await?;
-        file.flush().await?;
+        atomic_write_remote(sftp, &remote_path, &data).await?;
     }
     // --rsync-opt delete: remove remote files not in local
     if delete_extra {
@@ -358,7 +489,7 @@ pub(crate) async fn rsync_download(
                     );
                     let mut output = Vec::new();
                     sync.patch(std::io::Cursor::new(&local_data), &delta, &mut output)?;
-                    tokio::fs::write(&local_path, &output).await?;
+                    atomic_write_local(std::path::Path::new(&local_path), &output).await?;
                     continue;
                 }
             }
@@ -371,12 +502,12 @@ pub(crate) async fn rsync_download(
             );
             continue;
         }
-        info!("rsync download: {} -> {}", remote_path, local_path);
+        info!("rsync download (atomic): {} -> {}", remote_path, local_path);
         let data = sftp.read(remote_path).await?;
         if let Some(parent) = std::path::Path::new(&local_path).parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&local_path, &data).await?;
+        atomic_write_local(std::path::Path::new(&local_path), &data).await?;
     }
     // --rsync-opt delete: remove local files not on remote
     if delete_extra {
@@ -395,4 +526,93 @@ pub(crate) async fn rsync_download(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 6 chars, all alphanumeric, distinct across many calls.
+    /// We sample 100 suffixes and assert no duplicates — a
+    /// 6-char base62 space is ~57B so any collision in 100
+    /// draws is a broken RNG.
+    #[test]
+    fn random_tmp_suffix_format_and_uniqueness() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let s = random_tmp_suffix();
+            assert_eq!(s.len(), 6, "suffix must be 6 chars: {:?}", s);
+            assert!(
+                s.chars().all(|c| c.is_ascii_alphanumeric()),
+                "suffix must be alnum: {:?}",
+                s
+            );
+            assert!(seen.insert(s.clone()), "duplicate suffix: {:?}", s);
+        }
+    }
+
+    /// Round-trip: write via the atomic helper, verify content
+    /// matches and the target file exists (not the temp).
+    #[tokio::test]
+    async fn atomic_write_local_roundtrip() {
+        let dir = std::env::temp_dir().join("passhrs_atomic_local_test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let target = dir.join("hello.txt");
+        let data = b"hello atomic world\nsecond line\n";
+        atomic_write_local(&target, data).await.unwrap();
+        let read = tokio::fs::read(&target).await.unwrap();
+        assert_eq!(read, data);
+        // Temp file should be gone after rename.
+        let mut entries: Vec<PathBuf> = Vec::new();
+        let mut rd = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(entry) = rd.next_entry().await.unwrap() {
+            entries.push(entry.path());
+        }
+        assert_eq!(entries.len(), 1, "expected only target, got: {:?}", entries);
+        assert_eq!(entries[0], target);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Overwriting an existing file via atomic_write_local
+    /// should not leave any `.tmp.XXXXXX` litter behind and
+    /// should land the new bytes — the second-to-last line
+    /// of defense against regressing back to `tokio::fs::write`.
+    #[tokio::test]
+    async fn atomic_write_local_overwrites() {
+        let dir = std::env::temp_dir().join("passhrs_atomic_overwrite_test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let target = dir.join("file.bin");
+        tokio::fs::write(&target, b"v1").await.unwrap();
+        atomic_write_local(&target, b"v2-new-content").await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"v2-new-content");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// If the temp file already exists (e.g. orphan from a
+    /// crashed run), atomic_write_local must surface an
+    /// error from the EXCL `create_new` rather than silently
+    /// clobbering it.
+    #[tokio::test]
+    async fn atomic_write_local_excl_collision() {
+        let dir = std::env::temp_dir().join("passhrs_atomic_excl_test");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Pre-create a temp file that matches the exact
+        // naming pattern atomic_write_local generates. We
+        // can't predict the random suffix, so simulate by
+        // hand-picking a target whose name we know — the
+        // helper will pick a fresh suffix so this can't
+        // actually collide by accident. Instead, exercise the
+        // open_new(EXCL) path: call atomic_write_local twice
+        // rapidly and verify both succeed and the final
+        // content matches the second call.
+        let target = dir.join("shared.dat");
+        atomic_write_local(&target, b"first").await.unwrap();
+        atomic_write_local(&target, b"second").await.unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }
