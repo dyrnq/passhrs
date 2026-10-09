@@ -121,6 +121,29 @@ yet, because the only legitimate use case (rsync's `--inplace` block
 rewrite on a sparse file) doesn't apply to passhrs's whole-file
 transfers.
 
+#### POSIX mode preservation
+
+The destination file's rwx bits come from the **source** by default
+(on Unix). After the atomic rename, passhrs issues one extra round-trip:
+
+- **Push**: `SSH_FXP_SETSTAT` with the source's rwx bits, preserving the
+  file-type bits (REG/DIR/LNK/...) the server already has on the inode.
+- **Pull**: `std::fs::set_permissions` with the remote's rwx bits.
+- **Rsync** (both directions): same, applied to whichever path the
+  delta-merge lands on.
+
+Without this, an executable pushed to a non-root sftp-server would
+silently land as `0644` (the umask that sshd applies to its temp
+file), losing the `x` bit on the destination. With it, a `0755` local
+binary becomes a `0755` remote binary regardless of the sftp-server's
+umask.
+
+This is on by default — there is intentionally no `--preserve` flag,
+because the alternative (ignoring the source's mode) is a regression
+from the pre-atomic-write behavior where `O_TRUNC` happened to
+clobber the dst's mode along with its content. Ownership (`chown`),
+ACLs, xattrs, and hard links are out of scope.
+
 ### Environment Variables
 ```bash
 passhrs --exec-env MYVAR=hello --exec-env PATH=/custom/bin user@host 'echo $MYVAR'

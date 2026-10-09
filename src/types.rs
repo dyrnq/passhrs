@@ -41,4 +41,19 @@ pub struct ProxyJumpSpec {
 pub(crate) struct RemoteFileInfo {
     pub size: u64,
     pub mtime: u64,
+    /// POSIX mode bits (lower 12 bits: file-type + rwx). `None`
+    /// means the listing routine couldn't capture them (e.g.
+    /// Windows ACL-only filesystems, or remote sftp-server
+    /// refused to expose `permissions`). Callers that want to
+    /// preserve mode on the destination should treat `None` as
+    /// "skip preservation" rather than 0.
+    ///
+    /// On Windows the field is intentionally unread: POSIX mode
+    /// bits don't exist there, so `apply_local_mode` /
+    /// `set_remote_mode` are no-ops and `info.mode` is never
+    /// destructured. The `allow(dead_code)` silences rustc's
+    /// "field never read" warning on Windows builds without
+    /// affecting Unix builds where the field is actively used.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub mode: Option<u32>,
 }

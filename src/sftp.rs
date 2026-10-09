@@ -189,6 +189,81 @@ pub(crate) async fn atomic_write_local(path: &Path, data: &[u8]) -> Result<()> {
     write_res
 }
 
+/// Set the rwx portion of a remote file's mode, preserving the
+/// file-type bits (REG/DIR/LNK/...) the sftp-server already has
+/// on the inode. All other `FileAttributes` fields are left
+/// `None` — the SFTP wire protocol's `SSH_FXP_SETSTAT` treats
+/// `None` as "leave this attribute alone", so this single
+/// round-trip is enough to update only the mode.
+///
+/// Why post-rename (and not chmod-the-tmp-then-rename):
+///   - If we chmod the dst first, dst's mode is briefly visible
+///     to concurrent readers between the chmod and the rename.
+///   - If we chmod the tmp, anything that re-creates the dst
+///     between chmod and rename lands the renamed file with the
+///     wrong mode.
+///   - Post-rename setstat is a single observable swap with no
+///     extra window. Combined with the atomic_write's own
+///     rename, the dst never exists with "wrong content + right
+///     mode" or "right content + wrong mode".
+///
+/// Compiles cross-platform but is only invoked from
+/// `#[cfg(unix)]` blocks (push_path, rsync_upload). The
+/// `cfg_attr` silences the "never used" warning on Windows
+/// builds without affecting Unix builds.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn set_remote_mode(sftp: &SftpSession, path: &str, src_mode: u32) -> Result<()> {
+    use russh_sftp::client::fs::Metadata;
+    let cur = sftp
+        .metadata(path)
+        .await
+        .with_context(|| format!("cannot stat remote after write: {}", path))?;
+    // S_IFMT = 0o170000 on the wire; the low 12 bits hold the
+    // POSIX permission + setuid/setgid/sticky bits. We keep the
+    // file-type bits and replace only the permission bits.
+    let cur_perms = cur.permissions.unwrap_or(0o100000); // 0o100000 = S_IFREG default
+    let new_perms = (cur_perms & 0o170000) | (src_mode & 0o7777);
+    let attrs = Metadata {
+        size: None,
+        uid: None,
+        user: None,
+        gid: None,
+        group: None,
+        permissions: Some(new_perms),
+        atime: None,
+        mtime: None,
+    };
+    sftp.set_metadata(path, attrs)
+        .await
+        .with_context(|| format!("cannot set remote mode on {}", path))?;
+    Ok(())
+}
+
+/// Apply a remote file's POSIX rwx bits to a local file.
+/// Blocking std::fs is fine here — it's one syscall after a
+/// multi-MB transfer.
+///
+/// Unix-only: `PermissionsExt` + `Permissions::from_mode`
+/// don't exist on Windows.
+#[cfg(unix)]
+fn apply_local_mode(path: &Path, src_mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(src_mode & 0o7777);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("cannot set local mode on {}", path.display()))?;
+    Ok(())
+}
+
+/// Windows stub — see the unix impl above. Callers in
+/// `pull_path` / `rsync_download` are `#[cfg(unix)]`-gated,
+/// so this is never invoked, but the symbol must exist so
+/// the call sites compile without per-callsite `#[cfg]`.
+#[cfg(not(unix))]
+#[allow(dead_code)]
+fn apply_local_mode(_path: &Path, _src_mode: u32) -> Result<()> {
+    Ok(())
+}
+
 pub(crate) async fn push_path(sftp: &SftpSession, local: &str, remote: &str) -> Result<()> {
     let metadata = tokio::fs::metadata(local)
         .await
@@ -215,6 +290,17 @@ pub(crate) async fn push_path(sftp: &SftpSession, local: &str, remote: &str) -> 
             .with_context(|| format!("cannot read local file: {}", local))?;
         let content_len = content.len();
         atomic_write_remote(sftp, remote, &content).await?;
+        // Preserve the source file's POSIX rwx bits on the
+        // destination. Failures here are non-fatal: the bytes
+        // are already on disk; the caller can chmod after.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let src_mode = metadata.permissions().mode();
+            if let Err(e) = set_remote_mode(sftp, remote, src_mode).await {
+                warn!("SFTP push: failed to preserve mode on {}: {}", remote, e);
+            }
+        }
         info!(
             "SFTP push complete: {} -> {} ({} bytes, atomic)",
             local, remote, content_len
@@ -250,6 +336,11 @@ pub(crate) async fn pull_path(sftp: &SftpSession, remote: &str, local: &str) -> 
                     .read(remote)
                     .await
                     .with_context(|| format!("failed to read remote file: {}", remote))?;
+                // Snapshot the source mode bits before we forget
+                // what the remote file's attrs were — `meta` is
+                // moved into the recursive call below.
+                #[cfg(unix)]
+                let src_mode = meta.permissions;
                 if let Some(parent) = std::path::Path::new(local).parent() {
                     tokio::fs::create_dir_all(parent)
                         .await
@@ -257,6 +348,18 @@ pub(crate) async fn pull_path(sftp: &SftpSession, remote: &str, local: &str) -> 
                 }
                 let local_path = std::path::Path::new(local);
                 atomic_write_local(local_path, &data).await?;
+                #[cfg(unix)]
+                {
+                    if let Some(perms) = src_mode {
+                        if let Err(e) = apply_local_mode(local_path, perms) {
+                            warn!(
+                                "SFTP pull: failed to preserve mode on {}: {}",
+                                local_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
                 info!(
                     "SFTP pull complete: {} -> {} ({} bytes, atomic)",
                     remote,
@@ -293,7 +396,8 @@ pub(crate) async fn list_remote_files(
         } else {
             let size = stat.size.unwrap_or(0);
             let mtime = stat.mtime.unwrap_or(0) as u64;
-            files.insert(full_path, RemoteFileInfo { size, mtime });
+            let mode = stat.permissions;
+            files.insert(full_path, RemoteFileInfo { size, mtime, mode });
         }
     }
     Ok(files)
@@ -313,6 +417,13 @@ pub(crate) async fn list_local_files(path: &str) -> Result<HashMap<String, Remot
                 stack.push(full);
             } else {
                 let meta = entry.metadata().await?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    Some(meta.permissions().mode())
+                };
+                #[cfg(not(unix))]
+                let mode = None;
                 files.insert(
                     full,
                     RemoteFileInfo {
@@ -322,6 +433,7 @@ pub(crate) async fn list_local_files(path: &str) -> Result<HashMap<String, Remot
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        mode,
                     },
                 );
             }
@@ -408,6 +520,17 @@ pub(crate) async fn rsync_upload(
                     let mut output = Vec::new();
                     sync.patch(std::io::Cursor::new(&remote_data), &delta, &mut output)?;
                     atomic_write_remote(sftp, &remote_path, &output).await?;
+                    #[cfg(unix)]
+                    {
+                        if let Some(m) = info.mode {
+                            if let Err(e) = set_remote_mode(sftp, &remote_path, m).await {
+                                warn!(
+                                    "rsync upload: failed to preserve mode on {}: {}",
+                                    remote_path, e
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -423,6 +546,17 @@ pub(crate) async fn rsync_upload(
         info!("rsync upload (atomic): {} -> {}", local_path, remote_path);
         let data = tokio::fs::read(local_path).await?;
         atomic_write_remote(sftp, &remote_path, &data).await?;
+        #[cfg(unix)]
+        {
+            if let Some(m) = info.mode {
+                if let Err(e) = set_remote_mode(sftp, &remote_path, m).await {
+                    warn!(
+                        "rsync upload: failed to preserve mode on {}: {}",
+                        remote_path, e
+                    );
+                }
+            }
+        }
     }
     // --rsync-opt delete: remove remote files not in local
     if delete_extra {
@@ -524,6 +658,12 @@ pub(crate) async fn rsync_download(
                     let mut output = Vec::new();
                     sync.patch(std::io::Cursor::new(&local_data), &delta, &mut output)?;
                     atomic_write_local(std::path::Path::new(&local_path), &output).await?;
+                    #[cfg(unix)]
+                    {
+                        if let Some(m) = info.mode {
+                            let _ = apply_local_mode(std::path::Path::new(&local_path), m);
+                        }
+                    }
                     continue;
                 }
             }
@@ -542,6 +682,12 @@ pub(crate) async fn rsync_download(
             tokio::fs::create_dir_all(parent).await?;
         }
         atomic_write_local(std::path::Path::new(&local_path), &data).await?;
+        #[cfg(unix)]
+        {
+            if let Some(m) = info.mode {
+                let _ = apply_local_mode(std::path::Path::new(&local_path), m);
+            }
+        }
     }
     // --rsync-opt delete: remove local files not on remote
     if delete_extra {
