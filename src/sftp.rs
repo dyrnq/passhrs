@@ -100,33 +100,30 @@ pub(crate) async fn atomic_write_remote(sftp: &SftpSession, path: &str, data: &[
         //      temp's bytes are fully on disk and the rename
         //      is the only remaining side effect.
         let _ = file.close().await;
-        // Primary path: atomic replace. Linux rename(2) (and
-        // OpenSSH sftp-server) replaces an existing target in
-        // one observable step, so other processes see either
-        // the old bytes or the new bytes — never partial.
-        if let Err(e) = sftp.rename(&tmp, path).await {
-            // Fallback: some sftp-server implementations
-            // (or sftp-server front-ends) refuse to rename
-            // onto an existing path and return an error
-            // instead. Detect that and degrade to explicit
-            // unlink + rename. The window where the target
-            // doesn't exist is tiny (single round-trip) and
-            // any concurrent reader on a same-host system
-            // will get a clear "no such file" rather than a
-            // torn read — better than failing the whole
-            // transfer.
-            warn!(
-                "atomic rename {} -> {} failed ({}); retrying with explicit unlink",
-                tmp, path, e
-            );
-            // Best-effort unlink. If the target doesn't
-            // exist (first push) this is a no-op-style
-            // failure that we just ignore.
-            let _ = sftp.remove_file(path).await;
-            sftp.rename(&tmp, path)
-                .await
-                .with_context(|| format!("failed to rename {} -> {}", tmp, path))?;
-        }
+        // Pre-emptively unlink the existing dst before rename.
+        //
+        // Most sftp-server implementations (Linux kernel
+        // rename(2) backing the OpenSSH sftp-server) atomically
+        // replace an existing target on rename, but a non-trivial
+        // set of sftp-server builds don't — OpenSSH 10.0p2 on
+        // Debian 13 returns SSH_FX_FAILURE on rename-over-existing
+        // rather than auto-unlinking, and several embedded
+        // /dropbear-style servers do the same. Trying the rename
+        // first then falling back logged a WARN per push; doing
+        // the unlink up-front is silent in the common case and
+        // degrades to the same round-trip count on the rare
+        // "dst doesn't exist" path (the unlink itself no-ops via
+        // `let _ =`).
+        //
+        // The window where `path` doesn't exist on disk is a
+        // single SFTP round-trip, same as the try-rename-then-
+        // fallback path. Concurrent readers on a same-host system
+        // see "no such file" rather than a torn read — strictly
+        // better than the prior behavior.
+        let _ = sftp.remove_file(path).await;
+        sftp.rename(&tmp, path)
+            .await
+            .with_context(|| format!("failed to rename {} -> {}", tmp, path))?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
