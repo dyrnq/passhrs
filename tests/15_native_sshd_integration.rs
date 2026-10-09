@@ -1303,6 +1303,303 @@ fn test_atomic_rsync_delta_no_litter() {
 }
 
 // ======================================================================
+// Mode-preservation tests (issue #76).
+//
+// Pre-#74 (and pre-#76), the destination file's mode came from
+// the destination side's umask — so `--push` of an executable
+// would land as 0644 on a non-root sftp-server, and `--pull` of
+// a 0600 SSH key would land as 0644 if the local umask didn't
+// permit it. #76 adds a post-rename `SSH_FXP_SETSTAT` (push) or
+// `std::fs::set_permissions` (pull) that applies the source's
+// rwx bits to the destination.
+//
+// These tests are gated on unix because Windows SFTP doesn't
+// expose POSIX mode bits the same way. The cross-platform
+// coverage for #76 stays at the wire-format level: if
+// `sftp.metadata().permissions` is `Some(_)` on Windows, the
+// setstat path runs identically.
+// ======================================================================
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_preserve_mode_push() {
+    use std::os::unix::fs::PermissionsExt;
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // Pre-#76, an executable pushed to a 0644-umask sftp-server
+    // would land with the x bit stripped. Verify we now copy
+    // 0755 src -> 0755 dst. Also cover a 0600 (private key)
+    // case to make sure we don't just copy the umask accidentally.
+    let cases = [(0o755, "exec"), (0o600, "private"), (0o644, "data")];
+    for (mode, label) in cases {
+        let local = format!("{}/phr_preserve_push_{}.bin", tmp_root().display(), label);
+        let remote = format!("{}/phr_preserve_push_{}.bin", tmp_root().display(), label);
+        std::fs::write(&local, format!("content for {}\n", label)).unwrap();
+        std::fs::set_permissions(&local, std::fs::Permissions::from_mode(mode))
+            .expect("chmod local");
+
+        let d = dest();
+        let spec = format!("{}:{}", local, remote);
+        let a = [
+            "-p",
+            PORT,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "--push",
+            &spec,
+            &d,
+            "id",
+        ];
+        let (ok, _, stderr) = run_phr(&a);
+        assert!(ok, "push {} failed: {}", label, stderr);
+
+        // The remote file lives at the same /tmp path because
+        // passhrs authenticates as testuser who has /tmp write
+        // access; the sftp-server delivers the file at the
+        // exact remote path we asked for. We can stat it
+        // directly.
+        let got = std::fs::metadata(&remote)
+            .expect("remote file missing after push")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            got, mode,
+            "mode not preserved for {}: src={:#o}, dst={:#o}",
+            label, mode, got
+        );
+
+        let _ = std::fs::remove_file(&local);
+        let _ = std::fs::remove_file(&remote);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_preserve_mode_pull() {
+    use std::os::unix::fs::PermissionsExt;
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // Mirror of test_preserve_mode_push: source file on the
+    // sftp-server side has a specific mode, we pull it, and
+    // check the local copy got the same mode. This guards the
+    // pull-path helper (apply_local_mode) that pulls from
+    // sftp.metadata().permissions and applies via std::fs.
+    let cases = [(0o755, "exec"), (0o600, "private"), (0o644, "data")];
+    for (mode, label) in cases {
+        let remote = format!("{}/phr_preserve_pull_{}.bin", tmp_root().display(), label);
+        let local = format!(
+            "{}/phr_preserve_pull_{}.bin.local",
+            tmp_root().display(),
+            label
+        );
+        std::fs::write(&remote, format!("content for {}\n", label)).unwrap();
+        std::fs::set_permissions(&remote, std::fs::Permissions::from_mode(mode))
+            .expect("chmod remote");
+
+        let d = dest();
+        let spec = format!("{}:{}", remote, local);
+        let a = [
+            "-p",
+            PORT,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "--pull",
+            &spec,
+            &d,
+            "id",
+        ];
+        let (ok, _, stderr) = run_phr(&a);
+        assert!(ok, "pull {} failed: {}", label, stderr);
+
+        let got = std::fs::metadata(&local)
+            .expect("local file missing after pull")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(
+            got, mode,
+            "pull mode not preserved for {}: src={:#o}, dst={:#o}",
+            label, mode, got
+        );
+
+        let _ = std::fs::remove_file(&remote);
+        let _ = std::fs::remove_file(&local);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_preserve_mode_overwrite() {
+    use std::os::unix::fs::PermissionsExt;
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // Pre-#76, push 0755 onto existing 0644 dst would leave
+    // the dst at whatever umask the sftp-server applied (often
+    // 0644) — silently regressing the executable bit. With
+    // #76 the dst's mode is replaced with the src's mode after
+    // the rename, regardless of what mode the dst had before.
+    let local = format!("{}/phr_preserve_overwrite_src.bin", tmp_root().display());
+    let remote = format!("{}/phr_preserve_overwrite_dst.bin", tmp_root().display());
+
+    // Seed dst with 0644 (data-file mode)
+    std::fs::write(&remote, b"old content with 0644 mode\n").unwrap();
+    std::fs::set_permissions(&remote, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod dst to 0644");
+
+    // src is 0755 (executable mode)
+    std::fs::write(&local, b"new content with 0755 mode\n").unwrap();
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod src to 0755");
+
+    let d = dest();
+    let spec = format!("{}:{}", local, remote);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--push",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "overwrite push failed: {}", stderr);
+
+    let got = std::fs::metadata(&remote)
+        .expect("dst missing after overwrite push")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        got, 0o755,
+        "overwrite should adopt src mode: expected 0o755, got {:#o}",
+        got
+    );
+    // And the content should be the new one, not the old one.
+    let new_bytes = std::fs::read(&remote).expect("read dst after push");
+    assert!(
+        new_bytes.starts_with(b"new content"),
+        "content not replaced: {:?}",
+        String::from_utf8_lossy(&new_bytes)
+    );
+
+    let _ = std::fs::remove_file(&local);
+    let _ = std::fs::remove_file(&remote);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires native OpenSSH on 127.0.0.1:22222 with runner:PassTest1234!"]
+fn test_preserve_mode_rsync_delta() {
+    use std::os::unix::fs::PermissionsExt;
+    if !sshd_ok() {
+        eprintln!("SKIP: no container");
+        return;
+    }
+    // rsync delta path (same size / different content) goes
+    // through atomic_write_remote, which means it should also
+    // pick up the post-rename setstat. The dst has 0644 mode
+    // but the src has 0755; after the rsync the dst should be
+    // 0755 (not stuck at 0644).
+    let dir = format!("{}/phr_preserve_rsync_delta_src", tmp_root().display());
+    let remote_dir = format!("{}/phr_preserve_rsync_delta_dst", tmp_root().display());
+    setup_rsync_remote(remote_dir.as_str());
+
+    let _ = std::fs::create_dir_all(&dir);
+    let original: Vec<u8> = (b'a'..=b'z').cycle().take(1024).collect();
+    let mut modified = original.clone();
+    for byte in modified.iter_mut().skip(400).take(20) {
+        *byte = b'!';
+    }
+
+    std::fs::write(format!("{}/file.bin", dir), &modified).unwrap();
+    // src is 0755
+    std::fs::set_permissions(
+        format!("{}/file.bin", dir),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod src to 0755");
+
+    // Pre-seed remote with 0644 mode + original content
+    std::fs::write(format!("{}/file.bin", remote_dir), &original).unwrap();
+    std::fs::set_permissions(
+        format!("{}/file.bin", remote_dir),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("chmod remote to 0644");
+    // Force past mtime so the rsync can't short-circuit as
+    // "already in sync" (same nanosecond-resolution race as
+    // test_atomic_rsync_delta_no_litter above).
+    {
+        use std::time::Duration;
+        let remote_file = format!("{}/file.bin", remote_dir);
+        let past = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&remote_file)
+            .and_then(|f| f.set_modified(past));
+    }
+
+    let d = dest();
+    let spec = format!("{}/:{}/", dir, remote_dir);
+    let a = [
+        "-p",
+        PORT,
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "--rsync",
+        &spec,
+        &d,
+        "id",
+    ];
+    let (ok, _, stderr) = run_phr(&a);
+    assert!(ok, "rsync delta failed: {}", stderr);
+
+    // Content must be the modified version
+    let final_bytes =
+        std::fs::read(format!("{}/file.bin", remote_dir)).expect("remote gone after rsync");
+    assert_eq!(
+        final_bytes, modified,
+        "delta-patched bytes don't match the local source"
+    );
+    // Mode must be the src's 0755, not the dst's pre-existing 0644
+    let got_mode = std::fs::metadata(format!("{}/file.bin", remote_dir))
+        .expect("remote stat after rsync")
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(
+        got_mode, 0o755,
+        "rsync delta should preserve src mode 0o755, got {:#o}",
+        got_mode
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&remote_dir);
+}
+
+// ======================================================================
 // 环境变量测试
 // ======================================================================
 

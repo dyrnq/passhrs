@@ -41,4 +41,11 @@ pub struct ProxyJumpSpec {
 pub(crate) struct RemoteFileInfo {
     pub size: u64,
     pub mtime: u64,
+    /// POSIX mode bits (lower 12 bits: file-type + rwx). `None`
+    /// means the listing routine couldn't capture them (e.g.
+    /// Windows ACL-only filesystems, or remote sftp-server
+    /// refused to expose `permissions`). Callers that want to
+    /// preserve mode on the destination should treat `None` as
+    /// "skip preservation" rather than 0.
+    pub mode: Option<u32>,
 }
