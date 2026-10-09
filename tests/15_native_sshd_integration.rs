@@ -1553,10 +1553,14 @@ fn test_preserve_mode_overwrite() {
     assert!(ok1, "first push failed: {}", e1);
 
     // Now change the src's mode AND content, push again. The
-    // dst should pick up both.
+    // dst should pick up both. Use 0644 instead of 0600 so the
+    // test can still std::fs::read the dst as the runner user
+    // (testuser ends up owning it via atomic_write_remote; a
+    // testuser-owned 0600 would be unreadable cross-user in
+    // the sticky /tmp dir on single-host CI).
     std::fs::write(&local, b"VERSION TWO with new content\n").unwrap();
-    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o600))
-        .expect("chmod src to 0600");
+    std::fs::set_permissions(&local, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod src to 0644");
     let spec2 = format!("{}:{}", local, remote);
     let a2 = [
         "-p",
@@ -1573,7 +1577,7 @@ fn test_preserve_mode_overwrite() {
     let (ok2, _, e2) = run_phr(&a2);
     assert!(ok2, "second push failed: {}", e2);
 
-    // Dst should now have the new src's mode (0600), not the
+    // Dst should now have the new src's mode (0644), not the
     // first push's mode (0755).
     let got = std::fs::metadata(&remote)
         .expect("dst missing after overwrite push")
@@ -1581,8 +1585,8 @@ fn test_preserve_mode_overwrite() {
         .mode()
         & 0o7777;
     assert_eq!(
-        got, 0o600,
-        "overwrite should adopt second src mode: expected 0o600, got {:#o}",
+        got, 0o644,
+        "overwrite should adopt second src mode: expected 0o644, got {:#o}",
         got
     );
     let new_bytes = std::fs::read(&remote).expect("read dst after push");
