@@ -206,6 +206,12 @@ pub(crate) async fn atomic_write_local(path: &Path, data: &[u8]) -> Result<()> {
 ///     extra window. Combined with the atomic_write's own
 ///     rename, the dst never exists with "wrong content + right
 ///     mode" or "right content + wrong mode".
+///
+/// Compiles cross-platform but is only invoked from
+/// `#[cfg(unix)]` blocks (push_path, rsync_upload). The
+/// `cfg_attr` silences the "never used" warning on Windows
+/// builds without affecting Unix builds.
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn set_remote_mode(sftp: &SftpSession, path: &str, src_mode: u32) -> Result<()> {
     use russh_sftp::client::fs::Metadata;
     let cur = sftp
@@ -236,11 +242,25 @@ async fn set_remote_mode(sftp: &SftpSession, path: &str, src_mode: u32) -> Resul
 /// Apply a remote file's POSIX rwx bits to a local file.
 /// Blocking std::fs is fine here — it's one syscall after a
 /// multi-MB transfer.
+///
+/// Unix-only: `PermissionsExt` + `Permissions::from_mode`
+/// don't exist on Windows.
+#[cfg(unix)]
 fn apply_local_mode(path: &Path, src_mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(src_mode & 0o7777);
     std::fs::set_permissions(path, perms)
         .with_context(|| format!("cannot set local mode on {}", path.display()))?;
+    Ok(())
+}
+
+/// Windows stub — see the unix impl above. Callers in
+/// `pull_path` / `rsync_download` are `#[cfg(unix)]`-gated,
+/// so this is never invoked, but the symbol must exist so
+/// the call sites compile without per-callsite `#[cfg]`.
+#[cfg(not(unix))]
+#[allow(dead_code)]
+fn apply_local_mode(_path: &Path, _src_mode: u32) -> Result<()> {
     Ok(())
 }
 
