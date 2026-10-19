@@ -20,7 +20,7 @@ dirs = "6"
 bytes = "1.12"
 # futures is needed for channel read polling
 futures = "0.3"
-russh-sftp = "2.3.0"
+russh-sftp = "3"
 # Trial: use russh-config 0.58 against russh 0.63. Both are from the
 # same warp-tech monorepo but version-locking has slipped (russh is
 # ahead). Trial compile: if `cargo check` passes we adopt; if not we
