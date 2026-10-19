@@ -9,15 +9,15 @@ description = "SSH automation tool (russh-based, ssh-compatible CLI)"
 [dependencies]
 russh = { version = "0.63", default-features = false, features = ["rsa", "ring", "flate2"] }
 ssh-key = "0.7.0-rc.10"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 shell-escape = "0.1"
 term_size = "0.3"
 dirs = "6"
-bytes = "1"
+bytes = "1.12"
 # futures is needed for channel read polling
 futures = "0.3"
 russh-sftp = "2.3.0"
@@ -41,7 +41,7 @@ globset = "0.4"
 # `.unwrap_or_default()` to mirror the `%d` branch's silent
 # empty-on-failure style — OpenSSH similarly leaves the token
 # unexpanded when the value is unavailable.
-whoami = "2"
+whoami = "2.1"
 copia = { version = "0.3", features = ["async"] }
 crossterm = "0.29.0"
 # `libc` provides the SOL_SOCKET / SO_BINDTODEVICE constants and
