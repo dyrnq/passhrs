@@ -1,6 +1,6 @@
 [package]
 name = "passhrs"
-version = "1.0.9"
+version = "1.0.10"
 edition = "2021"
 repository = "https://github.com/dyrnq/passhrs"
 license = "MIT"
