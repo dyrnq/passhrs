@@ -9,7 +9,7 @@ description = "SSH automation tool (russh-based, ssh-compatible CLI)"
 [dependencies]
 russh = { version = "0.64", default-features = false, features = ["rsa", "ring", "flate2"] }
 ssh-key = "0.7.0-rc.10"
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 log = "0.4"
 env_logger = "0.11"
 anyhow = "1"
