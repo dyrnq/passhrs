@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Probe: can we run Docker on a macos-14 GitHub Actions runner via colima?
+# Probe: can we run Docker on a macos-15 GitHub Actions runner via colima?
 #
 # This script deliberately does NOT touch macOS's native openssh server.
 # Its only job is to install colima, start the Lima VM, and verify that
@@ -9,13 +9,13 @@
 # host's native sshd.
 set -euo pipefail
 
-# macos-14 GitHub runners execute steps under the `runner` user; the
+# macos-15 GitHub runners execute steps under the `runner` user; the
 # setup script itself is invoked via sudo, but colima must run as a
 # regular user — it stores VM state under ~/<user>/.colima and the
 # underlying Lima VM cannot be launched by uid 0.
 RUNNER_USER="${SUDO_USER:-runner}"
 
-# macos-14 is arm64 → Homebrew installs to /opt/homebrew. If for any
+# macos-15 is arm64 → Homebrew installs to /opt/homebrew. If for any
 # reason that prefix is missing, fall back to /usr/local (the legacy
 # Intel prefix). Either way the `brew` binary lives in <prefix>/bin.
 BREW_BIN="/opt/homebrew/bin"
@@ -26,7 +26,7 @@ export PATH="${BREW_BIN}:${PATH}"
 
 if ! sudo -u "${RUNNER_USER}" -H bash -c "export PATH='${BREW_BIN}:\$PATH'; command -v brew" >/dev/null; then
     echo "FATAL: brew not found on ${RUNNER_USER}'s PATH (${BREW_BIN})" >&2
-    echo "       macos-14 GitHub runners ship Homebrew preinstalled — if" >&2
+    echo "       macos-15 GitHub runners ship Homebrew preinstalled — if" >&2
     echo "       it's missing the runner image may have changed." >&2
     exit 1
 fi
@@ -49,7 +49,7 @@ echo "    colima at: $(sudo -u "${RUNNER_USER}" -H bash -c "export PATH='${BREW_
 echo "==> Starting colima VM (cpu=2 mem=4G disk=20G)..."
 # The CPU/memory/disk values are colima's accepted minimums and are
 # small enough to come up in under a minute on the free GitHub-hosted
-# macos-14 runner. colima start is idempotent: if the default profile
+# macos-15 runner. colima start is idempotent: if the default profile
 # is already running, the call returns within seconds and prints
 # "profile 'default' is already running".
 sudo -u "${RUNNER_USER}" -H bash -c "
@@ -86,6 +86,6 @@ sudo -u "${RUNNER_USER}" -H bash -c "
     docker run --rm hello-world
 " | tail -20
 
-echo "==> Probe SUCCESS: Docker works on macos-14 via colima."
+echo "==> Probe SUCCESS: Docker works on macos-15 via colima."
 echo "    Next step (if you choose): build a Linux openssh-server image"
 echo "    and run it on 127.0.0.1:22222 so tests/15 can connect."

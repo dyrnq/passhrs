@@ -47,7 +47,7 @@ The two-mode split is implemented as `-NoUpgrade` parameter on
 matrix:
   include:
     - { os: ubuntu-24.04, openssh: native }
-    - { os: macos-14,     openssh: native }
+    - { os: macos-15,     openssh: native }
     - { os: windows-2022, openssh: inbox-8.1p1 }
     - { os: windows-2022, openssh: upgraded-10.0 }
 ```

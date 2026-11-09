@@ -1,6 +1,6 @@
 # macOS OpenSSH Setup for the passhrs Integration Suite
 
-The macOS runner (`macos-14`) stands up the OS-shipped OpenSSH server
+The macOS runner (`macos-15`) stands up the OS-shipped OpenSSH server
 on `127.0.0.1:22222` and exercises the e2e suite in
 `tests/15_native_sshd_integration.rs` against it. Unlike Linux and
 Windows, no OpenSSH installation is needed — `/usr/sbin/sshd` and
@@ -143,7 +143,7 @@ sudo createhomedir -u "${USER}"
 ```
 
 - `UserShell` is set to `/bin/zsh` because GitHub-hosted
-  `macos-14` images ship zsh as the default user shell, and
+  `macos-15` images ship zsh as the default user shell, and
   testuser needs a real shell to be allowed to authenticate over
   SSH (`PermitRootLogin yes` in the shared config; the user
   account must have a usable shell).

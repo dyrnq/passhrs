@@ -2,7 +2,7 @@
 # Provision a real OpenSSH server on 127.0.0.1:22222 on a macOS runner.
 # Uses /usr/sbin/sshd shipped with the OS — no homebrew install needed.
 #
-# Targets GitHub-hosted macos-14 runners; assumes passwordless sudo
+# Targets GitHub-hosted macos-15 runners; assumes passwordless sudo
 # (the default on GitHub-hosted runners).
 set -euo pipefail
 

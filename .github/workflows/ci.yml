@@ -48,8 +48,8 @@ jobs:
           - name: ubuntu-24.04
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - name: macos-14
-            os: macos-14
+          - name: macos-15
+            os: macos-15
             target: aarch64-apple-darwin
           - name: windows-msvc
             os: windows-2022
@@ -109,7 +109,7 @@ jobs:
         include:
           - os: ubuntu-24.04
             openssh: native
-          - os: macos-14
+          - os: macos-15
             openssh: native
           - os: windows-2022
             openssh: inbox-8.1p1
@@ -134,7 +134,7 @@ jobs:
         run: sudo ./tests/sshd/setup-linux.sh
 
       - name: Provision sshd via Homebrew openssh + key auth (macOS)
-        # Replaces the previous native-sshd provision on macos-14.
+        # Replaces the previous native-sshd provision on macos-15.
         # macOS Sonoma+ secure-token lockout makes the native
         # testuser password path fundamentally unreliable (dscl
         # . -passwd, sysadminctl -resetPasswordFor, and passwd all
@@ -158,7 +158,7 @@ jobs:
         # is required for --key <IDENTITY_FILE>". Pass GITHUB_ENV
         # explicitly to sudo: `sudo VAR=value cmd` survives
         # env_reset regardless of the env_keep list.
-        if: matrix.os == 'macos-14'
+        if: matrix.os == 'macos-15'
         run: sudo GITHUB_ENV="${GITHUB_ENV}" ./tests/sshd/setup-macos-brew-openssh.sh
 
       - name: Provision native sshd (Windows, inbox 8.1p1)
@@ -228,7 +228,7 @@ jobs:
         # as a name of a cmdlet ...". Git Bash ships pre-installed on
         # windows-2019/2022 GitHub-hosted runners, so this works.
         #
-        # macOS retry note: macos-14's integration job has a known
+        # macOS retry note: macos-15's integration job has a known
         # intermittent flake — over the last 8 PR runs, ~25% pass on
         # the first attempt and the rest pass on one of the 2 retries.
         # Retries are kept inside this step so the same `cargo test`
@@ -255,7 +255,7 @@ jobs:
           echo "[run-tests] PHR_TEST_KEY=${PHR_TEST_KEY:-<unset>}"
           set +e
           attempt=1
-          MAX_ATTEMPTS=${{ matrix.os == 'macos-14' && 3 || 1 }}
+          MAX_ATTEMPTS=${{ matrix.os == 'macos-15' && 3 || 1 }}
           while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
               echo "=== attempt ${attempt}/${MAX_ATTEMPTS} ==="
               cargo test --release -- --include-ignored --test-threads=1 \

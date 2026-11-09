@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Provision a real OpenSSH server on 127.0.0.1:22222 on a macos-14
+# Provision a real OpenSSH server on 127.0.0.1:22222 on a macos-15
 # runner using Homebrew's openssh and SSH-key authentication.
 #
 # Why both changes vs. the previous (system sshd + password) approach:
@@ -40,8 +40,8 @@ PASS="PassTest1234!"
 PORT="22222"
 HOST="127.0.0.1"
 
-# macos-14 is arm64 → Homebrew installs to /opt/homebrew. Intel
-# fallback (/usr/local) is unlikely on macos-14 but supported.
+# macos-15 is arm64 → Homebrew installs to /opt/homebrew. Intel
+# fallback (/usr/local) is unlikely on macos-15 but supported.
 BREW_BIN="/opt/homebrew/bin"
 if [ ! -x "${BREW_BIN}/brew" ]; then
     BREW_BIN="/usr/local/bin"
@@ -86,7 +86,7 @@ echo "==> Installing openssh via brew (as ${SUDO_USER:-runner})..."
 # `brew install openssh` is idempotent — returns 0 if already at latest.
 #
 # HOMEBREW_NO_AUTO_UPDATE=1 stops brew from running `brew update` before
-# the install. On a fresh macos-14 runner the brew prefix has never
+# the install. On a fresh macos-15 runner the brew prefix has never
 # seen an update, so a vanilla `brew install openssh` triggers an
 # implicit `brew update` first; if that update hits a transient
 # GitHub-API or DNS flake (very common on shared CI egress IPs) the
@@ -257,7 +257,7 @@ sed -i '' '/^LogLevel /d; /^UsePAM /d' "${SSHD_CFG}"
 # `persourcepenalties` from default to `no` and removes the `crash:`
 # stats line). The previous conditional probe matched only the dump
 # format of OpenSSH 10.0/10.3p1 (`^persourcepenalties crash:`) and
-# OpenSSH 9.8 default-OFF (`^persourcepenalties no\b`); the macos-14
+# OpenSSH 9.8 default-OFF (`^persourcepenalties no\b`); the macos-15
 # runner image recently bumped to OpenSSH 10.5p1, whose `sshd -T`
 # format matches neither regex. The probe silently fell through to
 # "no override needed" and the per-source penalty stayed ON at

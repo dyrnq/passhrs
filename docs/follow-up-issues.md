@@ -345,7 +345,7 @@ tests`:
 
 ```bash
 attempt=1
-MAX_ATTEMPTS=${{ matrix.os == 'macos-14' && 3 || 1 }}
+MAX_ATTEMPTS=${{ matrix.os == 'macos-15' && 3 || 1 }}
 while [ "${attempt}" -le "${MAX_ATTEMPTS}" ]; do
     cargo test --release -- --include-ignored --test-threads=1 \
         > "integration-test.${attempt}.log" 2>&1
@@ -369,7 +369,7 @@ permanent fix.
 
 ## Hypotheses to triage
 
-1. **macOS runner-image drift**: GitHub-hosted `macos-14` runners ship
+1. **macOS runner-image drift**: GitHub-hosted `macos-15` runners ship
    Brew formulae updates; OpenSSH version on the runner has shifted
    between runs. Compare `sshd -V` + `brew info openssh` snapshots
    across a few red and green runs — if the red runs all use a specific
@@ -414,10 +414,10 @@ Add to a future PR (proposed):
 
 ## Acceptance criteria for closing this issue
 
-- 5 consecutive PR runs on macos-14 pass on the **first** attempt (no
+- 5 consecutive PR runs on macos-15 pass on the **first** attempt (no
   retry needed) — proves the retry is masking a permanent fix.
 - The macOS retry loop is removed from `.github/workflows/ci.yml`.
-- `MAX_ATTEMPTS=1` for `matrix.os == 'macos-14'` too.
+- `MAX_ATTEMPTS=1` for `matrix.os == 'macos-15'` too.
 
 ---
 
@@ -618,7 +618,7 @@ cfg gate and re-enable the test on Linux + macOS.
 
 ## Acceptance criteria for closing this issue
 
-- The same test passes on ubuntu-24.04 + macos-14 + windows-2022
+- The same test passes on ubuntu-24.04 + macos-15 + windows-2022
   (both inbox-8.1p1 and upgraded-10.0 rows in the integration
   matrix).
 - The `#[cfg(target_os = "windows")]` attribute is removed from
