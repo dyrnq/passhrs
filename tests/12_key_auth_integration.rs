@@ -69,21 +69,28 @@ fn sshd_ok() -> bool {
         Err(_) => return false,
     };
     let probe = || TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
-    if probe() {
-        return true;
-    }
+    // The first probe lives inside the macOS-only block on purpose:
+    // clippy 1.100's `needless_bool` rejects an `if probe() { return
+    // true; }` that is directly followed by another bool-returning
+    // expression, and the non-macOS arm below ends with exactly that
+    // (a `probe()` tail). Keeping the two arms disjoint — macOS gets
+    // the retry ladder, everyone else a single probe — satisfies the
+    // lint without changing behaviour.
     #[cfg(target_os = "macos")]
     {
+        if probe() {
+            return true;
+        }
         thread::sleep(Duration::from_millis(100));
         if probe() {
             return true;
         }
         thread::sleep(Duration::from_millis(100));
-        return probe();
+        probe()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        false
+        probe()
     }
 }
 
