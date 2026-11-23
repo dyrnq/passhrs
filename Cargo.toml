@@ -19,15 +19,27 @@ dirs = "7"
 bytes = "1.12"
 # futures is needed for channel read polling
 futures = "0.3"
-# SFTP subsystem client/server. 3.x is transport-agnostic: `SftpSession`
+# SFTP subsystem client/server. 4.x is transport-agnostic: `SftpSession`
 # is generic over `AsyncRead + AsyncWrite` and the crate has no russh
 # dependency at all, so it never needs to track russh's version.
-russh-sftp = "3"
+# (4.0.0 changed `SftpSession::write` to create+truncate like
+# std::fs::write; passhrs doesn't use it — its remote writes go
+# through OpenFlags + a temp file + rename, so the atomic-write
+# semantics are unaffected.)
+russh-sftp = "4"
 # russh-config parses ~/.ssh/config. It shares the warp-tech
 # monorepo with russh but does NOT depend on it — its own deps are
 # futures/globset/log/thiserror/tokio/whoami — so it can be upgraded
 # independently of russh without any version-locking constraint.
-russh-config = "0.58"
+#
+# 0.65.3 carries the GHSA-xm3f-wjw9-3x8m fix: the ProxyCommand
+# template used to be token-expanded and then split on spaces, so a
+# hostname containing spaces/;/$( ) could inject extra argv into the
+# proxy process. Upstream now validates the expanded %h/%u tokens
+# against OpenSSH's valid_hostname() rules and errors out instead.
+# The diff between 0.58.0 and 0.65.3 is additive only — no public
+# API changed, so no call-site changes are needed here.
+russh-config = "0.65"
 # Glob expansion for `Include <pattern>` directives in ssh_config.
 # russh-config already depends on globset 0.4 internally; declaring
 # it directly just exposes the same version we're already pulling
